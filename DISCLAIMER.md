@@ -1,0 +1,29 @@
+# Disclaimer
+
+**Forven is experimental software for educational and research use. It is NOT financial advice, and it is provided AS IS, without warranty of any kind.**
+
+## No financial advice
+
+Nothing produced by Forven — strategies, backtests, signals, metrics, or autonomous decisions — is financial, investment, legal, or tax advice. You are solely responsible for every decision and every order.
+
+## Substantial risk of loss
+
+Trading cryptocurrencies and derivatives carries a substantial risk of loss, including the **total loss** of funds, and losses can exceed your initial deposit when leverage is involved. Only ever risk capital you can afford to lose entirely.
+
+## Paper + testnet only
+
+Forven ships configured for **paper trading** with **Hyperliquid testnet** as the supported default. Live / mainnet (real-money) trading is **not a supported feature**: a live execution engine exists in the code but is **disabled by default** and reachable only through deliberate, multi-step opt-in (`FORVEN_EXECUTION_MODE=live` *and* `FORVEN_ALLOW_MAINNET=1` *and* mainnet credentials). If you enable it, you do so entirely **at your own risk** — the authors do not support, endorse, or take responsibility for that use.
+
+## Backtest / paper performance is not predictive
+
+Past, simulated, backtested, and paper-traded performance does **not** predict future or live results. The software's own performance metrics may be **inaccurate or misleading** (for example, due to data quality issues or look-ahead bias). Treat all reported numbers with skepticism and verify independently.
+
+## Your keys, your responsibility
+
+You are solely responsible for obtaining, funding, securing, and using your own exchange accounts, API keys, and model / LLM credentials, and for complying with all laws and regulations that apply to you — including securities, derivatives, and tax law in your jurisdiction.
+
+## No warranty / no liability
+
+To the maximum extent permitted by law, Forven is provided **WITHOUT WARRANTY OF ANY KIND**, express or implied (see sections 15–16 of the AGPL-3.0 text in [`LICENSE`](LICENSE)). The authors and contributors accept **no liability** for any loss or damage of any kind arising from your use of the software. This file is an additional notice under AGPL-3.0 section 7(a); it does not modify the license itself.
+
+By using Forven you acknowledge and accept these terms.
