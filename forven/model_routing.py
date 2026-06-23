@@ -135,6 +135,10 @@ _DEFAULT_MODEL_ROUTING = {
         ],
         "groq": [
             {"provider": "groq", "model_id": "llama-3.3-70b-versatile"},
+            # Groq's free tier has a tight per-minute token budget; fall back to
+            # Gemini (free, large context) before any paid provider so a request
+            # too large for Groq still completes for free.
+            {"provider": "gemini", "model_id": "gemini-2.5-flash"},
             {"provider": "openai", "model_id": "gpt-5.2"},
         ],
         "gemini": [

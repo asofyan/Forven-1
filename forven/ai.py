@@ -33,6 +33,17 @@ _RATE_LIMIT_HINTS = (
     "quota exceeded",
     "insufficient_quota",
 )
+# A single request that exceeds the provider's per-minute token budget (HTTP
+# 413). This is NOT a transient rate-limit — waiting and retrying the same
+# request can never succeed because the request itself is too big. Providers
+# (e.g. Groq) often phrase it with "rate limit" wording, so it must be detected
+# and excluded from the retryable rate-limit class.
+_REQUEST_TOO_LARGE_HINTS = (
+    "request too large",
+    "reduce your message size",
+    "too large for model",
+    "request_too_large",
+)
 _TRANSIENT_PROVIDER_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 _TRANSIENT_PROVIDER_HINTS = (
     "connecttimeout",
@@ -480,6 +491,13 @@ def _message_mentions_rate_limit(text: str) -> bool:
 
 
 def _is_rate_limit_exception(error: Exception) -> bool:
+    # A 413 "request too large" is a capacity mismatch, not a transient
+    # throttle — retrying the identical request never succeeds. Exclude it so
+    # callers fall back to a higher-capacity provider / fail fast instead of
+    # requeuing with minute-scale backoffs.
+    if _is_request_too_large(error):
+        return False
+
     seen: set[int] = set()
     current: object | None = error
 
@@ -540,6 +558,28 @@ def _walk_exception_chain(error: Exception):
         seen.add(current_id)
         yield current
         current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+
+def _is_request_too_large(error: Exception) -> bool:
+    """True when a single request exceeds the provider's token/size budget (413).
+
+    Distinct from a retryable rate-limit: the request must be made smaller or
+    sent to a higher-capacity provider — retrying as-is can never succeed.
+    """
+    for node in _walk_exception_chain(error):
+        status = getattr(node, "status_code", None)
+        if status == 413:
+            return True
+        response = getattr(node, "response", None)
+        if response is not None and getattr(response, "status_code", None) == 413:
+            return True
+        try:
+            message = str(node).lower()
+        except Exception:
+            message = ""
+        if any(hint in message for hint in _REQUEST_TOO_LARGE_HINTS):
+            return True
+    return False
 
 
 def is_transient_provider_exception(error: Exception) -> bool:
