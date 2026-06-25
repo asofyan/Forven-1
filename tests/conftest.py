@@ -129,4 +129,14 @@ def forven_db(tmp_path):
 
     from forven.db import init_db
     init_db()
+
+    # Reset the once-per-process scheduler-bootstrap guard so each test's fresh DB
+    # is re-seeded by get_scheduler()/_bootstrap_scheduler_jobs(); the module-level
+    # flag otherwise persists across tests in the same process and skips seeding.
+    try:
+        import forven.api_core as _api_core
+        _api_core._SCHEDULER_BOOTSTRAP_DONE = False
+    except Exception:
+        pass
+
     return db_path

@@ -129,40 +129,59 @@ class ForvenV1CompatMiddleware(BaseHTTPMiddleware):
 		return response
 
 
-def _bootstrap_scheduler_jobs():
-    """Ensure scheduler table has expected defaults even when bot isn't running."""
-    try:
-        from forven.db import init_db
+_SCHEDULER_BOOTSTRAP_DONE = False
+_SCHEDULER_BOOTSTRAP_LOCK = threading.Lock()
 
-        init_db()
-        # One-time gauntlet migration: demote strategies without canonical backtest
-        try:
-            from forven.brain import run_gauntlet_backtest_migration
-            run_gauntlet_backtest_migration()
-        except Exception as exc:
-            log.warning("Gauntlet backtest migration failed: %s", exc)
-        existing_jobs = get_jobs()
-        if not existing_jobs:
-            seed_forven_jobs()
-            log.info("Seeded default scheduler jobs from API bootstrap")
+
+def _bootstrap_scheduler_jobs(force: bool = False):
+    """Ensure scheduler table has expected defaults even when bot isn't running.
+
+    Runs ONCE per process. get_scheduler() — an ops endpoint the dashboard polls
+    — calls this on every request; without this guard each poll re-ran the full
+    init_db() (all schema scripts + every migration) + the gauntlet backtest
+    migration + job reconciliation, which a py-spy profile showed as steady-state
+    CPU on the single API worker. The work is idempotent, so once per process is
+    enough. Pass force=True to re-run intentionally (e.g. after a factory reset).
+    """
+    global _SCHEDULER_BOOTSTRAP_DONE
+    if _SCHEDULER_BOOTSTRAP_DONE and not force:
+        return
+    with _SCHEDULER_BOOTSTRAP_LOCK:
+        if _SCHEDULER_BOOTSTRAP_DONE and not force:
             return
+        try:
+            from forven.db import init_db
 
-        reconciliation = reconcile_forven_jobs()
-        added_monitoring = ensure_monitoring_jobs()
-        migrated_scanner = migrate_legacy_scanner_cadence()
-        migrated_data_jobs = migrate_data_manager_jobs()
-        if reconciliation["removed"] or reconciliation["added"] or added_monitoring or migrated_data_jobs:
-            log.info(
-                "Scheduler reconciliation from API bootstrap: removed=%d added=%d monitoring_added=%d data_jobs_migrated=%d",
-                reconciliation["removed"],
-                reconciliation["added"],
-                added_monitoring,
-                migrated_data_jobs,
-            )
-        elif migrated_scanner:
-            log.info("Applied scheduler legacy migration: scanner cadence updated")
-    except Exception as e:
-        log.error("API scheduler bootstrap failed: %s", e)
+            init_db()
+            # One-time gauntlet migration: demote strategies without canonical backtest
+            try:
+                from forven.brain import run_gauntlet_backtest_migration
+                run_gauntlet_backtest_migration()
+            except Exception as exc:
+                log.warning("Gauntlet backtest migration failed: %s", exc)
+            existing_jobs = get_jobs()
+            if not existing_jobs:
+                seed_forven_jobs()
+                log.info("Seeded default scheduler jobs from API bootstrap")
+            else:
+                reconciliation = reconcile_forven_jobs()
+                added_monitoring = ensure_monitoring_jobs()
+                migrated_scanner = migrate_legacy_scanner_cadence()
+                migrated_data_jobs = migrate_data_manager_jobs()
+                if reconciliation["removed"] or reconciliation["added"] or added_monitoring or migrated_data_jobs:
+                    log.info(
+                        "Scheduler reconciliation from API bootstrap: removed=%d added=%d monitoring_added=%d data_jobs_migrated=%d",
+                        reconciliation["removed"],
+                        reconciliation["added"],
+                        added_monitoring,
+                        migrated_data_jobs,
+                    )
+                elif migrated_scanner:
+                    log.info("Applied scheduler legacy migration: scanner cadence updated")
+        except Exception as e:
+            log.error("API scheduler bootstrap failed: %s", e)
+            return
+        _SCHEDULER_BOOTSTRAP_DONE = True
 
 
 async def _on_startup():
