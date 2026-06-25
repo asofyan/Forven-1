@@ -309,7 +309,6 @@
 	$: quickScreenRows = buildQuickScreenEvidenceRows({
 		strategy: container?.strategy ?? null,
 		backtests: backtestHistory,
-		validationHistory,
 		pipelineSettings,
 	});
 	$: executionTrades = container?.execution.trades ?? [];
