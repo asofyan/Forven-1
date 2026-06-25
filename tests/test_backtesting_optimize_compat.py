@@ -13,7 +13,7 @@ from forven.backtesting import BacktestingClient
 from forven.db import get_db
 from forven.routers import strategies as strategies_router
 from forven.routers import verdict as verdict_router
-from forven.strategies.optimizer import _get_param_space, optimize_strategy
+from forven.strategies.optimizer import _get_param_space, grid_search, optimize_strategy
 
 
 def _insert_strategy(strategy_id: str, *, symbol: str = "BTC", timeframe: str = "1h") -> None:
@@ -656,6 +656,41 @@ def test_optimize_strategy_honors_execution_ranges_objective_window_and_base_par
     assert result["best_objective"] == "total_return_pct"
     assert result["best_objective_value"] == 9.5
     assert result["validated"] is True
+
+
+def test_grid_search_sanitizes_legacy_leverage_axes(monkeypatch):
+    captured_leverage: list[float | None] = []
+
+    def _fake_backtest_strategy(**kwargs):
+        captured_leverage.append(kwargs.get("leverage"))
+        return {
+            "metrics": {
+                "total_trades": 10,
+                "sharpe": 1.0,
+                "total_return_pct": 5.0,
+                "win_rate": 50.0,
+                "profit_factor": 1.2,
+            }
+        }
+
+    monkeypatch.setattr("forven.strategies.optimizer.backtest_strategy", _fake_backtest_strategy)
+
+    results = grid_search(
+        "S-legacy-leverage-axis",
+        "BTC",
+        "rsi_momentum",
+        {"leverage": [0, 1], "rsi_length": [14]},
+        bars=240,
+        base_params={"leverage": 0, "rsi_length": 14},
+        execution_controls={"leverage": 1},
+        execution_param_space={"leverage": {"min": 0, "max": 2, "step": 1}},
+        max_trials=10,
+    )
+
+    assert results
+    assert set(captured_leverage) == {1.0, 2.0}
+    assert all(result["params"] == {"rsi_length": 14} for result in results)
+    assert all(result["execution_controls"]["leverage"] in {1, 2} for result in results)
 
 
 def _isolate_param_space_lookups(monkeypatch, *, registry_obj=None):

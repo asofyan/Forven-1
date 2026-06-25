@@ -48,6 +48,20 @@ MAX_OPTIMIZATION_TRIALS = 10_000
 
 
 _LHS_SEED = 42  # Deterministic seed for reproducible LHS sampling
+_EXECUTION_ONLY_PARAM_AXES = frozenset({"leverage"})
+_STRICTLY_POSITIVE_EXECUTION_AXES = frozenset({
+    "initial_capital",
+    "leverage",
+    "risk_per_trade",
+    "fixed_size",
+    "atr_stop_multiplier",
+    "kelly_multiplier",
+    "kelly_lookback",
+    "stop_loss_pct",
+    "take_profit_pct",
+    "trailing_stop_pct",
+    "time_stop_bars",
+})
 
 
 def _finite_metric(metrics: dict, *keys: str, default: float = float("-inf")) -> float:
@@ -151,6 +165,31 @@ def _normalize_explicit_param_space(param_space: dict | None) -> dict | None:
     return normalized
 
 
+def _sanitize_execution_axis_values(name: str, values: list) -> list:
+    """Drop impossible execution candidates from API/UI ranges before sampling."""
+    if name not in _STRICTLY_POSITIVE_EXECUTION_AXES and name != "fee_bps" and name != "slippage_bps":
+        return values
+
+    sanitized: list = []
+    for value in values:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric):
+            continue
+        if name in _STRICTLY_POSITIVE_EXECUTION_AXES and numeric <= 0:
+            continue
+        if name in {"fee_bps", "slippage_bps"} and numeric < 0:
+            continue
+        if name == "leverage" and numeric > 125:
+            continue
+        if name == "risk_per_trade" and numeric > 1:
+            continue
+        sanitized.append(value)
+    return sanitized
+
+
 def _lhs_sample(
     combos: list[tuple],
     param_ranges: list[list],
@@ -238,6 +277,7 @@ def grid_search(
     # over the current persisted params for every trial; execution ranges are
     # merged over the active execution profile for every trial.
     param_space = param_space if isinstance(param_space, dict) else {}
+    param_space = {name: spec for name, spec in param_space.items() if name not in _EXECUTION_ONLY_PARAM_AXES}
     execution_param_space = execution_param_space if isinstance(execution_param_space, dict) else {}
     base_params = dict(base_params or {})
     base_execution_controls = dict(execution_controls or {})
@@ -248,7 +288,10 @@ def grid_search(
 
     for name in param_space:
         spec = param_space[name]
-        if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        expanded = _expand_range_dict_spec(spec)
+        if expanded is not None:
+            param_ranges.append(expanded)
+        elif isinstance(spec, (list, tuple)) and len(spec) == 3:
             low, high, step = spec
             values = []
             v = low
@@ -264,18 +307,25 @@ def grid_search(
 
     for name in execution_param_space:
         spec = execution_param_space[name]
-        if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        expanded = _expand_range_dict_spec(spec)
+        if expanded is not None:
+            values = expanded
+        elif isinstance(spec, (list, tuple)) and len(spec) == 3:
             low, high, step = spec
             values = []
             v = low
             while v <= high:
                 values.append(v)
                 v += step
-            param_ranges.append(values)
         elif isinstance(spec, list):
-            param_ranges.append(spec)
+            values = spec
         else:
-            param_ranges.append([spec])
+            values = [spec]
+        values = _sanitize_execution_axis_values(name, values)
+        if not values:
+            log.warning("Grid search %s: skipping invalid execution axis %s=%s", strategy_id, name, spec)
+            continue
+        param_ranges.append(values)
         axes.append(("execution", name))
 
     combos = list(itertools.product(*param_ranges))

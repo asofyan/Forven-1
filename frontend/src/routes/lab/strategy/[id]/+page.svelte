@@ -137,6 +137,35 @@
 		time_stop_bars: string;
 	};
 	const DEFAULT_EXECUTION_LEVERAGE = '1';
+	const EXECUTION_PARAM_KEYS = new Set([
+		'initial_capital',
+		'fee_bps',
+		'slippage_bps',
+		'leverage',
+		'sizing_mode',
+		'risk_per_trade',
+		'fixed_size',
+		'atr_stop_multiplier',
+		'kelly_multiplier',
+		'kelly_lookback',
+		'stop_loss_pct',
+		'take_profit_pct',
+		'trailing_stop_pct',
+		'time_stop_bars',
+	]);
+	const STRICTLY_POSITIVE_EXECUTION_RANGE_KEYS = new Set([
+		'initial_capital',
+		'leverage',
+		'risk_per_trade',
+		'fixed_size',
+		'atr_stop_multiplier',
+		'kelly_multiplier',
+		'kelly_lookback',
+		'stop_loss_pct',
+		'take_profit_pct',
+		'trailing_stop_pct',
+		'time_stop_bars',
+	]);
 
 	let strategyId = '';
 	let returnTo = '/lab';
@@ -294,7 +323,7 @@
 		if (!(value && typeof value === 'object' && !Array.isArray(value))) return {};
 		const out: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-			if (key !== 'execution_profile') out[key] = entry;
+			if (key !== 'execution_profile' && !EXECUTION_PARAM_KEYS.has(key)) out[key] = entry;
 		}
 		return out;
 	}
@@ -2268,9 +2297,17 @@
 		};
 	}
 
+	function createOptimizationExecutionParamDraft(key: string, value: number): OptimizationParamDraft {
+		const draft = createOptimizationParamDraft(key, value);
+		if (STRICTLY_POSITIVE_EXECUTION_RANGE_KEYS.has(key) && Number(draft.min) <= 0) {
+			draft.min = draft.kind === 'int' ? '1' : formatOptimizationInputValue(Math.max(Number(draft.step), 0.000001), draft.kind);
+		}
+		return draft;
+	}
+
 	function syncOptimizationParamDrafts(params: Record<string, unknown>) {
 		const optimizableEntries = Object.entries(params)
-			.filter(([, value]) => isOptimizableNumericParam(value))
+			.filter(([key, value]) => !EXECUTION_PARAM_KEYS.has(key) && isOptimizableNumericParam(value))
 			.map(([key, value]) => [key, Number(value)] as const);
 		const source = stableStringify(Object.fromEntries(optimizableEntries));
 		if (source === optimizationParamDraftSource) return;
@@ -2328,7 +2365,7 @@
 				nextDrafts[key] = existing;
 				continue;
 			}
-			nextDrafts[key] = createOptimizationParamDraft(key, value);
+			nextDrafts[key] = createOptimizationExecutionParamDraft(key, value);
 		}
 		optimizationExecutionDrafts = nextDrafts;
 		optimizationExecutionDraftSource = source;
@@ -2352,6 +2389,19 @@
 		if (draft.kind === 'int' && (!Number.isInteger(min) || !Number.isInteger(max) || !Number.isInteger(step))) {
 			return 'Whole-number params require whole-number min, max, and step.';
 		}
+		return '';
+	}
+
+	function validateOptimizationExecutionDraft(draft: OptimizationParamDraft): string {
+		const baseError = validateOptimizationParamDraft(draft);
+		if (baseError) return baseError;
+		const min = Number(draft.min);
+		const max = Number(draft.max);
+		if (STRICTLY_POSITIVE_EXECUTION_RANGE_KEYS.has(draft.key) && min <= 0) {
+			return `${draft.key} minimum must be greater than zero.`;
+		}
+		if (draft.key === 'leverage' && max > 125) return 'Leverage maximum cannot exceed 125.';
+		if (draft.key === 'risk_per_trade' && max > 1) return 'Risk per trade maximum cannot exceed 1.';
 		return '';
 	}
 
@@ -2388,7 +2438,7 @@
 			[key]: {
 				...draft,
 				selected,
-				error: selected ? validateOptimizationParamDraft(draft) : '',
+				error: selected ? validateOptimizationExecutionDraft(draft) : '',
 			},
 		};
 	}
@@ -2399,7 +2449,7 @@
 			nextDrafts[key] = {
 				...draft,
 				selected,
-				error: selected ? validateOptimizationParamDraft(draft) : '',
+				error: selected ? validateOptimizationExecutionDraft(draft) : '',
 			};
 		}
 		optimizationExecutionDrafts = nextDrafts;
@@ -2432,7 +2482,7 @@
 			...optimizationExecutionDrafts,
 			[key]: {
 				...nextDraft,
-				error: nextDraft.selected ? validateOptimizationParamDraft(nextDraft) : '',
+				error: nextDraft.selected ? validateOptimizationExecutionDraft(nextDraft) : '',
 			},
 		};
 	}
@@ -2479,7 +2529,7 @@
 		for (const [key, draft] of Object.entries(optimizationExecutionDrafts)) {
 			let error = '';
 			if (draft.selected) {
-				error = validateOptimizationParamDraft(draft);
+				error = validateOptimizationExecutionDraft(draft);
 				if (!error) {
 					executionRanges[key] = {
 						min: Number(draft.min),

@@ -827,6 +827,7 @@ describe('/lab/strategy/[id] backtest history', () => {
 					mode: 'trend',
 					meta: { source: 'rule' },
 					zero: 0,
+					leverage: 0,
 				},
 			}),
 		);
@@ -841,6 +842,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.querySelector('[data-testid="opt-param-select-enabled"]')).toBeNull();
 		expect(target.querySelector('[data-testid="opt-param-select-mode"]')).toBeNull();
 		expect(target.querySelector('[data-testid="opt-param-select-meta"]')).toBeNull();
+		expect(target.querySelector('[data-testid="opt-param-select-leverage"]')).toBeNull();
+		expect(target.querySelector('[data-testid="opt-exec-select-leverage"]')).not.toBeNull();
 		// A numeric param defaulting to exactly 0 (e.g. an off-by-default threshold) is now
 		// optimizable — its range is seeded via the step fallback rather than being hidden.
 		expect(target.querySelector('[data-testid="opt-param-select-zero"]')).not.toBeNull();
@@ -1002,11 +1005,43 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(payload).toEqual(expect.objectContaining({
 			strategy_id: 'S0001',
 			leverage: 1,
+			parameter_ranges: {
+				fast: { min: 10, max: 20, step: 2 },
+			},
 			execution_profile: expect.objectContaining({
 				leverage: 1,
 			}),
 		}));
+		expect(payload.parameter_ranges).not.toHaveProperty('leverage');
 		expect(target.textContent).not.toContain('Leverage must be greater than 0 and no more than 125.');
+	});
+
+	it('blocks invalid execution leverage ranges before optimization submit', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(
+			buildContainer([], {
+				params: {
+					fast: 12,
+					slow: 26,
+					signal: 9,
+				},
+			}),
+		);
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+
+		await waitForCondition(() => target.querySelector('[data-testid="opt-exec-select-leverage"]') !== null);
+		clickByTestId(target, 'opt-exec-select-leverage');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-min-leverage"]'), '0');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-max-leverage"]'), '2');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-step-leverage"]'), '1');
+		await flush();
+
+		clickButtonByText(target, 'Run Optimization');
+		await flush();
+
+		expect(apiMocks.submitOptimization).not.toHaveBeenCalled();
+		expect(target.querySelector('[data-testid="opt-exec-error-leverage"]')?.textContent).toContain('leverage minimum must be greater than zero.');
 	});
 
 	it('blocks optimization submit when a selected range is invalid', async () => {
@@ -1255,10 +1290,11 @@ describe('/lab/strategy/[id] backtest history', () => {
 		await waitForCondition(() => apiMocks.submitBacktest.mock.calls.length > 0);
 
 		expect(apiMocks.submitBacktest).toHaveBeenCalledWith(expect.objectContaining({
-			params: expect.objectContaining({ fast: 12, slow: 26, signal: 9, leverage: 1 }),
+			params: expect.objectContaining({ fast: 12, slow: 26, signal: 9 }),
 			initial_capital: 10000,
 			fee_bps: 4.5,
 			slippage_bps: 2,
+			leverage: 1,
 			sizing_mode: 'full',
 		}));
 	});
