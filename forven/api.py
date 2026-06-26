@@ -62,7 +62,6 @@ from forven.routers.webhooks import router as webhooks_router
 from forven.routers.updates import router as updates_router
 from forven.routers.backtesting import router as backtesting_router
 from forven.routers.lifecycle import router as lifecycle_router
-from forven.routers.simulation import router as simulation_router, simulation_api_enabled
 from forven.routers.verdict import router as verdict_router
 from forven.routers.robustness import router as robustness_router
 from forven.routers.gauntlet import router as gauntlet_router
@@ -658,8 +657,6 @@ app.include_router(backtesting_router)
 app.include_router(lifecycle_router)
 app.include_router(deepdive_router)
 app.include_router(assistant_router)
-if simulation_api_enabled():
-    app.include_router(simulation_router)
 app.include_router(verdict_router)
 app.include_router(robustness_router)
 app.include_router(gauntlet_router)
