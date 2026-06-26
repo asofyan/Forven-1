@@ -1153,6 +1153,21 @@ async def _run_runtime_worker_async(*, start_delay_seconds: float = 0.0) -> int:
         init_db()
     except Exception:
         log.exception("runtime worker: init_db failed (continuing)")
+
+    # Arm fail-closed spend enforcement IN THIS PROCESS before any loop can issue
+    # an LLM call. The agent/brain/daemon loops started below spend on the
+    # configured providers; without arming, the model-selection allow-list is a
+    # silent no-op (assert_callable / resolve_route fail OPEN) until the API
+    # process arms the persisted `forven:model-selection-enforced` flag — and the
+    # watchdog starts this worker BEFORE the API, so on a fresh install (or after
+    # disable_enforcement) the loops could spend on never-connected providers.
+    # Mirrors forven/daemon.py and every other spend-capable process; idempotent.
+    try:
+        from forven.model_selection import ensure_enforcement_armed
+
+        ensure_enforcement_armed()
+    except Exception:
+        log.exception("runtime worker: failed to arm spend enforcement")
     try:
         recovered = reset_scheduler_job_locks()
         if recovered:
