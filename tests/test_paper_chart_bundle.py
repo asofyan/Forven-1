@@ -41,6 +41,41 @@ def test_indicator_specs_resolution():
     assert paper_domain._chart_indicator_specs("some_custom_thing", {}) == []
 
 
+def test_indicator_specs_for_added_types():
+    """The composite / variant types now resolve to the registry indicators they
+    actually gate on (previously they fell through to the 'no overlay' warning)."""
+    _kinds = lambda stype, params: [s["kind"] for s in paper_domain._chart_indicator_specs(stype, params)]
+    assert _kinds("bollinger_reversion", {"bb_period": 20, "bb_std": 2.0, "rsi_period": 14}) == ["bollinger", "rsi"]
+    assert _kinds("bb_rsi_reversion", {"bb_period": 20, "bb_std": 2.0, "rsi_period": 14}) == ["bollinger", "rsi"]
+    assert _kinds("funding_fade_rsi", {"funding_period": 48, "rsi_period": 14}) == ["funding_zscore", "rsi"]
+    assert _kinds("macd_volume", {"fast": 12, "slow": 26, "signal": 9, "vol_period": 20}) == ["macd", "volume_sma"]
+    assert _kinds("trend_keltner", {"kc_period": 20, "kc_mult": 2.0, "ma_period": 100}) == ["keltner", "ema"]
+    # ORB: the opening-range high/low band == a donchian channel over range_bars.
+    orb = paper_domain._chart_indicator_specs("orb", {"range_bars": 6})
+    assert [s["kind"] for s in orb] == ["donchian"]
+    assert orb[0]["params"]["length"] == 6
+
+
+def test_marker_descriptor_fields():
+    """Every real fill / would-be trigger is self-describing (side/action/shape/color)
+    so the frontend renders the four distinct labeled markers + muted trigger arrows."""
+    buy = paper_domain._trade_marker_fields("long", "entry")
+    assert buy == {"side": "bull", "action": "buy", "shape": "arrowUp", "color": "#22c55e", "label": "BUY"}
+    sell = paper_domain._trade_marker_fields("long", "exit")
+    assert sell == {"side": "bear", "action": "sell", "shape": "arrowDown", "color": "#ef4444", "label": "SELL"}
+    short = paper_domain._trade_marker_fields("short", "entry")
+    assert short == {"side": "bear", "action": "short", "shape": "arrowDown", "color": "#f97316", "label": "SHORT"}
+    cover = paper_domain._trade_marker_fields("short", "exit")
+    assert cover == {"side": "bull", "action": "cover", "shape": "arrowUp", "color": "#14b8a6", "label": "COVER"}
+    # Triggers: muted hues, entry=green up / exit=red down, long/short kept in action.
+    tlong = paper_domain._trigger_marker_fields("long", "entry")
+    assert tlong == {"side": "bull", "action": "long_signal", "shape": "arrowUp", "color": "#4ade80"}
+    tshort = paper_domain._trigger_marker_fields("short", "entry")
+    assert tshort["action"] == "short_signal" and tshort["shape"] == "arrowUp" and tshort["color"] == "#4ade80"
+    texit = paper_domain._trigger_marker_fields("long", "exit")
+    assert texit == {"side": "bear", "action": "exit_signal", "shape": "arrowDown", "color": "#f87171"}
+
+
 def test_compute_chart_indicators_uses_registry():
     frame = _frame()
     specs = paper_domain._chart_indicator_specs("rsi_momentum", {"rsi_period": 14, "ema_fast": 10, "ema_slow": 30})
@@ -118,12 +153,33 @@ def test_chart_bundle_assembles_everything(monkeypatch):
     # 1. Real indicators (registry), not guessed.
     assert {m["name"] for m in bundle["main_indicators"]} == {"ema_fast", "ema_slow"}
     assert any(s["name"] == "rsi" for s in bundle["sub_indicators"])
-    # 2. Full-history triggers.
+    # 2. Full-history triggers — self-describing (muted arrows distinct from fills).
     assert bundle["trigger_entries"] and bundle["trigger_exits"]
-    # 3. Actual trade markers.
-    assert any(m["trade_id"] == "E1" for m in bundle["entry_markers"])
-    assert any(m["trade_id"] == "E1" for m in bundle["exit_markers"])
-    # 4. Active stop + take-profit from the open position.
-    assert bundle["active_levels"]["stop"] and bundle["active_levels"]["take_profit"]
-    assert bundle["active_levels"]["stop"][0]["price"] == pytest.approx(bars[590]["close"] * 0.97)
-    assert bundle["active_levels"]["take_profit"][0]["price"] == pytest.approx(bars[590]["close"] * 1.05)
+    te = bundle["trigger_entries"][0]
+    assert te["shape"] == "arrowUp" and te["color"] == "#4ade80" and te["action"] in ("long_signal", "short_signal")
+    tx = bundle["trigger_exits"][0]
+    assert tx["shape"] == "arrowDown" and tx["color"] == "#f87171" and tx["action"] == "exit_signal"
+    # 3. Actual trade markers — the long entry/exit carry BUY/SELL descriptors.
+    e1_entry = next(m for m in bundle["entry_markers"] if m["trade_id"] == "E1")
+    assert e1_entry["action"] == "buy" and e1_entry["label"] == "BUY" and e1_entry["shape"] == "arrowUp"
+    assert e1_entry["color"] == "#22c55e" and e1_entry["side"] == "bull"
+    e1_exit = next(m for m in bundle["exit_markers"] if m["trade_id"] == "E1")
+    assert e1_exit["action"] == "sell" and e1_exit["label"] == "SELL" and e1_exit["shape"] == "arrowDown"
+    assert e1_exit["color"] == "#ef4444" and e1_exit["side"] == "bear"
+    # Open position appended as a BUY marker too.
+    assert any(m.get("is_open") and m["label"] == "BUY" for m in bundle["entry_markers"])
+    # 4. Active levels: ENTRY + stop + take-profit, each self-describing.
+    levels = bundle["active_levels"]
+    assert levels["stop"] and levels["take_profit"] and levels["entry"]
+    assert levels["stop"][0]["price"] == pytest.approx(bars[590]["close"] * 0.97)
+    assert levels["take_profit"][0]["price"] == pytest.approx(bars[590]["close"] * 1.05)
+    assert levels["entry"][0]["price"] == pytest.approx(bars[590]["close"])
+    assert levels["entry"][0]["type"] == "entry" and levels["entry"][0]["label"] == "ENTRY"
+    assert levels["entry"][0]["color"] == "#3b82f6"
+    for bucket, ltype, label, color in (
+        ("stop", "stop", "SL", "#ef4444"),
+        ("take_profit", "take_profit", "TP", "#22c55e"),
+    ):
+        lvl = levels[bucket][0]
+        assert lvl["type"] == ltype and lvl["label"] == label and lvl["color"] == color
+        assert lvl["from_time"] == bars[590]["timestamp"] and lvl["to_time"] is None

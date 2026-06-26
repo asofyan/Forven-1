@@ -1119,6 +1119,85 @@ def _transition_to_paper(**kwargs) -> dict[str, Any]:
     return transition_stage(**kwargs)
 
 
+def _execution_profile_selection_enabled() -> bool:
+    """Operator switch (default on): pick + freeze the best risk engine at promotion."""
+    try:
+        from forven.api_core import get_settings
+
+        return bool(get_settings().get("paper_select_execution_profile", True))
+    except Exception:
+        return True
+
+
+def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id: str) -> dict[str, Any]:
+    """Pick the best RISK ENGINE for a strategy and FREEZE it onto its params so
+    paper/live size + stop EXACTLY like the engine the backtest chose.
+
+    Runs a bounded sizing/stop sweep through the shared kernel and scores by a
+    risk-adjusted objective (Sharpe). Idempotent — skips when a profile is already
+    present (manual or a prior selection) — and best-effort: any failure is logged
+    and promotion proceeds on the safe shared default (1% risk / 2x-ATR). This is
+    the chokepoint that makes "paper adheres to the chosen engine" true: every
+    strategy passes through the promotion gate before it is param-locked in paper.
+    """
+    if not _execution_profile_selection_enabled():
+        return {"skipped": True, "reason": "disabled by setting"}
+
+    from forven.db import get_db
+    from forven.strategies.execution_selection import select_execution_profile
+    from forven.strategies.sizing import normalize_execution_controls
+
+    row = _strategy_row(strategy_id)
+    if not row:
+        return {"skipped": True, "reason": "strategy not found"}
+    params = _loads(row.get("params"), {})
+    if not isinstance(params, dict):
+        params = {}
+    if isinstance(params.get("execution_profile"), dict) and params["execution_profile"]:
+        return {"skipped": True, "reason": "execution_profile already present"}
+
+    selection = select_execution_profile(
+        strategy_id=strategy_id,
+        asset=str(row.get("symbol") or "BTC"),
+        strategy_type=str(row.get("type") or ""),
+        params=params,
+        timeframe=str(row.get("timeframe") or "1h"),
+        regime_gate=False,  # match the paper scanner's kernel call (the parity reference)
+        lean=True,          # bounded grid for promotion-time latency
+    )
+
+    metrics = _loads(row.get("metrics"), {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+    chosen = selection.get("chosen")
+    marker = {
+        "objective": selection.get("objective"),
+        "chosen_label": selection.get("chosen_label"),
+        "chosen_score": selection.get("chosen_score"),
+        "n_candidates": selection.get("n_candidates"),
+        "n_eligible": selection.get("n_eligible"),
+    }
+    new_params = dict(params)
+    if isinstance(chosen, dict) and chosen:
+        normalized = normalize_execution_controls(chosen) or chosen
+        new_params["execution_profile"] = normalized
+        marker["profile"] = normalized
+    metrics["gauntlet_selected_execution_profile"] = marker
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET params = ?, metrics = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(new_params, sort_keys=True), json.dumps(metrics, sort_keys=True), strategy_id),
+        )
+    log.info(
+        "execution-profile selection for %s: chose %s (%s=%.4f over %d candidates, %d eligible)",
+        strategy_id, selection.get("chosen_label"), selection.get("objective"),
+        float(selection.get("chosen_score") or 0.0),
+        int(selection.get("n_candidates") or 0), int(selection.get("n_eligible") or 0),
+    )
+    return {"skipped": False, "selection": marker}
+
+
 def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     from forven.gauntlet.status import get_strategy_gauntlet_status
 
@@ -1147,6 +1226,19 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
     # (the authoritative numeric gate); composite_robustness_score remains a
     # UI/ranking number only (still surfaced in `status`).
 
+    # Pick + freeze the best risk engine BEFORE the transition so the strategy
+    # enters paper sized/stopped by the engine the backtest chose (best-effort;
+    # never blocks promotion). After it transitions to paper its params are
+    # operator-locked, so this is the moment to record it.
+    try:
+        profile_selection = _select_and_persist_execution_profile(workflow, strategy_id)
+    except Exception as exc:  # noqa: BLE001 — selection must never block promotion
+        log.warning(
+            "execution-profile selection failed for %s (promoting on the default engine): %s",
+            strategy_id, exc,
+        )
+        profile_selection = {"error": str(exc)}
+
     transition = _transition_to_paper(
         strategy_id=strategy_id,
         target_stage="paper",
@@ -1156,7 +1248,7 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
     )
     target = str(transition.get("to") or transition.get("target_stage") or "").strip().lower()
     if target == "paper":
-        return {"status": "passed", "transition": transition, "gauntlet_status": status}
+        return {"status": "passed", "transition": transition, "gauntlet_status": status, "execution_profile_selection": profile_selection}
     reason_code = str(transition.get("reason_code") or "").strip()
     if transition.get("approval_id") or reason_code == "operator_promotion_approval_required":
         return {

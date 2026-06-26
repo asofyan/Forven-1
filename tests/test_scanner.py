@@ -1013,12 +1013,14 @@ def test_manage_positions_uses_dynamic_position_sizing(monkeypatch):
         account_equity=10_000.0,
     )
 
-    # Mirror sizing: no execution profile → default 1% risk of the $10k paper
-    # sandbox over the 2% stop, at 2x leverage → size_fraction 0.01/(0.02*2)=0.25
-    # → 2.5 ETH (loss-at-stop = 2.5 * 40 = $100 = 1% of equity).
+    # Mirror sizing: no execution profile → default risk engine = 1% risk of the
+    # $10k paper sandbox over a 2x-ATR stop (here 2*20/2000 = 2%), at 2x leverage
+    # → size_fraction 0.01/(0.02*2)=0.25 → 2.5 ETH (loss-at-stop = 2.5*40 = $100 =
+    # 1% of equity). The default engine is `atr`, not `fraction` (the $100-notional
+    # bug fix), and it derives the same 2% distance from ATR here.
     assert opened["size"] == 2.5
     assert opened["signal_data"]["sizing"]["mirror_sized"] is True
-    assert opened["signal_data"]["sizing"]["sizing_mode"] == "fraction"
+    assert opened["signal_data"]["sizing"]["sizing_mode"] == "atr"
     assert opened["signal_data"]["sizing"]["source"] == "default_1pct"
     assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 1960.0
     assert opened["signal_data"]["risk_plan"]["take_profit_price"] == 2080.0
@@ -1084,11 +1086,13 @@ def test_manage_positions_derives_stop_from_sizing_when_strategy_has_no_stop(mon
         account_equity=10_000.0,
     )
 
-    assert opened["signal_data"]["stop_loss"] == 85.0
+    # Default risk engine derives a 2x-ATR stop (2*10 = 20) → stop at 100-20 = 80.0,
+    # aligned with the kernel (previously the legacy path used an ad-hoc 1.5x-ATR = 85).
+    assert opened["signal_data"]["stop_loss"] == 80.0
     assert opened["signal_data"]["stop_loss_source"] == "atr_fallback"
     assert opened["signal_data"]["exchange_stop_requested"] is True
     assert opened["signal_data"]["exchange_take_profit_requested"] is False
-    assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 85.0
+    assert opened["signal_data"]["risk_plan"]["stop_loss_price"] == 80.0
     assert opened["signal_data"].get("take_profit") is None
     assert [fill["fill_kind"] for fill in fills] == ["entry"]
     assert fills[0]["trade_id"] == "E-ATR-1"
@@ -2038,3 +2042,58 @@ def test_enrich_scan_frame_preserves_explicit_pair_symbol(monkeypatch):
     scanner_mod._enrich_scan_frame(df, "SOL/USDT", "1h")
 
     assert seen["symbol"] == "SOL/USDT"  # already a pair — left intact
+
+
+# ── kernel→legacy fallback hardening (no-auto-fallback parity stance) ─────────
+
+def _kernel_dispatch_fixture(monkeypatch, *, kernel_return):
+    """Wire _apply_execution_actions so a paper strategy is kernel-eligible and the
+    kernel returns `kernel_return`; track whether the legacy engine runs."""
+    legacy_calls: list[str] = []
+    monkeypatch.setattr(scanner_mod, "_get_account_equity", lambda: 10_000.0)
+    monkeypatch.setattr(scanner_mod, "_paper_kernel_execution_enabled", lambda: True)
+    monkeypatch.setattr(scanner_mod, "_is_kernel_paper_strategy", lambda _s: True)
+    monkeypatch.setattr(scanner_mod, "_live_kernel_execution_enabled", lambda: False)
+    monkeypatch.setattr(
+        scanner_mod, "manage_positions_via_kernel",
+        lambda *a, **k: kernel_return,
+    )
+    monkeypatch.setattr(
+        scanner_mod, "manage_positions",
+        lambda *a, **k: (legacy_calls.append(str(a[0])) or ["LEGACY-OPENED"]),
+    )
+    return legacy_calls
+
+
+def _one_signal_row():
+    return [{"strategy_id": "S-FB", "strategy": {"asset": "BTC", "stage": "paper"}, "signal": {}}]
+
+
+def test_transient_kernel_failure_skips_without_legacy(monkeypatch):
+    # KERNEL_SKIP_SCAN must NOT fall through to the divergent legacy engine.
+    legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=scanner_mod.KERNEL_SKIP_SCAN)
+    diag: dict = {}
+    actions = scanner_mod._apply_execution_actions(_one_signal_row(), diagnostics_out=diag)
+    assert actions == []
+    assert legacy == []  # legacy engine never ran
+
+
+def test_non_vectorizable_is_flagged_not_legacy_traded_by_default(monkeypatch):
+    # kernel returns None (genuinely non-vectorizable) + fallback disabled (default)
+    # → flag non-parity, do NOT trade on legacy.
+    legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=None)
+    monkeypatch.setattr(scanner_mod, "_paper_legacy_fallback_enabled", lambda: False)
+    diag: dict = {}
+    actions = scanner_mod._apply_execution_actions(_one_signal_row(), diagnostics_out=diag)
+    assert actions == []
+    assert legacy == []
+    assert diag["S-FB"]["execution_decision"] == "non_vectorizable_no_parity"
+
+
+def test_non_vectorizable_uses_legacy_when_fallback_enabled(monkeypatch):
+    # Opt-in: enabling the legacy fallback restores trading non-vectorizable strategies.
+    legacy = _kernel_dispatch_fixture(monkeypatch, kernel_return=None)
+    monkeypatch.setattr(scanner_mod, "_paper_legacy_fallback_enabled", lambda: True)
+    actions = scanner_mod._apply_execution_actions(_one_signal_row())
+    assert actions == ["LEGACY-OPENED"]
+    assert legacy == ["S-FB"]

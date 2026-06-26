@@ -93,7 +93,9 @@ def test_profile_is_threaded_from_params_when_no_explicit_controls():
     profile explicitly — and DIFFERENTLY from the default 1% sizing. This is what makes
     the promotion metrics reflect what paper actually trades."""
     df = _frame()
-    profile = {"sizing_mode": "atr", "atr_stop_multiplier": 2.0, "risk_per_trade": 0.01, "take_profit_pct": 6.0}
+    # Chosen to size DIFFERENTLY from the default risk engine (atr / mult=2.0 / risk=1%):
+    # 2% risk over a 3.5x-ATR stop, so size_fraction is unambiguously distinct.
+    profile = {"sizing_mode": "atr", "atr_stop_multiplier": 3.5, "risk_per_trade": 0.02, "take_profit_pct": 6.0}
     base = {"rsi_period": 14, "rsi_entry": 45, "rsi_exit": 55, "ema_fast": 10, "ema_slow": 30, "adx_period": 14, "adx_min": 0}
     profiled = dict(base, execution_profile=profile)
 

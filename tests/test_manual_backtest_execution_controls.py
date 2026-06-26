@@ -3,11 +3,12 @@
 Covers the stops + position-sizing path in ``_run_directional_signal_series``.
 
 Parity overhaul note: a strategy with no actionable execution profile (None / {} /
-bare ``sizing_mode="full"``) is now sized at the default 1% risk (fraction mode) via
-the shared ``execution_kernel`` — the SAME path the live/paper scanner uses — rather
-than the old full-notional kernel. This is what makes paper reproduce the backtest for
-profile-less strategies (the common case). The tests below assert that unified
-behavior.
+bare ``sizing_mode="full"``) is now sized by the default RISK ENGINE — 1% risk over a
+2x-ATR stop (``sizing_mode="atr"``), which the kernel both sizes off AND places as a
+real stop — via the shared ``execution_kernel`` (the SAME path the live/paper scanner
+uses). This replaces the old flat-1%-notional degeneracy (the "$100 on a $10k
+portfolio" bug) and is what makes paper reproduce the backtest for profile-less
+strategies (the common case). The tests below assert that unified behavior.
 """
 from __future__ import annotations
 
@@ -71,7 +72,7 @@ def test_normalize_coerces_and_clamps():
 
 
 # ---------------------------------------------------------------------------
-# No actionable profile → default 1% fraction sizing (parity with the scanner)
+# No actionable profile → default ATR risk engine (parity with the scanner)
 # ---------------------------------------------------------------------------
 
 def test_no_controls_uses_default_risk_sizing():
@@ -83,14 +84,17 @@ def test_no_controls_uses_default_risk_sizing():
     # Entry fills next bar open after signal[1] -> bar 2 open=102; exit signal[5] -> bar 6 open=102.
     assert t["entry_price"] == pytest.approx(102.0)
     assert t["exit_price"] == pytest.approx(102.0)
-    # No profile -> default fraction sizing at 1% risk (no stop -> flat risk_per_trade).
-    assert t["size_fraction"] == pytest.approx(0.01)
+    # No profile -> default ATR risk engine: risk-based sizing (NOT the old flat 1%
+    # notional). With a tight ATR stop the fraction clamps toward 1.0; the exact risk
+    # math is pinned in test_sizing.py. The key property: it's no longer piddly.
+    assert t["size_fraction"] > 0.01
+    assert t["size_fraction"] <= 1.0
     assert t["exit_reason"] == "signal"
 
 
 def test_no_controls_and_full_sizing_match():
     """Both None and bare sizing_mode='full' are 'no actionable profile' → identical
-    (default 1% fraction) trades."""
+    trades under the default ATR risk engine."""
     df = _frame([100, 101, 103, 102, 104, 101, 100])
     sig = _signals(df, entries=[1], exits=[4])
     none_ctrl = bt._run_directional_signal_series(df, sig, warmup=0, leverage=2.0, fee_bps=3.5, slippage_bps=2.0)
@@ -99,7 +103,9 @@ def test_no_controls_and_full_sizing_match():
         execution_controls={"sizing_mode": "full"},
     )
     assert [t["pnl_pct"] for t in none_ctrl] == [t["pnl_pct"] for t in full]
-    assert none_ctrl[0]["size_fraction"] == pytest.approx(0.01)
+    # Both resolve to the SAME default engine, so sizing matches and is risk-based.
+    assert none_ctrl[0]["size_fraction"] == pytest.approx(full[0]["size_fraction"])
+    assert none_ctrl[0]["size_fraction"] > 0.01
 
 
 # ---------------------------------------------------------------------------

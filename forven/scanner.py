@@ -5062,9 +5062,33 @@ def _blocked_scan_row(
 # the backtest. Proven end-to-end in tests/test_paper_reconcile_parity.py.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Sentinel: a TRANSIENT failure (candle fetch error, engine exception, unresolved
+# strategy instance, no asset) prevented the kernel from running. The caller SKIPS
+# this strategy for this scan rather than silently dropping to the divergent legacy
+# engine — paper must never trade on different rules than the backtest would. This
+# is distinct from None, which means the strategy is genuinely non-vectorizable.
+KERNEL_SKIP_SCAN = object()
+
+
 def _paper_kernel_execution_enabled() -> bool:
     """Master switch for kernel-driven paper execution (parity path)."""
     return _scanner_bool_setting("paper_kernel_execution", True)
+
+
+def _paper_legacy_fallback_enabled() -> bool:
+    """When False (default), a kernel-eligible strategy that exposes NO vectorized
+    signals is flagged as non-parity and NOT traded on the divergent legacy per-bar
+    engine — a strategy that cannot run the kernel cannot reproduce its backtest, so
+    fail closed (the operator's no-auto-fallback stance). Set true to restore the
+    legacy fallback for non-vectorizable strategies."""
+    return _scanner_bool_setting("paper_legacy_fallback_enabled", False)
+
+
+def _paper_include_funding_enabled() -> bool:
+    """Charge perp funding into paper closed-trade PnL when the backtest does (it
+    funds by default). Reads the SAME setting key as the backtest so the two engines
+    keep ONE funding convention — net-costs parity."""
+    return _scanner_bool_setting("backtest_include_funding", True)
 
 
 def _paper_kernel_history_bars() -> int:
@@ -5072,6 +5096,19 @@ def _paper_kernel_history_bars() -> int:
         return max(int(_scanner_float_setting("paper_kernel_history_bars", 1500)), 300)
     except Exception:
         return 1500
+
+
+def _paper_kernel_backfill_bars() -> int:
+    """How many recent bars of kernel entries the scanner will OPEN/backfill on a
+    scan. The window gives downtime tolerance: if the scanner misses a few bars, the
+    entries in the gap are still recorded (matched by direction+entry_time, so no
+    duplicates) instead of being permanently dropped as the backtest takes them. It
+    stays bounded so a fresh/reset book never replays full history. Default 6
+    (~5 missed scans); was a hard 2."""
+    try:
+        return max(int(_scanner_float_setting("paper_kernel_backfill_bars", 6)), 2)
+    except Exception:
+        return 6
 
 
 def _is_kernel_paper_strategy(strat: dict) -> bool:
@@ -5386,10 +5423,21 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     from forven.strategies import backtest as _bt
     from forven.strategies.paper_reconcile import reconcile
 
+    def _skip(reason: str) -> object:
+        """Transient kernel failure → skip this scan (do NOT run the divergent legacy
+        engine); surface the reason so the operator sees which strategies aren't on
+        the parity path and why."""
+        if diagnostics is not None:
+            diagnostics[strat_id] = {
+                "strategy_id": strat_id, "execution_decision": "kernel_skip_transient",
+                "reason": reason, "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+            }
+        return KERNEL_SKIP_SCAN
+
     p = dict(strat.get("params") or {})
     asset = str(strat.get("asset") or "").strip()
     if not asset:
-        return None
+        return _skip("no asset on strategy")
     timeframe = str(strat.get("timeframe") or p.get("timeframe") or "1h").strip().lower() or "1h"
 
     try:
@@ -5398,10 +5446,10 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
         )
         df = _trim_unclosed_latest_candle(df, timeframe)
     except Exception as exc:
-        log.warning("[%s] kernel paper: candle fetch failed (%s); legacy path", strat_id, exc)
-        return None
+        log.warning("[%s] kernel paper: candle fetch failed (%s); SKIP scan (no legacy)", strat_id, exc)
+        return _skip(f"candle fetch failed: {exc}")
     if df is None or df.empty or len(df) < 20:
-        return None
+        return _skip("insufficient candle history")
 
     strategy_instance = None
     try:
@@ -5417,7 +5465,7 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     except Exception:
         strategy_instance = None
     if strategy_instance is None:
-        return None
+        return _skip("could not resolve strategy instance")
 
     leverage = float(p.get("leverage", 1.0) or 1.0)
     _, fee_bps, slippage_bps = _resolve_trade_assumptions(p)
@@ -5437,18 +5485,30 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             strategy_type=strategy_type,
         )
     except Exception as exc:
-        log.warning("[%s] kernel paper: run_strategy_execution failed (%s); legacy path", strat_id, exc)
-        return None
+        log.warning("[%s] kernel paper: run_strategy_execution failed (%s); SKIP scan (no legacy)", strat_id, exc)
+        return _skip(f"run_strategy_execution failed: {exc}")
     if res is None:
-        return None  # no vectorized signals → legacy per-bar path
+        return None  # genuinely non-vectorizable → caller decides (flag vs legacy)
+
+    # Net-costs parity: charge perp funding into the kernel trades' pnl_pct exactly
+    # like the backtest (which funds by default via _apply_funding_to_trades).
+    # run_strategy_execution nets only fees+slippage; funding is applied here so a
+    # held perp position's closed PnL matches the backtest rather than overstating it.
+    if res.closed_trades and _paper_include_funding_enabled():
+        try:
+            _bt._apply_funding_to_trades(res.closed_trades, df, leverage, timeframe)
+        except Exception as exc:
+            log.warning("[%s] kernel paper: funding application failed (%s); net-of-fees only", strat_id, exc)
 
     is_live = str(execution_type).strip().lower() == "live"
     sizing_equity = _get_account_equity() if is_live else _get_paper_strategy_equity(strat_id)
     # Only RECORD activity from go-live forward — never replay the strategy's entire
-    # would-be history as trades (that flooded a fresh/reset book). The last couple of
-    # bars give scan-timing tolerance; pre-cutoff trades show on the chart as triggers,
-    # not as recorded trades. Closes/refreshes of already-recorded trades are unaffected.
-    recent_cutoff = str(df.index[-2]) if len(df) >= 2 else None
+    # would-be history as trades (that flooded a fresh/reset book). The recent window
+    # gives scan-timing + downtime tolerance (missed bars still get backfilled, matched
+    # by direction+entry_time so no duplicates); pre-cutoff trades show on the chart as
+    # triggers, not recorded trades. Closes/refreshes of recorded trades are unaffected.
+    _backfill_bars = min(_paper_kernel_backfill_bars(), len(df))
+    recent_cutoff = str(df.index[-_backfill_bars]) if len(df) >= 2 else None
     actions_plan = reconcile(res, _kernel_recorded_trades(strat_id), recent_cutoff=recent_cutoff)
     open_applier = _kernel_open_live_trade if is_live else _kernel_open_paper_trade
     close_applier = _kernel_close_live_trade if is_live else _kernel_close_paper_trade
@@ -5916,19 +5976,47 @@ def _apply_execution_actions(signal_rows: list[dict], diagnostics_out: dict[str,
             strat = item["strategy"]
             signal = item["signal"]
             actions = None
+            kernel_attempted = False
             # Parity path: strategies with vectorized signals are managed by the shared
             # backtest kernel (paper trades == backtest trades; live takes the SAME
-            # decisions with real fills). Falls back to the legacy per-bar path when
-            # disabled or the strategy has no vectorized signals (→ None).
+            # decisions with real fills).
             if _paper_kernel_execution_enabled() and _is_kernel_paper_strategy(strat):
+                kernel_attempted = True
                 actions = manage_positions_via_kernel(
                     strat_id, strat, account_equity=account_equity, execution_type="paper", diagnostics=diagnostics_out,
                 )
             elif _live_kernel_execution_enabled() and _is_live_kernel_stage(strat):
+                kernel_attempted = True
                 actions = manage_positions_via_kernel(
                     strat_id, strat, account_equity=account_equity, execution_type="live", diagnostics=diagnostics_out,
                 )
+
+            if actions is KERNEL_SKIP_SCAN:
+                # Transient kernel failure — skip this strategy this scan. Do NOT fall
+                # through to the legacy engine, whose entry timing / exit model / PnL
+                # convention diverge from the backtest (would silently break parity).
+                continue
             if actions is None:
+                # actions is None means: kernel not attempted (disabled / not a kernel
+                # stage) OR the strategy is genuinely non-vectorizable.
+                if kernel_attempted and not _paper_legacy_fallback_enabled():
+                    # Kernel-eligible but non-vectorizable: a strategy that cannot run
+                    # the kernel cannot reproduce its backtest. Fail closed — flag it
+                    # as non-parity instead of trading it on the divergent legacy path.
+                    if diagnostics_out is not None:
+                        diagnostics_out[strat_id] = {
+                            "strategy_id": strat_id,
+                            "execution_decision": "non_vectorizable_no_parity",
+                            "reason": "strategy exposes no vectorized generate_signals; "
+                                      "not traded on the legacy engine (set paper_legacy_fallback_enabled to override)",
+                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                        }
+                    log.warning(
+                        "[%s] paper: non-vectorizable strategy has no parity engine; skipping "
+                        "(enable paper_legacy_fallback_enabled to trade it on the legacy path)",
+                        strat_id,
+                    )
+                    continue
                 actions = manage_positions(
                     strat_id,
                     strat,

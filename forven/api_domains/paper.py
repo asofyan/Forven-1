@@ -1508,6 +1508,46 @@ def _build_strategy_signal_markers(session: dict, *, limit: int = 500) -> tuple[
     return entries, exits
 
 
+# Self-describing marker visuals (industry-standard trading-chart conventions).
+# Real fills are four DISTINCT labeled markers; would-be triggers are smaller,
+# muted arrows. Every marker carries shape/color/side/action so the frontend can
+# render straight from the payload (it still falls back to direction if absent).
+_MARK_BUY = "#22c55e"      # long entry  (BUY)
+_MARK_SELL = "#ef4444"     # long exit   (SELL)
+_MARK_SHORT = "#f97316"    # short entry (SHORT, orange)
+_MARK_COVER = "#14b8a6"    # short exit  (COVER, teal)
+_MARK_TRIG_ENTRY = "#4ade80"  # muted green: would-be entry trigger
+_MARK_TRIG_EXIT = "#f87171"   # muted red:   would-be exit trigger
+
+
+def _trade_marker_fields(direction: str, leg: str) -> dict:
+    """Self-describing visual fields for a REAL fill. ``leg`` is 'entry' or 'exit'.
+
+    side ('bull'|'bear') drives above/below-bar placement on the frontend;
+    BUY/COVER sit below the bar (bullish), SELL/SHORT sit above (bearish)."""
+    is_short = str(direction or "long").strip().lower() == "short"
+    if leg == "entry":
+        if is_short:
+            return {"side": "bear", "action": "short", "shape": "arrowDown", "color": _MARK_SHORT, "label": "SHORT"}
+        return {"side": "bull", "action": "buy", "shape": "arrowUp", "color": _MARK_BUY, "label": "BUY"}
+    if is_short:
+        return {"side": "bull", "action": "cover", "shape": "arrowUp", "color": _MARK_COVER, "label": "COVER"}
+    return {"side": "bear", "action": "sell", "shape": "arrowDown", "color": _MARK_SELL, "label": "SELL"}
+
+
+def _trigger_marker_fields(direction: str, leg: str) -> dict:
+    """Self-describing visual fields for a would-be TRIGGER. ``leg`` is 'entry'/'exit'.
+
+    Entries are green up-arrows (below bar), exits red down-arrows (above bar); the
+    long/short nuance is preserved in ``action`` while the color/shape follow the
+    entry/exit convention the product owner asked for."""
+    is_short = str(direction or "long").strip().lower() == "short"
+    if leg == "entry":
+        return {"side": "bull", "action": "short_signal" if is_short else "long_signal",
+                "shape": "arrowUp", "color": _MARK_TRIG_ENTRY}
+    return {"side": "bear", "action": "exit_signal", "shape": "arrowDown", "color": _MARK_TRIG_EXIT}
+
+
 def get_paper_session_markers(
     session_id: str,
     *,
@@ -1538,6 +1578,7 @@ def get_paper_session_markers(
                     "is_open": False,
                     "direction": direction,
                     "marker_kind": "trade",
+                    **_trade_marker_fields(direction, "entry"),
                 }
             )
         if exit_ts and exit_price is not None:
@@ -1551,6 +1592,7 @@ def get_paper_session_markers(
                     "is_open": False,
                     "direction": direction,
                     "marker_kind": "trade",
+                    **_trade_marker_fields(direction, "exit"),
                 }
             )
 
@@ -1563,14 +1605,16 @@ def get_paper_session_markers(
         entry_time = str((position or {}).get("entry_time") or "").strip()
         entry_price = trading_domain._coerce_optional_float((position or {}).get("entry_price"))
         if entry_time and entry_price is not None:
+            _open_dir = str((position or {}).get("side") or "long").lower()
             entries.append(
                 {
                     "timestamp": entry_time,
                     "price": entry_price,
                     "trade_id": f"open:{session.get('id')}:{index}",
                     "is_open": True,
-                    "direction": str((position or {}).get("side") or "long").lower(),
+                    "direction": _open_dir,
                     "marker_kind": "trade",
+                    **_trade_marker_fields(_open_dir, "entry"),
                 }
             )
 
@@ -1655,6 +1699,32 @@ def _chart_indicator_specs(strategy_type: str, params: dict) -> list[dict]:
         "ichimoku": [{"id": "ich", "kind": "ichimoku", "params": {"conversion": _i("tenkan_period", 9), "base": _i("kijun_period", 26), "span_b": _i("senkou_b_period", 52)}}],
         "funding": [{"id": "fz", "kind": "funding_zscore", "params": {"length": _i("zscore_period", 96)}}],
         "vwap": [{"id": "vwap", "kind": "vwap", "params": {"length": _i("vwap_period", 0)}}],
+        # Mean-reversion variant of bollinger → same overlays (bands + RSI).
+        "bollinger_reversion": [
+            {"id": "bb", "kind": "bollinger", "params": {"length": _i("bb_period", 20), "num_std": _f("bb_std", 2.0)}},
+            {"id": "rsi", "kind": "rsi", "params": {"length": _i("rsi_period", 14)}},
+        ],
+        # Composite types (forven/strategies/composite) mapped to the registry
+        # indicators they actually gate on.
+        "bb_rsi_reversion": [
+            {"id": "bb", "kind": "bollinger", "params": {"length": _i("bb_period", 20), "num_std": _f("bb_std", 2.0)}},
+            {"id": "rsi", "kind": "rsi", "params": {"length": _i("rsi_period", 14)}},
+        ],
+        "funding_fade_rsi": [
+            {"id": "fz", "kind": "funding_zscore", "params": {"length": _i("funding_period", 48)}},
+            {"id": "rsi", "kind": "rsi", "params": {"length": _i("rsi_period", 14)}},
+        ],
+        "macd_volume": [
+            {"id": "macd", "kind": "macd", "params": {"fast": _i("fast", 12), "slow": _i("slow", 26), "signal": _i("signal", 9)}},
+            {"id": "vol_sma", "kind": "volume_sma", "params": {"length": _i("vol_period", 20)}},
+        ],
+        "trend_keltner": [
+            {"id": "kc", "kind": "keltner", "params": {"length": _i("kc_period", 20), "atr_length": _i("kc_period", 20), "mult": _f("kc_mult", 2.0)}},
+            {"id": "ema_trend", "kind": "ema", "params": {"length": _i("ma_period", 100)}},
+        ],
+        # Opening-range breakout: the rolling high/low band the strategy breaks out
+        # of == a donchian channel over the opening-range window.
+        "orb": [{"id": "orb", "kind": "donchian", "params": {"length": _i("range_bars", 4)}}],
     }
     return builders.get(stype, [])
 
@@ -1765,12 +1835,12 @@ def _kernel_trigger_markers(strat, frame, *, params, leverage, strategy_type, cu
     for t in res.closed_trades:
         d = str(t.get("direction") or "long")
         if t.get("entry_time") and _before(t["entry_time"]):
-            entries.append({"timestamp": str(t["entry_time"]), "price": float(t["entry_price"]), "direction": d, "marker_kind": "signal"})
+            entries.append({"timestamp": str(t["entry_time"]), "price": float(t["entry_price"]), "direction": d, "marker_kind": "signal", **_trigger_marker_fields(d, "entry")})
         if t.get("exit_time") and _before(t["exit_time"]):
-            exits.append({"timestamp": str(t["exit_time"]), "price": float(t["exit_price"]), "direction": d, "marker_kind": "signal"})
+            exits.append({"timestamp": str(t["exit_time"]), "price": float(t["exit_price"]), "direction": d, "marker_kind": "signal", **_trigger_marker_fields(d, "exit")})
     for d, pos in (res.open_positions or {}).items():
         if pos.get("entry_time") and _before(pos["entry_time"]):
-            entries.append({"timestamp": str(pos["entry_time"]), "price": float(pos["entry_price"]), "direction": str(d), "marker_kind": "signal"})
+            entries.append({"timestamp": str(pos["entry_time"]), "price": float(pos["entry_price"]), "direction": str(d), "marker_kind": "signal", **_trigger_marker_fields(str(d), "entry")})
     return entries, exits
 
 
@@ -1822,23 +1892,39 @@ def get_paper_session_chart(
             strat, frame, params=params, leverage=leverage, strategy_type=strategy_type, cutoff=cutoff,
         )
 
-    # Active levels from the open position.
+    # Active levels from the open position. Every level is self-describing
+    # (type/label/color/from_time/to_time) so the frontend draws the industry-
+    # standard active-order lines straight from the payload. ``entry`` carries the
+    # open position's entry price (blue solid "ENTRY" line for the whole hold).
     position = session.get("position") if isinstance(session.get("position"), dict) else None
-    active_levels: dict[str, list[dict]] = {"stop": [], "take_profit": [], "trail": []}
+    active_levels: dict[str, list[dict]] = {"stop": [], "take_profit": [], "trail": [], "entry": []}
     if position:
         side = str(position.get("side") or "long").strip().lower()
         entry_time = str(position.get("entry_time") or "")
+
+        def _level(price: float, ltype: str, label: str, color: str) -> dict:
+            # from_time anchors the line to the entry; to_time=None ⇒ still open.
+            # (A full-width dashed price line + axis label is the TradingView-standard
+            # representation of an active order. For a TRUE entry-anchored ray, draw a
+            # 2-point line series instead — see the trendLine pattern in
+            # ChartWorkspace.svelte: chart.addLineSeries(...).setData([{start},{now}]).)
+            return {"price": price, "direction": side, "from_time": entry_time, "to_time": None,
+                    "type": ltype, "label": label, "color": color}
+
+        entry_price = trading_domain._coerce_optional_float(position.get("entry_price"))
+        if entry_price is not None:
+            active_levels["entry"].append(_level(entry_price, "entry", "ENTRY", "#3b82f6"))
         sl = trading_domain._coerce_optional_float(position.get("stop_loss_price"))
         tp = trading_domain._coerce_optional_float(position.get("take_profit_price"))
         if sl is not None:
-            active_levels["stop"].append({"price": sl, "direction": side, "from_time": entry_time})
+            active_levels["stop"].append(_level(sl, "stop", "SL", "#ef4444"))
         if tp is not None:
-            active_levels["take_profit"].append({"price": tp, "direction": side, "from_time": entry_time})
+            active_levels["take_profit"].append(_level(tp, "take_profit", "TP", "#22c55e"))
         trail = trading_domain._coerce_optional_float(
             parse_trade_signal_data(position.get("signal_data")).get("trailing_stop_price")
         )
         if trail is not None:
-            active_levels["trail"].append({"price": trail, "direction": side, "from_time": entry_time})
+            active_levels["trail"].append(_level(trail, "trail", "Trail", "#f59e0b"))
 
     return {
         "session_id": str(session.get("id") or session_id),

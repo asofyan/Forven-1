@@ -1843,7 +1843,8 @@ def _evaluate_source_divergence_gate(strategy_id: str, general_settings: Any) ->
 
     Fail-open by design: a missing / stale / insufficient-overlap reading allows the
     promotion (unless the operator sets ``block_when_missing``) so a never-reconciled
-    strategy never jams the funnel. Ships inert (``enabled=False``).
+    strategy never jams the funnel. Enabled by default (the Binance↔HyperLiquid venue
+    gap is real); fail-open keeps it from blocking until a divergence is measured.
     """
     cfg: dict[str, Any] = {}
     if isinstance(general_settings, dict):

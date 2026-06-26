@@ -356,11 +356,42 @@
 		return String(marker.source || 'trade').toLowerCase() === 'signal' ? 'signal' : 'trade';
 	}
 
-	function markerText(marker: SignalMarker, fallback: string): string | undefined {
-		// Markers render as clean arrows/dots (color + shape convey side/entry-exit);
-		// per-marker text labels stack and overlap badly when trades cluster, so the
-		// chart stays label-free and trade details live in the trades table.
-		return undefined;
+	function markerText(marker: SignalMarker): string | undefined {
+		// Real fills get a short label (BUY/SELL/SHORT/COVER) so the four otherwise-
+		// colliding pairs are tellable apart. Would-be triggers stay text-free —
+		// there can be many and the text would stack and overlap badly.
+		if (markerSource(marker) !== 'trade') return undefined;
+		return marker.label || undefined;
+	}
+
+	// One real-fill marker. Defaults derive the four distinct visuals from
+	// direction + entry/exit; the backend's self-describing fields (side → above/
+	// below bar, color, shape, label) override when present.
+	function buildTradeMarker(m: SignalMarker, leg: 'entry' | 'exit'): SeriesMarker<Time> | null {
+		const raw = parseTimestamp(m.timestamp);
+		if (isNaN(raw)) return null;
+		const t = snapToBar(raw);
+		if (t === null) return null;
+		const direction = markerDirection(m);
+		let position: 'aboveBar' | 'belowBar';
+		let color: string;
+		let shape: 'arrowUp' | 'arrowDown';
+		let label: string;
+		if (leg === 'entry') {
+			if (direction === 'short') { position = 'aboveBar'; color = '#f97316'; shape = 'arrowDown'; label = 'SHORT'; }
+			else { position = 'belowBar'; color = '#22c55e'; shape = 'arrowUp'; label = 'BUY'; }
+		} else if (direction === 'short') {
+			position = 'belowBar'; color = '#14b8a6'; shape = 'arrowUp'; label = 'COVER';
+		} else {
+			position = 'aboveBar'; color = '#ef4444'; shape = 'arrowDown'; label = 'SELL';
+		}
+		const side = String(m.side || '').toLowerCase();
+		if (side === 'bull') position = 'belowBar';
+		else if (side === 'bear') position = 'aboveBar';
+		if (m.color) color = m.color;
+		if (m.shape === 'arrowUp' || m.shape === 'arrowDown') shape = m.shape;
+		const text = markerText(m) ?? label;
+		return { time: t, position, color, shape, ...(text ? { text } : {}) };
 	}
 
 	function updateMarkers() {
@@ -368,55 +399,37 @@
 
 		const markers: SeriesMarker<Time>[] = [];
 
+		// Real fills → four DISTINCT labeled markers (BUY / SELL / SHORT / COVER) so
+		// the pairs that used to collide (BUY≡COVER, SELL≡SHORT) are tellable apart.
+		// Backend self-describing fields (side/color/shape/label) drive the visual when
+		// present; otherwise we derive from direction + entry/exit (backward-compatible).
 		for (const m of entryMarkers) {
-			const raw = parseTimestamp(m.timestamp);
-			if (isNaN(raw)) continue;
-			const t = snapToBar(raw);
-			if (t === null) continue;
-			const direction = markerDirection(m);
-			const text = markerText(m, direction === 'short' ? 'Short' : 'Buy');
-			markers.push({
-				time: t,
-				position: direction === 'short' ? 'aboveBar' : 'belowBar',
-				color: direction === 'short' ? '#ef4444' : '#22c55e',
-				shape: direction === 'short' ? 'arrowDown' : 'arrowUp',
-				...(text ? { text } : {}),
-			});
+			const mk = buildTradeMarker(m, 'entry');
+			if (mk) markers.push(mk);
 		}
-
 		for (const m of exitMarkers) {
-			const raw = parseTimestamp(m.timestamp);
-			if (isNaN(raw)) continue;
-			const t = snapToBar(raw);
-			if (t === null) continue;
-			const direction = markerDirection(m);
-			const text = markerText(m, direction === 'short' ? 'Cover' : 'Sell');
-			markers.push({
-				time: t,
-				position: direction === 'short' ? 'belowBar' : 'aboveBar',
-				color: direction === 'short' ? '#22c55e' : '#ef4444',
-				shape: direction === 'short' ? 'arrowUp' : 'arrowDown',
-				...(text ? { text } : {}),
-			});
+			const mk = buildTradeMarker(m, 'exit');
+			if (mk) markers.push(mk);
 		}
 
-		// Full-history strategy triggers — dim circles, distinct from solid trade arrows,
-		// and no text (there can be many). Entries below the bar, exits above (mirrored
-		// for shorts), so a trigger that became a trade lines up under its arrow.
+		// Full-history strategy triggers — smaller, MUTED arrows (green up = entry,
+		// red down = exit) so they stay visually distinct from the solid trade arrows
+		// but still read as long/short signals. No text (there can be many).
 		for (const m of triggerMarkers) {
 			const raw = parseTimestamp(m.timestamp);
 			if (isNaN(raw)) continue;
 			const t = snapToBar(raw);
 			if (t === null) continue;
-			const direction = markerDirection(m);
-			const isExit = String((m as { type?: string }).type || 'entry').toLowerCase() === 'exit';
-			const below = isExit ? direction === 'short' : direction !== 'short';
-			markers.push({
-				time: t,
-				position: below ? 'belowBar' : 'aboveBar',
-				color: 'rgba(148, 163, 184, 0.5)',
-				shape: 'circle',
-			});
+			const isExit = m.type === 'exit';
+			let position: 'aboveBar' | 'belowBar' = isExit ? 'aboveBar' : 'belowBar';
+			let color = isExit ? '#f87171' : '#4ade80';
+			let shape: 'arrowUp' | 'arrowDown' = isExit ? 'arrowDown' : 'arrowUp';
+			const side = String(m.side || '').toLowerCase();
+			if (side === 'bull') position = 'belowBar';
+			else if (side === 'bear') position = 'aboveBar';
+			if (m.color) color = m.color;
+			if (m.shape === 'arrowUp' || m.shape === 'arrowDown') shape = m.shape;
+			markers.push({ time: t, position, color, shape, size: 0.7 });
 		}
 
 		// Lightweight charts requires markers to be sorted by time
@@ -433,6 +446,11 @@
 				positionLinesMap.delete(id);
 			}
 		}
+		// Industry-standard active-order representation: a full-width price line with
+		// an axis price label (solid ENTRY, dashed SL/TP/Trail). lightweight-charts has
+		// no native entry-anchored ray; for a TRUE ray (segment from entry bar → now)
+		// draw a 2-point line series instead — see the trendLine pattern below
+		// (chart.addLineSeries(...).setData([{ time: start }, { time: now }])).
 		for (const level of priceLines) {
 			if (!Number.isFinite(level.price)) continue;
 			const options = {

@@ -315,8 +315,16 @@
 			price: marker.price,
 			type,
 			direction: markerDirection(marker),
-			label: markerLabel(marker, type),
+			// Prefer the backend's short on-chart text (BUY/SELL/SHORT/COVER); fall
+			// back to the derived verbose label for legacy payloads.
+			label: marker.label ?? markerLabel(marker, type),
 			source: markerSource(marker),
+			// Forward the self-describing visuals so the chart renders straight from
+			// the payload (ChartWorkspace falls back to direction when absent).
+			...(marker.side ? { side: marker.side } : {}),
+			...(marker.action ? { action: marker.action } : {}),
+			...(marker.shape ? { shape: marker.shape } : {}),
+			...(marker.color ? { color: marker.color } : {}),
 		};
 	}
 
@@ -1498,11 +1506,20 @@
 			...(bundle.trigger_exits ?? []).map((m) => toSignalMarker(m, 'exit')),
 		];
 
-		// Active stop / take-profit / trailing lines for the open position.
-		const levels = bundle.active_levels ?? { stop: [], take_profit: [], trail: [] };
+		// Active order lines for the open position: a solid blue ENTRY line drawn for
+		// the whole hold, plus DASHED red SL / green TP / amber Trail lines (the
+		// TradingView-standard look for active orders). Prefer the backend's
+		// self-describing levels; fall back to the open position's entry price.
+		const levels = bundle.active_levels ?? { stop: [], take_profit: [], trail: [], entry: [] };
 		const lines: typeof positionPriceLines = [];
-		for (const s of levels.stop ?? []) lines.push({ id: 'sl', price: s.price, color: '#ef4444', title: 'SL' });
-		for (const t of levels.take_profit ?? []) lines.push({ id: 'tp', price: t.price, color: '#22c55e', title: 'TP' });
+		const entryLevel = (levels.entry ?? [])[0];
+		const fallbackEntry = Number(selectedSession?.position?.entry_price);
+		const entryPrice = entryLevel?.price ?? (Number.isFinite(fallbackEntry) ? fallbackEntry : undefined);
+		if (entryPrice !== undefined && (entryLevel || selectedSession?.position)) {
+			lines.push({ id: 'entry', price: entryPrice, color: '#3b82f6', title: 'ENTRY', dashed: false });
+		}
+		for (const s of levels.stop ?? []) lines.push({ id: 'sl', price: s.price, color: '#ef4444', title: 'SL', dashed: true });
+		for (const t of levels.take_profit ?? []) lines.push({ id: 'tp', price: t.price, color: '#22c55e', title: 'TP', dashed: true });
 		for (const tr of levels.trail ?? []) lines.push({ id: 'trail', price: tr.price, color: '#f59e0b', title: 'Trail', dashed: true });
 		positionPriceLines = lines;
 	}

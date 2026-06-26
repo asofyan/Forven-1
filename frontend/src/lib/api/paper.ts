@@ -528,6 +528,12 @@ export interface TradeMarker {
 	pnl?: number;
 	pnl_pct?: number;
 	is_open?: boolean;
+	// Self-describing visuals from the backend (industry-standard marker conventions).
+	side?: 'bull' | 'bear' | string;
+	action?: 'buy' | 'sell' | 'short' | 'cover' | 'long_signal' | 'short_signal' | 'exit_signal' | string;
+	shape?: 'arrowUp' | 'arrowDown' | string;
+	color?: string;
+	label?: string;
 }
 
 export interface TradeMarkersResponse {
@@ -595,6 +601,10 @@ export interface ActiveLevel {
 	price: number;
 	direction?: string;
 	from_time?: string;
+	to_time?: string | null;
+	type?: 'stop' | 'take_profit' | 'trail' | 'entry' | string;
+	label?: string;
+	color?: string;
 }
 
 export interface PaperSessionChart {
@@ -606,7 +616,7 @@ export interface PaperSessionChart {
 	exit_markers: TradeMarker[];
 	trigger_entries: TradeMarker[];
 	trigger_exits: TradeMarker[];
-	active_levels: { stop: ActiveLevel[]; take_profit: ActiveLevel[]; trail: ActiveLevel[] };
+	active_levels: { stop: ActiveLevel[]; take_profit: ActiveLevel[]; trail: ActiveLevel[]; entry?: ActiveLevel[] };
 	strategy_type: string;
 	warnings: string[];
 }
