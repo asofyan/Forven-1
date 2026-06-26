@@ -366,16 +366,62 @@ export async function updateResultParams(
 	});
 }
 
-export async function updateStrategyDefaultParams(
-	strategyId: string,
-	params: Record<string, unknown>,
-	options?: { pinnedBacktestId?: string | null }
-): Promise<{
+// Open position summary returned by the PRE-edit warning endpoint
+// (GET /api/strategies/{id}/open-position).
+export interface OpenPositionSummary {
+	trade_id: string;
+	asset: string;
+	direction: 'long' | 'short';
+	is_live: boolean;
+	entry_price: number | null;
+	stop_loss: number | null;
+	take_profit: number | null;
+}
+
+export interface StrategyOpenPosition {
+	has_open_position: boolean;
+	count: number;
+	positions: OpenPositionSummary[];
+}
+
+// `open_position_update` field on the params PATCH response: describes how the
+// open position's stop / take-profit were recomputed from the new profile.
+export interface OpenPositionUpdateEntry {
+	trade_id: string;
+	asset: string;
+	direction: 'long' | 'short';
+	is_live: boolean;
+	entry_price: number | null;
+	stop_loss: { old: number | null; new: number | null };
+	take_profit: { old: number | null; new: number | null };
+	trailing_stop_pct: number | null;
+}
+
+export interface OpenPositionUpdate {
+	affected: boolean;
+	count: number;
+	positions: OpenPositionUpdateEntry[];
+}
+
+export interface UpdateStrategyDefaultParamsResponse {
 	ok: boolean;
 	strategy_id: string;
 	params: Record<string, unknown>;
 	pinned_backtest_id?: string | null;
-}> {
+	open_position_update?: OpenPositionUpdate | null;
+}
+
+// Pre-edit check: does the strategy have an open paper/live position that a
+// params change would mutate? Drives the warning shown before saving defaults.
+export async function getStrategyOpenPosition(strategyId: string): Promise<StrategyOpenPosition> {
+	return fetchApi(`/strategies/${strategyId}/open-position`);
+}
+
+export async function updateStrategyDefaultParams(
+	strategyId: string,
+	params: Record<string, unknown>,
+	options?: { pinnedBacktestId?: string | null }
+): Promise<UpdateStrategyDefaultParamsResponse> {
 	const body: Record<string, unknown> = { params };
 	if (options && options.pinnedBacktestId !== undefined) {
 		body.pinned_backtest_id = options.pinnedBacktestId ?? '';

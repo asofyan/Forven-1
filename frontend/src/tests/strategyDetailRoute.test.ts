@@ -16,6 +16,7 @@ const apiMocks = vi.hoisted(() => ({
 
 const backtestingMocks = vi.hoisted(() => ({
 	getRobustnessResult: vi.fn(),
+	getStrategyOpenPosition: vi.fn(),
 	runCostStressRobustness: vi.fn(),
 	runMonteCarloRobustness: vi.fn(),
 	runParamJitterRobustness: vi.fn(),
@@ -524,8 +525,14 @@ describe('/lab/strategy/[id] backtest history', () => {
 		backtestingMocks.runRegimeSplitRobustness.mockReset();
 		backtestingMocks.runWalkForwardRobustness.mockReset();
 		backtestingMocks.getRobustnessResult.mockReset();
+		backtestingMocks.getStrategyOpenPosition.mockReset();
 		backtestingMocks.submitWalkForwardRobustness.mockReset();
 		backtestingMocks.updateStrategyDefaultParams.mockReset();
+		backtestingMocks.getStrategyOpenPosition.mockResolvedValue({
+			has_open_position: false,
+			count: 0,
+			positions: [],
+		});
 		lifecycleMocks.getGauntletStatus.mockReset();
 		lifecycleMocks.getPaperLiveReadiness.mockReset();
 		lifecycleMocks.getPipelineConfig.mockReset();

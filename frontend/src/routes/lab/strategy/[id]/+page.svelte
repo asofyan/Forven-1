@@ -21,7 +21,12 @@
 		type StrategyContainerPayload,
 	} from '$lib/api';
 	import { getPrebuiltStrategies } from '$lib/api/strategies';
-	import { updateStrategyDefaultParams } from '$lib/api/backtesting';
+	import {
+		getStrategyOpenPosition,
+		updateStrategyDefaultParams,
+		type OpenPositionUpdate,
+		type StrategyOpenPosition,
+	} from '$lib/api/backtesting';
 	import type { EquityPoint, ParamSpec, Strategy, Trade } from '$lib/api/types';
 	import StrategyLink from '$lib/components/ui/StrategyLink.svelte';
 	import DateRangeFieldset from '$lib/components/ui/DateRangeFieldset.svelte';
@@ -2961,6 +2966,43 @@
 		}
 	}
 
+	function formatPositionPrice(value: number | null | undefined): string {
+		if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+		return Number(value).toLocaleString(undefined, { maximumFractionDigits: 8 });
+	}
+
+	// Defensive: a failed pre-edit check must never block saving — log and proceed.
+	async function fetchOpenPositionSummary(strategyId: string): Promise<StrategyOpenPosition | null> {
+		try {
+			return await getStrategyOpenPosition(strategyId);
+		} catch (err) {
+			console.warn('Open-position pre-save check failed; proceeding with save.', err);
+			return null;
+		}
+	}
+
+	// Build the warning shown before saving execution settings onto a live/paper
+	// trade. Returns null when there is no open position to warn about.
+	function describeOpenPositionWarning(summary: StrategyOpenPosition | null): string | null {
+		if (!summary?.has_open_position || !summary.positions?.length) return null;
+		const pos = summary.positions[0];
+		const entry = formatPositionPrice(pos.entry_price);
+		const extra = summary.count > 1 ? ` (plus ${summary.count - 1} other open position${summary.count - 1 === 1 ? '' : 's'})` : '';
+		return `⚠️ This strategy has an open ${pos.direction.toUpperCase()} ${pos.asset} position (entry ${entry})${extra}. Saving these execution settings will UPDATE its stop-loss / take-profit on the live position. Apply anyway?`;
+	}
+
+	// Surface what the backend recomputed on the open position after a save.
+	function notifyOpenPositionUpdate(update: OpenPositionUpdate | null | undefined): void {
+		if (!update?.affected) return;
+		for (const p of update.positions ?? []) {
+			addToast(
+				`Updated open ${p.direction.toUpperCase()} ${p.asset}: SL ${formatPositionPrice(p.stop_loss?.old)} → ${formatPositionPrice(p.stop_loss?.new)}, TP ${formatPositionPrice(p.take_profit?.old)} → ${formatPositionPrice(p.take_profit?.new)}`,
+				'info',
+				`/lab/strategy/${encodeURIComponent(strategyId)}`,
+			);
+		}
+	}
+
 	async function setAsDefaultParams() {
 		if (!container || settingDefaultParams) return;
 		const effectiveParams = getEffectiveOptimizationParams();
@@ -2969,14 +3011,19 @@
 		const paramsToSave = optimizedExecutionDraft
 			? { ...effectiveParams, execution_profile: executionDraftToPayload(optimizedExecutionDraft) }
 			: effectiveParams;
-		const confirmed = typeof window === 'undefined' || window.confirm(
-			'Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.'
+		const openPositionWarning = describeOpenPositionWarning(
+			await fetchOpenPositionSummary(container.strategy.id),
 		);
+		const confirmMessage = openPositionWarning
+			? `Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.\n\n${openPositionWarning}`
+			: 'Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.';
+		const confirmed = typeof window === 'undefined' || window.confirm(confirmMessage);
 		if (!confirmed) return;
 		settingDefaultParams = true;
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
+			const res = await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			notifyOpenPositionUpdate(res?.open_position_update);
 			await loadContainer();
 		} catch (err) {
 			addToast(err instanceof Error ? err.message : 'Failed to update params', 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
@@ -2989,16 +3036,21 @@
 		if (!container || settingDefaultParams) return;
 		const params = getBacktestParamDraft(item);
 		if (Object.keys(params).length === 0) return;
-		const confirmed = typeof window === 'undefined' || window.confirm(
-			'Set this backtest as the strategy default?\n\nIts parameters will drive paper trading and live execution, and its metrics will display on the Lab manager.'
+		const openPositionWarning = describeOpenPositionWarning(
+			await fetchOpenPositionSummary(container.strategy.id),
 		);
+		const confirmMessage = openPositionWarning
+			? `Set this backtest as the strategy default?\n\nIts parameters will drive paper trading and live execution, and its metrics will display on the Lab manager.\n\n${openPositionWarning}`
+			: 'Set this backtest as the strategy default?\n\nIts parameters will drive paper trading and live execution, and its metrics will display on the Lab manager.';
+		const confirmed = typeof window === 'undefined' || window.confirm(confirmMessage);
 		if (!confirmed) return;
 		settingDefaultParams = true;
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, params, {
+			const res = await updateStrategyDefaultParams(container.strategy.id, params, {
 				pinnedBacktestId: item.result_id
 			});
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			notifyOpenPositionUpdate(res?.open_position_update);
 			await loadContainer();
 		} catch (err) {
 			addToast(err instanceof Error ? err.message : 'Failed to update params', 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
@@ -3062,6 +3114,12 @@
 			addToast('Fix the highlighted parameter errors before saving.', 'error');
 			return;
 		}
+		// This pane has no confirm by default — only prompt when the save would
+		// mutate an open paper/live position.
+		const openPositionWarning = describeOpenPositionWarning(
+			await fetchOpenPositionSummary(container.strategy.id),
+		);
+		if (openPositionWarning && typeof window !== 'undefined' && !window.confirm(openPositionWarning)) return;
 		settingDefaultParams = true;
 		parameterSaveMessage = '';
 		parameterSaveError = '';
@@ -3071,9 +3129,10 @@
 			// the alpha params, so a tuned profile survives reload and drives backtests
 			// instead of being ephemeral.
 			const paramsToSave = { ...paramsDraft, execution_profile: executionDraftToPayload(executionDraft) };
-			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
+			const res = await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			parameterSaveMessage = 'Default parameters saved.';
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			notifyOpenPositionUpdate(res?.open_position_update);
 			await loadContainer();
 		} catch (err) {
 			parameterSaveError = err instanceof Error ? err.message : 'Failed to save parameter defaults';

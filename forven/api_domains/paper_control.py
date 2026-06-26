@@ -809,3 +809,180 @@ def set_manual_pause(session_id: str, paused: bool) -> dict:
         {"manual_pause": bool(paused), "manual_pause_set_at": _iso_now()},
     )
     return _refresh(session_id)
+
+
+# --------------------------------------------------------------------------- #
+# Propagate execution-profile edits onto an OPEN position
+# When an operator changes a paper/live strategy's execution settings (Save /
+# Set-default), the open position's SL/TP/trailing are recomputed from the new
+# profile — anchored at the ENTRY price and derived EXACTLY as the kernel places
+# them (sizing.entry_stop_dist_pct) — so the immediate apply matches what the next
+# scan would refresh to (no fight with auto-management). Paper: signal_data DB
+# write. Live: cancel + re-place the resting reduce-only exchange orders.
+# --------------------------------------------------------------------------- #
+def _strategy_timeframe(strategy_id: str) -> str:
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT timeframe FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+        tf = str((dict(row).get("timeframe") if row else "") or "").strip().lower()
+        return tf or "1h"
+    except Exception:
+        return "1h"
+
+
+def _atr_at_entry(asset: str, timeframe: str, entry_time, period: int) -> float | None:
+    """Wilder ATR at the position's entry bar — matches how the kernel placed the
+    stop. Falls back to the latest ATR if the entry bar is outside the fetch window."""
+    import pandas as pd
+
+    from forven.market_data import fetch_market_candles
+    from forven.strategies.execution_kernel import _compute_atr_series
+
+    try:
+        df = fetch_market_candles(asset, bars=max(int(period) * 6, 300), interval=timeframe)
+        if df is None or df.empty:
+            return None
+        atr = _compute_atr_series(df, int(period))
+        if entry_time:
+            try:
+                ts = pd.Timestamp(str(entry_time))
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                pos = atr.index.get_indexer([ts], method="nearest")[0]
+                if pos >= 0:
+                    return float(atr.iloc[pos])
+            except Exception:
+                pass
+        return float(atr.iloc[-1])
+    except Exception:
+        return None
+
+
+def _profile_levels_for_trade(trade: dict, ec: dict, timeframe: str) -> dict:
+    """The SL/TP/trailing the new execution profile implies for this OPEN position,
+    anchored at its ENTRY price (exactly as the kernel places them at entry)."""
+    from forven.strategies import sizing as _sizing
+
+    entry = _coerce_optional_float(trade.get("entry_price")) or 0.0
+    direction = _normalize_trade_direction(trade.get("direction"))
+    sign = -1.0 if direction == "short" else 1.0
+    asset = str(trade.get("asset") or "").strip().upper()
+
+    atr_value = None
+    if ec.get("sizing_mode") == "atr":
+        atr_value = _atr_at_entry(asset, timeframe, trade.get("entry_time") or trade.get("created_at"), ec.get("atr_period", 14))
+
+    stop_dist = _sizing.entry_stop_dist_pct(ec, entry_price=entry, atr_value=atr_value) if entry > 0 else None
+    new_sl = None
+    if stop_dist is not None and (ec.get("stop_loss_pct") is not None or ec.get("sizing_mode") == "atr"):
+        new_sl = round(entry * (1.0 - sign * stop_dist), 8)
+    new_tp = None
+    if ec.get("take_profit_pct") is not None:
+        new_tp = round(entry * (1.0 + sign * float(ec["take_profit_pct"]) / 100.0), 8)
+    new_trail = float(ec["trailing_stop_pct"]) if ec.get("trailing_stop_pct") is not None else None
+    return {"stop_loss": new_sl, "take_profit": new_tp, "trailing_stop_pct": new_trail}
+
+
+def _apply_levels_to_open_trade(trade: dict, levels: dict) -> dict:
+    """Apply recomputed SL/TP/trailing to one OPEN trade (paper DB / live exchange)."""
+    trade_id = str(trade.get("id"))
+    asset = str(trade.get("asset") or "").strip().upper()
+    direction = _normalize_trade_direction(trade.get("direction"))
+    live = _trade_is_live(trade)
+    sd = parse_trade_signal_data(trade.get("signal_data"))
+    vault = _live_vault_for_trade(trade) if live else None
+
+    new_sl = levels.get("stop_loss")
+    new_tp = levels.get("take_profit")
+    new_trail = levels.get("trailing_stop_pct")
+    old_sl = _coerce_optional_float(sd.get("stop_loss_price") if sd.get("stop_loss_price") is not None else sd.get("stop_loss"))
+    old_tp = _coerce_optional_float(sd.get("take_profit_price") if sd.get("take_profit_price") is not None else sd.get("take_profit"))
+
+    updates: dict = {}
+    if new_sl is not None and new_sl > 0:
+        if live:
+            old_oid = sd.get("exchange_stop_order_id")
+            if old_oid:
+                _cancel_live_order(asset, old_oid, vault)
+            new_oid = _place_live_protective("stop_loss", trade, float(new_sl), vault)
+            if new_oid is not None:
+                updates["exchange_stop_order_id"] = str(new_oid)
+            updates["exchange_stop_requested"] = True
+        updates["stop_loss"] = float(new_sl)
+        updates["stop_loss_price"] = float(new_sl)
+        updates["stop_loss_source"] = "execution_profile"
+        updates["sl_adjusted_at"] = _iso_now()
+
+    if new_tp is not None and new_tp > 0:
+        if live:
+            old_oid = sd.get("exchange_take_profit_order_id")
+            if old_oid:
+                _cancel_live_order(asset, old_oid, vault)
+            new_oid = _place_live_protective("take_profit", trade, float(new_tp), vault)
+            if new_oid is not None:
+                updates["exchange_take_profit_order_id"] = str(new_oid)
+        updates["take_profit"] = float(new_tp)
+        updates["take_profit_price"] = float(new_tp)
+        updates["take_profit_source"] = "execution_profile"
+        updates["tp_adjusted_at"] = _iso_now()
+
+    if new_trail is not None and new_trail > 0:
+        updates["trailing_stop_pct"] = float(new_trail)
+
+    if updates:
+        _update_open_trade_signal_data(trade_id, updates)
+
+    return {
+        "trade_id": trade_id, "asset": asset, "direction": direction, "is_live": live,
+        "entry_price": _coerce_optional_float(trade.get("entry_price")),
+        "stop_loss": {"old": old_sl, "new": new_sl},
+        "take_profit": {"old": old_tp, "new": new_tp},
+        "trailing_stop_pct": new_trail,
+    }
+
+
+def open_position_summary(strategy_id: str) -> dict:
+    """Lightweight 'is this strategy in a trade?' check for the pre-edit warning.
+    Returns the open position(s) with current entry/SL/TP so the UI can warn before
+    an execution-setting change touches them."""
+    from forven.scanner import _get_open_trades
+
+    trades = [t for t in _get_open_trades(strategy_id) if str(t.get("status") or "").upper() == "OPEN"]
+    positions = []
+    for trade in trades:
+        sd = parse_trade_signal_data(trade.get("signal_data"))
+        positions.append({
+            "trade_id": str(trade.get("id")),
+            "asset": str(trade.get("asset") or "").strip().upper(),
+            "direction": _normalize_trade_direction(trade.get("direction")),
+            "is_live": _trade_is_live(trade),
+            "entry_price": _coerce_optional_float(trade.get("entry_price")),
+            "stop_loss": _coerce_optional_float(sd.get("stop_loss_price") if sd.get("stop_loss_price") is not None else sd.get("stop_loss")),
+            "take_profit": _coerce_optional_float(sd.get("take_profit_price") if sd.get("take_profit_price") is not None else sd.get("take_profit")),
+        })
+    return {"has_open_position": bool(positions), "count": len(positions), "positions": positions}
+
+
+def apply_execution_profile_to_open_position(strategy_id: str, params: dict, *, actor: str = "ui") -> dict | None:
+    """Push the new execution_profile's SL/TP/trailing onto the strategy's OPEN
+    position(s). Returns an impact summary, or None if nothing is open. Best-effort:
+    a per-trade failure is recorded, never raised, so the param save never fails on a
+    downstream exchange hiccup."""
+    from forven.scanner import _get_open_trades
+    from forven.strategies import sizing as _sizing
+
+    open_trades = [t for t in _get_open_trades(strategy_id) if str(t.get("status") or "").upper() == "OPEN"]
+    if not open_trades:
+        return None
+
+    ec = _sizing.normalize_execution_controls(_sizing.extract_execution_profile(params)) or _sizing.default_controls()
+    timeframe = _strategy_timeframe(strategy_id)
+    positions = []
+    for trade in open_trades:
+        try:
+            levels = _profile_levels_for_trade(trade, ec, timeframe)
+            positions.append(_apply_levels_to_open_trade(trade, levels))
+        except Exception as exc:  # noqa: BLE001 — never fail the param save on a downstream hiccup
+            log.warning("apply execution profile to open trade %s failed: %s", trade.get("id"), exc, exc_info=True)
+            positions.append({"trade_id": str(trade.get("id")), "error": str(exc)})
+    return {"affected": True, "count": len(positions), "positions": positions}

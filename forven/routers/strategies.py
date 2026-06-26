@@ -442,6 +442,15 @@ def update_strategy_default_params(strategy_id: str, body: PatchResultParamsBody
         actor="ui",
     )
 
+
+@router.get("/api/strategies/{strategy_id}/open-position")
+def get_strategy_open_position(strategy_id: str):
+    """Is this strategy currently in a trade? Drives the pre-edit warning so the
+    operator knows an execution-setting change will update the open position."""
+    from forven.api_domains.paper_control import open_position_summary
+
+    return open_position_summary(strategy_id)
+
 @router.get("/api/results")
 def get_backtest_results(
     strategy: str | None = None,

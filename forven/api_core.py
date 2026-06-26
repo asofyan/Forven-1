@@ -8173,11 +8173,34 @@ def update_strategy_default_params(
     # Research recovery: on param edit, try re-certification for research_only strategies
     _try_research_recovery_on_edit(strategy_id)
 
+    # Propagate execution-setting changes onto an OPEN paper/live position so the
+    # edit "takes" on the running trade. Only when the strategy is in an
+    # operator-owned (paper/live) stage AND the execution_profile actually changed —
+    # a pure alpha-param edit leaves the open position's SL/TP alone. Best-effort:
+    # never fail the param save on a downstream exchange hiccup.
+    open_position_update = None
+    try:
+        from forven.brain import stage_is_param_locked
+        from forven.strategies import sizing as _sizing
+
+        if stage_is_param_locked(row["stage"]):
+            old_ep = _sizing.normalize_execution_controls(_sizing.extract_execution_profile(existing_params))
+            new_ep = _sizing.normalize_execution_controls(_sizing.extract_execution_profile(canonical_params))
+            if old_ep != new_ep:
+                from forven.api_domains.paper_control import apply_execution_profile_to_open_position
+
+                open_position_update = apply_execution_profile_to_open_position(
+                    strategy_id, canonical_params, actor=actor
+                )
+    except Exception:  # noqa: BLE001 — propagation is best-effort; the save already succeeded
+        log.warning("execution-profile propagation to open position failed for %s", strategy_id, exc_info=True)
+
     return {
         "ok": True,
         "strategy_id": strategy_id,
         "params": canonical_params,
         "pinned_backtest_id": pin_written,
+        "open_position_update": open_position_update,
     }
 
 
