@@ -318,3 +318,219 @@ def ohlcv_rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
             frame[column] = 0.0
     frame = frame.dropna(subset=["open", "high", "low", "close"])
     return frame[["open", "high", "low", "close", "volume"]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binance market data (the lead exchange) — paper trades on REAL Binance data so
+# the chart, signals, and prices match the backtest (which also uses Binance) and
+# the real market, instead of HyperLiquid testnet (which drifts). Execution stays
+# in-app; only the DATA comes from Binance. Public market data needs no API key.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BINANCE_EXCHANGE = None
+
+
+def _binance_exchange():
+    """Lazy, process-wide ccxt Binance client (public market data, rate-limited)."""
+    global _BINANCE_EXCHANGE
+    if _BINANCE_EXCHANGE is None:
+        import ccxt
+
+        _BINANCE_EXCHANGE = ccxt.binance({"enableRateLimit": True})
+    return _BINANCE_EXCHANGE
+
+
+def _binance_symbol(coin: str) -> str:
+    """Map a coin/asset token to the Binance ccxt spot pair (e.g. BTC -> BTC/USDT).
+
+    Uses USDT — the same quote the backtest's Binance lake stores — so paper reads
+    the identical series the backtest validated on.
+    """
+    from forven.symbol_mapping import _extract_crypto_base
+
+    token = str(coin or "").strip().upper()
+    base = _extract_crypto_base(token) or token
+    return f"{base}/USDT"
+
+
+def fetch_binance_candles(
+    coin: str,
+    *,
+    bars: int = 300,
+    interval: str = "1h",
+    end_time: int | None = None,
+    clean: bool = False,
+) -> pd.DataFrame:
+    """Fetch OHLCV candles from BINANCE — a drop-in for ``fetch_hyperliquid_candles``.
+
+    Returns the same normalized frame (UTC open-time index; open/high/low/close/volume;
+    the unclosed active candle dropped). Paginates Binance's 1000-bar/call cap so the
+    scanner's long kernel window and the chart's 2000-bar window are served.
+    """
+    normalized_coin = str(coin or "").strip().upper()
+    if not normalized_coin:
+        raise ValueError("coin is required")
+    normalized_interval = str(interval or "1h").strip().lower()
+    interval_ms = INTERVAL_TO_MS.get(normalized_interval)
+    if interval_ms is None:
+        raise ValueError(f"unsupported interval: {interval}")
+
+    requested_bars = max(int(bars), 1)
+    symbol = _binance_symbol(normalized_coin)
+    exchange = _binance_exchange()
+    end_ms = int(end_time) if end_time else int(time.time() * 1000)
+    start_ms = end_ms - (requested_bars + 1) * interval_ms
+
+    rows: list[list] = []
+    since = start_ms
+    per_call = 1000
+    last_err: Exception | None = None
+    for _attempt in range(2):  # one retry on a transient network hiccup
+        try:
+            rows = []
+            cursor = since
+            while cursor < end_ms:
+                batch = exchange.fetch_ohlcv(symbol, timeframe=normalized_interval, since=cursor, limit=per_call)
+                if not batch:
+                    break
+                rows.extend(batch)
+                last_t = int(batch[-1][0])
+                if len(batch) < per_call or last_t + interval_ms >= end_ms:
+                    break
+                cursor = last_t + interval_ms
+            last_err = None
+            break
+        except Exception as exc:  # noqa: BLE001 — surfaced below if both attempts fail
+            last_err = exc
+    if last_err is not None:
+        raise RuntimeError(f"Binance candle fetch failed for {symbol} {normalized_interval}: {last_err}")
+    if not rows:
+        raise RuntimeError(f"No candle data returned for {symbol} {normalized_interval}")
+
+    df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "volume"])
+    df["t"] = pd.to_datetime(df["t"].astype("int64"), unit="ms", utc=True)
+    df = df[~df.index.duplicated(keep="last")] if df.index.name == "t" else df
+    df = df.drop_duplicates(subset="t", keep="last").set_index("t").sort_index()
+    for column in ("open", "high", "low", "close", "volume"):
+        df[column] = df[column].astype(float)
+
+    # Drop the unclosed active candle (no lookahead / repaint), mirroring HL fetch.
+    reference_ts = pd.Timestamp(end_ms, unit="ms", tz="UTC") if end_time else pd.Timestamp.now("UTC")
+    df = df[df.index + pd.Timedelta(interval_ms, unit="ms") <= reference_ts]
+    df = df[["open", "high", "low", "close", "volume"]].tail(requested_bars)
+
+    if clean:
+        df = clean_ohlcv(df, interval=normalized_interval)
+    return df
+
+
+def fetch_binance_prices(coins) -> dict[str, float]:
+    """Latest Binance spot prices for a list of coins, keyed by bare coin (BTC, ETH…)."""
+    tokens = [str(c).strip().upper() for c in (coins or []) if c]
+    if not tokens:
+        return {}
+    exchange = _binance_exchange()
+    sym_to_coin: dict[str, str] = {}
+    for token in tokens:
+        sym = _binance_symbol(token)
+        from forven.symbol_mapping import _extract_crypto_base
+
+        sym_to_coin[sym] = _extract_crypto_base(token) or token
+    out: dict[str, float] = {}
+    try:
+        tickers = exchange.fetch_tickers(list(sym_to_coin.keys()))
+        for sym, ticker in (tickers or {}).items():
+            coin = sym_to_coin.get(sym)
+            last = ticker.get("last") if isinstance(ticker, dict) else None
+            if last is None and isinstance(ticker, dict):
+                last = ticker.get("close")
+            if coin and last is not None:
+                out[coin] = float(last)
+    except Exception:
+        for sym, coin in sym_to_coin.items():
+            try:
+                ticker = exchange.fetch_ticker(sym)
+                last = ticker.get("last") or ticker.get("close")
+                if last is not None:
+                    out[coin] = float(last)
+            except Exception:
+                continue
+    return out
+
+
+def fetch_binance_price(coin: str) -> float | None:
+    """Latest Binance spot price for one coin, or None."""
+    return fetch_binance_prices([coin]).get(_binance_symbol(coin).split("/")[0])
+
+
+def resolve_market_data_source() -> str:
+    """The configured market-data exchange for paper data/prices. Default 'binance'
+    (the lead exchange); the operator can set 'hyperliquid' to revert."""
+    try:
+        from forven.api_core import get_settings
+
+        src = str(get_settings().get("market_data_source", "binance") or "binance").strip().lower()
+    except Exception:
+        src = "binance"
+    return src if src in ("binance", "hyperliquid") else "binance"
+
+
+def fetch_market_candles(
+    coin: str,
+    *,
+    bars: int = 300,
+    interval: str = "1h",
+    end_time: int | None = None,
+    clean: bool = False,
+) -> pd.DataFrame:
+    """Source-aware candle fetch: Binance (default) or HyperLiquid, per the
+    ``market_data_source`` setting. When the source is Binance it does NOT silently
+    fall back to HyperLiquid on error (that would reintroduce the wrong prices) —
+    it raises, and the caller skips."""
+    if resolve_market_data_source() == "binance":
+        return fetch_binance_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean)
+    return fetch_hyperliquid_candles(coin, bars=bars, interval=interval, end_time=end_time, clean=clean)
+
+
+class BinancePriceFeed:
+    """Async Binance price feed mirroring HyperLiquidFeed's interface — polls spot
+    tickers and dispatches ``{coin: price}`` to ``on_price``. Binance has no public
+    allMids websocket, so a short poll is used (fresh enough for paper marking)."""
+
+    def __init__(self, coins, on_price, poll_seconds: float = 3.0):
+        if callable(coins):
+            self._coins_fn = coins
+        else:
+            _static = [str(c).upper() for c in coins]
+            self._coins_fn = lambda: _static
+        self.on_price = on_price
+        self._poll = max(float(poll_seconds), 1.0)
+
+    async def _dispatch(self, prices: dict[str, float]):
+        import asyncio
+        import inspect
+
+        if not prices:
+            return
+        if asyncio.iscoroutinefunction(self.on_price):
+            await self.on_price(prices)
+            return
+        result = self.on_price(prices)
+        if inspect.isawaitable(result):
+            await result
+
+    async def start(self):
+        import asyncio
+
+        delay = 1.0
+        while True:
+            try:
+                coins = self._coins_fn()
+                prices = await asyncio.to_thread(fetch_binance_prices, coins)
+                await self._dispatch(prices)
+                delay = 1.0
+                await asyncio.sleep(self._poll)
+            except Exception as exc:  # noqa: BLE001 — keep the feed alive, back off
+                log.warning("BinancePriceFeed poll failed: %s", exc)
+                await asyncio.sleep(min(delay, 30.0))
+                delay = min(delay * 2, 30.0)

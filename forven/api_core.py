@@ -1641,6 +1641,10 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "scanner_signal_interval_minutes": 5,
     "scanner_execution_interval_minutes": 5,
     "scanner_allow_direct_market_fetch": True,
+    # Market-data exchange for paper data/prices/chart. 'binance' (the lead exchange,
+    # default) makes paper trade on the SAME real series the backtest validates on;
+    # 'hyperliquid' reverts to the HL feed. Execution stays in-app regardless.
+    "market_data_source": "binance",
     "daemon_candle_cache_refresh_seconds": 90,
     "paper_test_mode_enabled": False,
     "paper_test_high_activity_enabled": False,
@@ -2732,6 +2736,9 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
                 payload.get("scanner_allow_direct_market_fetch"),
                 bool(updates.get("scanner_allow_direct_market_fetch", True)),
             )
+        if "market_data_source" in payload:
+            _src = str(payload.get("market_data_source") or "").strip().lower()
+            updates["market_data_source"] = _src if _src in ("binance", "hyperliquid") else "binance"
         if "daemon_candle_cache_refresh_seconds" in payload:
             updates["daemon_candle_cache_refresh_seconds"] = _coerce_bounded_int(
                 payload.get("daemon_candle_cache_refresh_seconds"),

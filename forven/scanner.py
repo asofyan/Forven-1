@@ -41,6 +41,7 @@ from forven.market_cache import (
 from forven.market_data import (
     fetch_hyperliquid_candles,
     fetch_hyperliquid_funding_rate,
+    fetch_market_candles,
     dataframe_to_ohlcv_rows,
     ohlcv_rows_to_dataframe,
 )
@@ -1657,7 +1658,9 @@ def fetch_candles(coin: str, bars: int = 300, interval: str = "1h") -> pd.DataFr
     if not _scanner_bool_setting("scanner_allow_direct_market_fetch", True):
         raise RuntimeError(f"Candle cache unavailable/stale for {normalized_coin}")
 
-    df = fetch_hyperliquid_candles(
+    # Source-aware (Binance by default): paper trades on the SAME exchange the
+    # backtest validates on, so signals/fills match. No silent HL fallback.
+    df = fetch_market_candles(
         normalized_coin,
         bars=max(required_bars, _CANDLE_CACHE_BARS),
         interval=resolved_interval,

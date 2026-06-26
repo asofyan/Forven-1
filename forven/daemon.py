@@ -51,7 +51,14 @@ from forven.exchange.risk import (
     update_equity,
 )
 from forven.market_cache import normalize_prices, publish_price_snapshot, publish_candle_snapshot
-from forven.market_data import fetch_hyperliquid_candles, dataframe_to_ohlcv_rows
+from forven.market_data import (
+    fetch_hyperliquid_candles,
+    fetch_market_candles,
+    fetch_binance_prices,
+    resolve_market_data_source,
+    BinancePriceFeed,
+    dataframe_to_ohlcv_rows,
+)
 from forven.runtime_health import compute_runtime_code_fingerprint
 from forven.system_mode_policy import autonomous_runtime_allowed
 
@@ -1551,9 +1558,9 @@ async def _refresh_candle_cache(state: dict) -> None:
     for coin in _active_coins():
         try:
             df = await _to_thread_with_timeout(
-                f"daemon.fetch_hyperliquid_candles.{coin}",
+                f"daemon.fetch_market_candles.{coin}",
                 CANDLE_FETCH_TIMEOUT_SECONDS,
-                fetch_hyperliquid_candles,
+                fetch_market_candles,  # source-aware: Binance by default
                 coin,
                 bars=CANDLE_CACHE_BARS,
                 interval="1h",
@@ -1653,7 +1660,12 @@ async def async_market_loop(state: dict):
     feeder: asyncio.Task | None = None
 
     async def _start_market_workers() -> tuple[asyncio.Task, asyncio.Task]:
-        feed = HyperLiquidFeed(coins=_active_coins, on_price=on_price)
+        # Source-aware price feed: Binance (the lead exchange) by default so paper
+        # marking/display uses REAL Binance prices, not HyperLiquid testnet.
+        if resolve_market_data_source() == "binance":
+            feed = BinancePriceFeed(coins=_active_coins, on_price=on_price)
+        else:
+            feed = HyperLiquidFeed(coins=_active_coins, on_price=on_price)
         return (
             spawn(_price_consumer(price_queue, state), name="daemon-price-consumer"),
             spawn(feed.start(), name="daemon-feed"),
@@ -1707,12 +1719,20 @@ async def async_market_loop(state: dict):
                     and now - last_fallback_poll >= PRICE_FALLBACK_POLL_INTERVAL
                 ):
                     try:
-                        mids = await _to_thread_with_timeout(
-                            "daemon.get_all_mids.fallback",
-                            FALLBACK_MIDS_TIMEOUT_SECONDS,
-                            get_all_mids,
-                            _get_testnet(),
-                        )
+                        if resolve_market_data_source() == "binance":
+                            mids = await _to_thread_with_timeout(
+                                "daemon.fetch_binance_prices.fallback",
+                                FALLBACK_MIDS_TIMEOUT_SECONDS,
+                                fetch_binance_prices,
+                                _active_coins(),
+                            )
+                        else:
+                            mids = await _to_thread_with_timeout(
+                                "daemon.get_all_mids.fallback",
+                                FALLBACK_MIDS_TIMEOUT_SECONDS,
+                                get_all_mids,
+                                _get_testnet(),
+                            )
                         if isinstance(mids, dict):
                             await enqueue_price("poll", mids)
                     except Exception as e:
