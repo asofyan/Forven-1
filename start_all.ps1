@@ -412,15 +412,16 @@ function Install-BackendDeps {
     try {
         Invoke-Checked -FilePath $Python -CommandArgs @("-m","pip","install","-e",".")
     } catch {
-        Write-WarnMessage "pip install -e . failed; installing runtime deps directly."
+        Write-WarnMessage "pip install -e . failed; installing declared runtime deps from pyproject."
         & $Python -m pip uninstall -y forven | Out-Null
-        Invoke-Checked -FilePath $Python -CommandArgs @(
-            "-m","pip","install",
-            "click>=8.0","rich>=13.0","httpx>=0.25","PyJWT>=2.8","cryptography>=41.0","croniter>=2.0",
-            "filelock>=3.13","discord.py>=2.3","chromadb>=0.5","numpy>=1.26","pandas>=2.2",
-            "python-multipart>=0.0.9","fastapi>=0.111.0","uvicorn>=0.30.0","websockets>=13.0,<17","slowapi>=0.1.9","alembic>=1.13.0","pyarrow>=16.0.0","ccxt>=4.5.0",
-            "eth-account>=0.13.0","hyperliquid-python-sdk>=0.22.0"
-        )
+        # Derive the dependency set from pyproject (via the preflight helper) so this
+        # fallback can never drift from the declared deps the way a hand-list did
+        # (it had a stale pandas pin and a spurious 'alembic' forven never imports).
+        $declared = @(& $Python -m forven.preflight --print-deps 2>$null | Where-Object { $_ -and $_.Trim() })
+        if ($declared.Count -lt 1) {
+            Throw-StartAllError "Could not read declared dependencies from pyproject for the fallback install."
+        }
+        Invoke-Checked -FilePath $Python -CommandArgs (@("-m","pip","install") + $declared)
     }
 }
 
@@ -1091,11 +1092,19 @@ $env:PYTHONPATH = if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) { $script:R
 
 $npm = Get-NpmCommand
 $python = [string](Ensure-Venv | Select-Object -Last 1)
-if (-not (Test-ModuleAvailable -PythonCommand $python -ModuleName "forven.api") -or
-    -not (Test-ModuleAvailable -PythonCommand $python -ModuleName "uvicorn") -or
-    -not (Test-ModuleAvailable -PythonCommand $python -ModuleName "websockets") -or
-    -not (Test-ModuleAvailable -PythonCommand $python -ModuleName "multipart")) {
+# Dependency completeness is driven by pyproject (the single source of truth) via
+# the preflight module, NOT a hand-maintained import probe that silently drifts:
+# the old 4-module check missed every lazily-imported dep (feedparser, trafilatura,
+# yt-dlp, ...), so a fresh/partial venv booted "healthy" and broke mid-operation.
+# Install on any gap, then re-verify and fail loudly if still unsatisfied.
+& $python -m forven.preflight
+if ($LASTEXITCODE -ne 0) {
+    Write-Info "Dependency preflight reported gaps; installing backend deps..."
     Install-BackendDeps -Python $python
+    & $python -m forven.preflight
+    if ($LASTEXITCODE -ne 0) {
+        Throw-StartAllError "Backend dependencies still unsatisfied after install (see preflight output above)."
+    }
 }
 Ensure-FrontendDeps -Npm $npm
 
