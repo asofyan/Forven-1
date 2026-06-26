@@ -27,7 +27,28 @@ from typing import Literal
 from forven.strategies.execution_kernel import KernelResult
 
 
-ActionKind = Literal["open", "close", "backfill", "refresh"]
+ActionKind = Literal["open", "close", "backfill", "refresh", "orphan_close"]
+
+
+def _ts_lt(a: str, b: str) -> bool:
+    """a < b for ISO-ish timestamp strings, tolerant of format drift (space vs 'T',
+    with/without tz). Falls back to plain string compare."""
+    from datetime import datetime, timezone
+
+    def _parse(s: str):
+        s = str(s or "").strip().replace(" ", "T")
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    pa, pb = _parse(a), _parse(b)
+    if pa is not None and pb is not None:
+        return pa < pb
+    return str(a) < str(b)
 
 
 @dataclass
@@ -49,7 +70,7 @@ def _key(direction: str, entry_time: str) -> tuple[str, str]:
     return (str(direction or "long").strip().lower(), str(entry_time))
 
 
-def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | None = None) -> list[ReconcileAction]:
+def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | None = None, window_start: str | None = None) -> list[ReconcileAction]:
     """Diff the kernel's view against recorded paper trades → ordered actions.
 
     ``recorded`` is the strategy's paper trades (open and closed), each a dict with at
@@ -79,8 +100,13 @@ def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | N
         return recent_cutoff is None or str(entry_time) >= recent_cutoff
 
     recorded_by_key: dict[tuple[str, str], dict] = {}
+    recorded_open_by_dir: dict[str, dict] = {}
     for r in recorded:
         recorded_by_key[_key(r.get("direction", "long"), r.get("entry_time"))] = r
+        if str(r.get("status") or "open").strip().lower() != "closed":
+            recorded_open_by_dir.setdefault(str(r.get("direction") or "long").strip().lower(), r)
+
+    matched: set[int] = set()  # id() of recorded dicts consumed by a close/refresh/adopt
 
     closes: list[ReconcileAction] = []
     backfills: list[ReconcileAction] = []
@@ -97,21 +123,49 @@ def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | N
                 backfills.append(ReconcileAction("backfill", direction, entry_time, trade=kc))
         elif str(r.get("status") or "open").strip().lower() != "closed":
             closes.append(ReconcileAction("close", direction, entry_time, trade=kc, recorded=r))
-        # else: already recorded closed → nothing to do.
+            matched.add(id(r))
+        else:
+            matched.add(id(r))  # already recorded closed → nothing to do, but it IS matched.
 
     opens: list[ReconcileAction] = []
     refreshes: list[ReconcileAction] = []
+    kernel_open_dirs: set[str] = set()
     for direction, pos in res.open_positions.items():
         direction = str(direction or "long").strip().lower()
+        kernel_open_dirs.add(direction)
         entry_time = str(pos.get("entry_time"))
-        k = _key(direction, entry_time)
-        r = recorded_by_key.get(k)
-        if r is None or str(r.get("status") or "open").strip().lower() == "closed":
-            if _recent(entry_time):  # don't adopt a position that opened before tracking began
-                opens.append(ReconcileAction("open", direction, entry_time, position=pos))
-        else:
+        r = recorded_by_key.get(_key(direction, entry_time))
+        if r is not None and str(r.get("status") or "open").strip().lower() != "closed" and id(r) not in matched:
             refreshes.append(ReconcileAction("refresh", direction, entry_time, position=pos, recorded=r))
+            matched.add(id(r))
+            continue
+        # No exact (direction, entry_time) match. Before opening a NEW trade, ADOPT a
+        # same-direction recorded OPEN whose entry has DRIFTED — e.g. it was opened on a
+        # different data source (the HL→Binance switch) or a non-kernel path, so its
+        # kernel_entry_time no longer matches. There is ≤1 open per direction (unique
+        # index), so this is unambiguous and avoids a duplicate-open + a stranded orphan.
+        r_dir = recorded_open_by_dir.get(direction)
+        if r_dir is not None and id(r_dir) not in matched:
+            refreshes.append(ReconcileAction("refresh", direction, entry_time, position=pos, recorded=r_dir))
+            matched.add(id(r_dir))
+        elif _recent(entry_time):  # don't adopt a position that opened before tracking began
+            opens.append(ReconcileAction("open", direction, entry_time, position=pos))
+
+    # ORPHAN CLOSE: a recorded OPEN trade the kernel can no longer see (no exact match,
+    # not adopted) for a direction the kernel now holds NO position on → the kernel has
+    # exited it. Converge by closing it, so paper never holds a trade the strategy/kernel
+    # already covered. Guarded to entries WITHIN the evaluated window (the kernel can't
+    # speak to an entry older than its history). ``window_start`` None disables the guard
+    # (the parity tests pass full history, so it never fires there anyway).
+    orphan_closes: list[ReconcileAction] = []
+    for direction, r in recorded_open_by_dir.items():
+        if id(r) in matched or direction in kernel_open_dirs:
+            continue
+        entry_time = str(r.get("entry_time") or "")
+        if window_start is not None and entry_time and _ts_lt(entry_time, str(window_start)):
+            continue  # entry predates the kernel's evaluated window → leave it alone
+        orphan_closes.append(ReconcileAction("orphan_close", direction, entry_time, recorded=r))
 
     # Apply closes/backfills before opens so a same-direction re-entry after an exit is
-    # never mistaken for a still-open position.
-    return closes + backfills + opens + refreshes
+    # never mistaken for a still-open position; orphan-closes last (pure cleanup).
+    return closes + backfills + opens + refreshes + orphan_closes

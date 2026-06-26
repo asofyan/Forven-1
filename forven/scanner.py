@@ -5153,15 +5153,32 @@ def _kernel_recorded_trades(strat_id: str) -> list[dict]:
     for r in rows:
         row = dict(r)
         sd = parse_trade_signal_data(row.get("signal_data"))
+        is_open = str(row.get("status") or "").upper() == "OPEN"
         kref = sd.get("kernel_entry_time")
-        if not kref:
-            continue
-        out.append({
-            "direction": str(row.get("direction") or "long").strip().lower(),
-            "entry_time": str(kref),
-            "status": "open" if str(row.get("status") or "").upper() == "OPEN" else "closed",
-            "_row": row,
-        })
+        if kref:
+            out.append({
+                "direction": str(row.get("direction") or "long").strip().lower(),
+                "entry_time": str(kref),
+                "status": "open" if is_open else "closed",
+                "_row": row,
+            })
+        elif is_open:
+            # Orphan OPEN trade (legacy / non-kernel / data-drift): no kernel_entry_time,
+            # so it never matched the reconciler before and could be held forever. Surface
+            # it (with its real entry timestamp) so the reconciler can ADOPT it (if the
+            # kernel still holds that direction) or CONVERGE-CLOSE it (if the kernel is
+            # flat). Skip operator-controlled positions — those are never auto-managed.
+            if sd.get("manual_pause") or str(sd.get("source") or "").strip().lower() == "manual":
+                continue
+            entry_ref = sd.get("entry_time") or row.get("opened_at") or row.get("created_at") or ""
+            out.append({
+                "direction": str(row.get("direction") or "long").strip().lower(),
+                "entry_time": str(entry_ref),
+                "status": "open",
+                "_row": row,
+                "_orphan": True,
+            })
+        # CLOSED without kernel_entry_time → irrelevant to the kernel view; skip.
     return out
 
 
@@ -5276,11 +5293,35 @@ def _kernel_refresh_paper_trade(action) -> str | None:
     if row is None:
         return None
     pos = action.position or {}
-    _update_trade_signal_data(str(row.get("id")), {
+    updates = {
         "stop_loss": pos.get("stop_price"), "stop_loss_price": pos.get("stop_price"),
         "take_profit": pos.get("target_price"), "take_profit_price": pos.get("target_price"),
-    })
+    }
+    # When ADOPTING a drifted orphan (its kernel_entry_time no longer matches), stamp
+    # the kernel's current entry_time so it reconciles cleanly from now on.
+    if (action.recorded or {}).get("_orphan") and action.entry_time:
+        updates["kernel_entry_time"] = str(action.entry_time)
+    _update_trade_signal_data(str(row.get("id")), updates)
     return None
+
+
+def _kernel_close_orphan(action, *, last_close: float, last_time: str) -> str | None:
+    """Converge-close a recorded OPEN paper trade the kernel can no longer see and is
+    now FLAT on — it was opened on a different data source (the HL→Binance switch) or a
+    non-kernel path, so the reconciler's (direction, entry_time) match broke and it would
+    otherwise be held forever. Closes at the latest bar so paper stops holding a trade the
+    strategy/kernel already exited."""
+    row = (action.recorded or {}).get("_row")
+    if row is None or not last_close or last_close <= 0:
+        return None
+    trade_id = str(row.get("id"))
+    direction = str(action.direction or "long")
+    close_trade_record(
+        trade_id, signal_exit_price=last_close, exit_price=last_close,
+        close_reason="reconcile_flat", close_price_source="kernel_converge",
+        extra_signal_data={"kernel_converge_exit": True, "kernel_exit_time": last_time},
+    )
+    return f"KERNEL-CONVERGE-CLOSE {row.get('asset')} {direction} @ {last_close:.6g} (kernel flat)"
 
 
 def _kernel_handle_manual_exits(strat_id: str, current_price: float) -> list[str]:
@@ -5518,7 +5559,16 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     # triggers, not recorded trades. Closes/refreshes of recorded trades are unaffected.
     _backfill_bars = min(_paper_kernel_backfill_bars(), len(df))
     recent_cutoff = str(df.index[-_backfill_bars]) if len(df) >= 2 else None
-    actions_plan = reconcile(res, _kernel_recorded_trades(strat_id), recent_cutoff=recent_cutoff)
+    window_start = str(df.index[0]) if len(df) else None
+    last_close = float(df["close"].iloc[-1]) if len(df) else 0.0
+    last_time = str(df.index[-1]) if len(df) else ""
+    actions_plan = reconcile(
+        res, _kernel_recorded_trades(strat_id), recent_cutoff=recent_cutoff, window_start=window_start,
+    )
+    # Converge-close (orphan rescue) is paper-only and operator-gateable. Drop those
+    # actions when disabled or on the live path (the gated live path handles its own).
+    if is_live or not _scanner_bool_setting("paper_kernel_converge_orphans", True):
+        actions_plan = [a for a in actions_plan if a.kind != "orphan_close"]
     open_applier = _kernel_open_live_trade if is_live else _kernel_open_paper_trade
     close_applier = _kernel_close_live_trade if is_live else _kernel_close_paper_trade
     label = "live" if is_live else "paper"
@@ -5532,6 +5582,8 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
                 msg = close_applier(strat_id, strat, a)
             elif a.kind == "refresh":
                 msg = _kernel_refresh_paper_trade(a)
+            elif a.kind == "orphan_close":
+                msg = _kernel_close_orphan(a, last_close=last_close, last_time=last_time)
             else:
                 msg = None
             if msg:

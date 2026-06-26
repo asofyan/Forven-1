@@ -2097,3 +2097,42 @@ def test_non_vectorizable_uses_legacy_when_fallback_enabled(monkeypatch):
     actions = scanner_mod._apply_execution_actions(_one_signal_row())
     assert actions == ["LEGACY-OPENED"]
     assert legacy == ["S-FB"]
+
+
+# ── orphan converge-close (paper never holds a trade the kernel has exited) ───
+
+def _open_orphan_paper_trade(strategy_id, *, direction="short", entry=100.0, signal_data=None):
+    return scanner_mod._open_trade_db(
+        strat_id=strategy_id, asset="BTC", direction=direction, entry=entry,
+        size=0.1, risk_pct=0.01, leverage=1.0,
+        signal_data=signal_data if signal_data is not None else {},
+        execution_type="paper",
+    )
+
+
+def test_kernel_recorded_trades_surfaces_orphan_open(forven_db):
+    # An open paper trade with NO kernel_entry_time is surfaced as an orphan so the
+    # reconciler can adopt or converge-close it (it used to be silently skipped).
+    _open_orphan_paper_trade("S-ORPH", direction="short")
+    rec = scanner_mod._kernel_recorded_trades("S-ORPH")
+    assert len(rec) == 1
+    assert rec[0]["_orphan"] is True and rec[0]["direction"] == "short" and rec[0]["status"] == "open"
+
+
+def test_kernel_recorded_trades_skips_manual_orphan(forven_db):
+    # Operator-controlled (manual / paused) positions are never auto-managed.
+    _open_orphan_paper_trade("S-MAN", signal_data={"source": "manual"})
+    assert scanner_mod._kernel_recorded_trades("S-MAN") == []
+
+
+def test_kernel_close_orphan_closes_the_trade(forven_db):
+    from forven.db import get_db
+    from forven.strategies.paper_reconcile import ReconcileAction
+
+    tid = _open_orphan_paper_trade("S-OC", direction="short", entry=100.0)
+    action = ReconcileAction("orphan_close", "short", "", recorded={"_row": {"id": tid, "asset": "BTC"}})
+    msg = scanner_mod._kernel_close_orphan(action, last_close=90.0, last_time="2026-06-26T00:00:00+00:00")
+    assert msg and "CONVERGE-CLOSE" in msg
+    with get_db() as conn:
+        row = dict(conn.execute("SELECT status FROM trades WHERE id = ?", (tid,)).fetchone())
+    assert row["status"] == "CLOSED"
