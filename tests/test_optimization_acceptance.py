@@ -74,8 +74,14 @@ def test_baseline_retained_when_candidate_worse_oos():
 
 
 def test_baseline_retained_when_improvement_within_noise():
-    # Big fold-to-fold variance; tiny mean gain -> must not clear the noise band.
-    ctx, _ = _patch_walk_forward(_wfa([0.5, 1.5, 0.5]), _wfa([0.55, 1.55, 0.55]))
+    # The mean per-fold OOS-Sharpe gain CLEARS the absolute floor (0.10), but the
+    # per-fold DELTAS have real variance, so the noise band (IMPROVE_NOISE_K * std)
+    # is the binding constraint. baseline [0.5,0.5,0.5] vs candidate [0.25,0.65,1.05]
+    # -> deltas [-0.25, 0.15, 0.55]: mean 0.15 (> 0.10 floor), sample std 0.40 ->
+    # noise margin 0.5*0.40 = 0.20 > 0.15, so the candidate is rejected BY THE NOISE
+    # BAND. (With IMPROVE_NOISE_K=0 the same candidate would be ACCEPTED, so unlike
+    # the old constant-delta fixture this actually exercises the anti-overfit term.)
+    ctx, _ = _patch_walk_forward(_wfa([0.5, 0.5, 0.5]), _wfa([0.25, 0.65, 1.05]))
     with ctx:
         decision = evaluate_optimization_candidate(
             strategy_id="S", asset="BTC", strategy_type="rsi_momentum",
@@ -84,6 +90,73 @@ def test_baseline_retained_when_improvement_within_noise():
         )
     assert decision.accepted is False
     assert decision.rule_results["improvement_clears_noise"]["passed"] is False
+    # fold_consistency PASSES here (2/3 folds not-worse), proving the noise band —
+    # not fold consistency or the absolute floor — is what rejected the candidate.
+    assert decision.rule_results["fold_consistency"]["passed"] is True
+
+
+def test_baseline_retained_when_fold_consistency_fails():
+    # Mean gain clears BOTH the floor and the noise band, but the candidate is
+    # worse in 2/3 folds (a single lucky fold drives the mean) -> fold_consistency
+    # must reject it. baseline [0.5,0.5,0.5] vs candidate [0.45,0.45,3.0].
+    ctx, _ = _patch_walk_forward(_wfa([0.5, 0.5, 0.5]), _wfa([0.45, 0.45, 3.0]))
+    with ctx:
+        decision = evaluate_optimization_candidate(
+            strategy_id="S", asset="BTC", strategy_type="rsi_momentum",
+            current_params={"rsi_entry": 30}, candidate_params={"rsi_entry": 35},
+            optimization_metrics=_OK_OPT,
+        )
+    assert decision.accepted is False
+    assert decision.rule_results["fold_consistency"]["passed"] is False
+    assert decision.rule_results["improvement_clears_noise"]["passed"] is True
+
+
+def test_baseline_retained_when_oos_profit_factor_worse():
+    # Better OOS Sharpe but a worse OOS profit factor -> rejected.
+    ctx, _ = _patch_walk_forward(
+        _wfa([0.5, 0.5, 0.5], pf=2.0),
+        _wfa([1.1, 1.0, 1.2], pf=1.4),
+    )
+    with ctx:
+        decision = evaluate_optimization_candidate(
+            strategy_id="S", asset="BTC", strategy_type="rsi_momentum",
+            current_params={"rsi_entry": 30}, candidate_params={"rsi_entry": 35},
+            optimization_metrics=_OK_OPT,
+        )
+    assert decision.accepted is False
+    assert decision.rule_results["oos_profit_factor"]["passed"] is False
+
+
+def test_baseline_retained_when_trade_count_collapses():
+    # Better OOS Sharpe but the OOS trade count collapses below 75% of baseline.
+    ctx, _ = _patch_walk_forward(
+        _wfa([0.5, 0.5, 0.5], trades=40),
+        _wfa([1.1, 1.0, 1.2], trades=10),
+    )
+    with ctx:
+        decision = evaluate_optimization_candidate(
+            strategy_id="S", asset="BTC", strategy_type="rsi_momentum",
+            current_params={"rsi_entry": 30}, candidate_params={"rsi_entry": 35},
+            optimization_metrics=_OK_OPT,
+        )
+    assert decision.accepted is False
+    assert decision.rule_results["oos_trade_count"]["passed"] is False
+
+
+def test_baseline_retained_when_candidate_not_robust():
+    # Better OOS Sharpe but the candidate's own WFA verdict is not PASS -> rejected.
+    ctx, _ = _patch_walk_forward(
+        _wfa([0.5, 0.5, 0.5], verdict="PASS"),
+        _wfa([1.1, 1.0, 1.2], verdict="FAIL"),
+    )
+    with ctx:
+        decision = evaluate_optimization_candidate(
+            strategy_id="S", asset="BTC", strategy_type="rsi_momentum",
+            current_params={"rsi_entry": 30}, candidate_params={"rsi_entry": 35},
+            optimization_metrics=_OK_OPT,
+        )
+    assert decision.accepted is False
+    assert decision.rule_results["candidate_robust"]["passed"] is False
 
 
 def test_baseline_retained_when_drawdown_worsens():
