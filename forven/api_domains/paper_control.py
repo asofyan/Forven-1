@@ -480,12 +480,23 @@ def open_manual_position(
     if resolved_size is None or resolved_size <= 0:
         if resolved_risk_pct is None or resolved_risk_pct <= 0:
             raise HTTPException(status_code=400, detail="Provide size>0 or risk_pct in (0,100].")
+        # Size via the SHARED sizing mirror (forven.strategies.sizing) — the same
+        # fraction math the kernel/auto path uses — so a manual open is consistent
+        # with how the engine would size it: risk risk_pct of equity over the stop.
+        from forven.strategies import sizing as _sizing
+
         equity = _coerce_optional_float(session.get("capital")) or _INITIAL_PAPER_CAPITAL
-        resolved_size, sizing_meta = risk_mod.calculate_position_size(
-            asset=asset, direction=norm_dir, entry_price=mid,
-            stop_loss_price=sl, account_equity=equity,
-            risk_pct=resolved_risk_pct / 100.0, leverage=lev,
-        )
+        risk_frac = resolved_risk_pct / 100.0
+        stop_dist_pct = (abs(mid - sl) / mid) if (sl and sl > 0 and mid) else None
+        ec = _sizing.default_controls(risk_frac)
+        size_fraction = _sizing.size_fraction(ec, stop_dist_pct, leverage=lev, initial_capital=equity)
+        resolved_size = round(_sizing.position_units(equity=equity, size_fraction=size_fraction, leverage=lev, entry_price=mid), 6)
+        sizing_meta = {
+            "method": "fraction_mirror", "size_fraction": round(float(size_fraction), 8),
+            "units": resolved_size, "portfolio_equity": round(float(equity), 4),
+            "leverage": lev, "stop_distance_pct": (round(float(stop_dist_pct), 8) if stop_dist_pct else None),
+            "risk_pct": resolved_risk_pct, "mirror_sized": True,
+        }
     if resolved_size is None or resolved_size <= 0:
         raise HTTPException(status_code=400, detail="Computed position size is zero.")
 

@@ -5050,6 +5050,444 @@ def _blocked_scan_row(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Kernel-driven paper execution (paper↔backtest parity overhaul)
+#
+# Paper trades ARE the shared backtest kernel's trades. Each scan, run the engine
+# (forven.strategies.backtest.run_strategy_execution → execution_kernel.simulate)
+# over the strategy's history and reconcile its view (open + closed positions)
+# against the recorded paper trades. This replaces the bespoke close-price /
+# _risk_exit_reason exits and gives paper next-bar-open entries, intrabar
+# stop/TP/trailing/time-stops, profile sizing, and net-of-cost PnL — identical to
+# the backtest. Proven end-to-end in tests/test_paper_reconcile_parity.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _paper_kernel_execution_enabled() -> bool:
+    """Master switch for kernel-driven paper execution (parity path)."""
+    return _scanner_bool_setting("paper_kernel_execution", True)
+
+
+def _paper_kernel_history_bars() -> int:
+    try:
+        return max(int(_scanner_float_setting("paper_kernel_history_bars", 1500)), 300)
+    except Exception:
+        return 1500
+
+
+def _is_kernel_paper_strategy(strat: dict) -> bool:
+    """Kernel paper execution applies to PAPER-stage strategies only; live keeps the
+    legacy path until the live-consistency phase."""
+    stage = str(strat.get("stage") or strat.get("status") or "").strip().lower()
+    return stage in ("paper", "paper_trading")
+
+
+def _resolve_kernel_trade_mode(strat: dict, strategy_instance) -> str:
+    tm = str((strat.get("params") or {}).get("trade_mode") or strat.get("trade_mode") or "").strip().lower()
+    if tm in ("long_only", "short_only", "both"):
+        return tm
+    modes = getattr(strategy_instance, "supported_trade_modes", None)
+    if modes and "both" in modes:
+        return "both"
+    if modes and modes == {"short_only"}:
+        return "short_only"
+    return "long_only"
+
+
+def _kernel_recorded_trades(strat_id: str) -> list[dict]:
+    """Recorded kernel-managed paper trades (open + recently closed) shaped for the
+    reconciler. ``entry_time`` is the kernel bar timestamp stored at open, so it lines
+    up with the KernelResult's entries."""
+    out: list[dict] = []
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE COALESCE(strategy_id, strategy) = ? "
+            "AND status IN ('OPEN','CLOSED') ORDER BY opened_at DESC LIMIT 800",
+            (strat_id,),
+        ).fetchall()
+    for r in rows:
+        row = dict(r)
+        sd = parse_trade_signal_data(row.get("signal_data"))
+        kref = sd.get("kernel_entry_time")
+        if not kref:
+            continue
+        out.append({
+            "direction": str(row.get("direction") or "long").strip().lower(),
+            "entry_time": str(kref),
+            "status": "open" if str(row.get("status") or "").upper() == "OPEN" else "closed",
+            "_row": row,
+        })
+    return out
+
+
+def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equity: float, leverage: float) -> str | None:
+    from forven.strategies import sizing as _sizing
+
+    p = dict(strat.get("params") or {})
+    asset = str(strat.get("asset") or "")
+    direction = action.direction
+    pos = action.position or {}
+    entry_price = float(pos.get("entry_price") or 0.0)
+    if entry_price <= 0 or not asset:
+        return None
+    size_fraction = float(pos.get("size_fraction") or 0.0)
+    units = round(_sizing.position_units(
+        equity=float(sizing_equity), size_fraction=size_fraction,
+        leverage=leverage, entry_price=entry_price,
+    ), 6)
+    if units <= 0:
+        return None
+    stop_price = pos.get("stop_price")
+    target_price = pos.get("target_price")
+    alloc_risk = (
+        _coerce_positive_float((p.get("execution_profile") or {}).get("risk_per_trade"))
+        or min(float(size_fraction), 1.0)
+    )
+    signal_data = {
+        "kernel_managed": True,
+        "kernel_entry_time": action.entry_time,
+        "kernel_entry_bar": int(pos.get("entry_bar") or 0),
+        "kernel_size_fraction": round(float(size_fraction), 8),
+        "kernel_equity_at_entry": round(float(sizing_equity), 4),
+        "kernel_regime": pos.get("regime"),
+        "price": entry_price,
+        "direction": direction,
+        "stop_loss": stop_price,
+        "stop_loss_price": stop_price,
+        "take_profit": target_price,
+        "take_profit_price": target_price,
+        "source": "scanner.kernel",
+        "sizing": {
+            "method": "kernel", "size_fraction": round(float(size_fraction), 8),
+            "units": units, "portfolio_equity": round(float(sizing_equity), 4),
+            "leverage": leverage, "mirror_sized": True,
+        },
+    }
+    trade_id = _open_trade_db(
+        strat_id, asset, direction, entry_price, units,
+        float(alloc_risk), float(leverage), signal_data, execution_type="paper",
+    )
+    try:
+        register(trade_id, asset, direction, strat_id, float(alloc_risk), entry_price, execution_type="paper")
+    except Exception:
+        pass
+    _update_trade_fill(trade_id=trade_id, fill_price=entry_price, fill_kind="entry", signal_price=entry_price)
+    return f"KERNEL-OPEN {asset} {direction} @ {entry_price:.6g} size={units}"
+
+
+def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, direction: str) -> str | None:
+    trade_id = str(row.get("id"))
+    exit_price = float(trade.get("exit_price") or 0.0)
+    pnl_pct_net = float(trade.get("pnl_pct") or 0.0)  # kernel net, equity-fraction
+    equity_at_entry = (
+        _coerce_positive_float(parse_trade_signal_data(row.get("signal_data")).get("kernel_equity_at_entry"))
+        or _PAPER_SANDBOX_INITIAL_CAPITAL
+    )
+    pnl_usd = round(float(equity_at_entry) * pnl_pct_net, 4)
+    exit_reason = str(trade.get("exit_reason") or "signal")
+    _update_trade_fill(trade_id=trade_id, fill_price=exit_price, fill_kind="exit", signal_price=exit_price)
+    close_trade_record(
+        trade_id, signal_exit_price=exit_price, exit_price=exit_price,
+        close_reason=exit_reason, close_price_source="kernel",
+        extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
+    )
+    # Override with the kernel's NET values (close_trade_record computes a gross,
+    # position-return pnl; the kernel pnl_pct is net-of-drag, size-scaled equity impact).
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE trades SET pnl_pct=?, net_pnl_pct=?, pnl=?, pnl_usd=? WHERE id=?",
+            (round(pnl_pct_net, 8), round(pnl_pct_net, 8), pnl_usd, pnl_usd, trade_id),
+        )
+    return f"KERNEL-CLOSE {strat.get('asset')} {direction} @ {exit_price:.6g} pnl={pnl_pct_net * 100:.2f}% ({exit_reason})"
+
+
+def _kernel_close_paper_trade(strat_id: str, strat: dict, action) -> str | None:
+    trade = action.trade or {}
+    if action.recorded and action.recorded.get("_row"):
+        return _kernel_close_recorded(strat_id, strat, action.recorded["_row"], trade, action.direction)
+    # Backfill: opened AND closed between scans — record the completed trade.
+    from forven.strategies.paper_reconcile import ReconcileAction
+    sizing_equity = _get_paper_strategy_equity(strat_id)
+    leverage = float((strat.get("params") or {}).get("leverage", 1.0) or 1.0)
+    open_pos = {
+        "entry_price": trade.get("entry_price"), "entry_bar": trade.get("entry_bar"),
+        "size_fraction": trade.get("size_fraction"), "regime": trade.get("regime"),
+        "stop_price": None, "target_price": None,
+    }
+    _kernel_open_paper_trade(strat_id, strat, ReconcileAction("open", action.direction, action.entry_time, position=open_pos),
+                             sizing_equity=sizing_equity, leverage=leverage)
+    row = next(
+        (r["_row"] for r in _kernel_recorded_trades(strat_id)
+         if r["entry_time"] == action.entry_time and r["direction"] == action.direction and r["status"] == "open"),
+        None,
+    )
+    if row is None:
+        return None
+    return _kernel_close_recorded(strat_id, strat, row, trade, action.direction)
+
+
+def _kernel_refresh_paper_trade(action) -> str | None:
+    row = (action.recorded or {}).get("_row")
+    if row is None:
+        return None
+    pos = action.position or {}
+    _update_trade_signal_data(str(row.get("id")), {
+        "stop_loss": pos.get("stop_price"), "stop_loss_price": pos.get("stop_price"),
+        "take_profit": pos.get("target_price"), "take_profit_price": pos.get("target_price"),
+    })
+    return None
+
+
+def _kernel_handle_manual_exits(strat_id: str, current_price: float) -> list[str]:
+    """Enforce operator-set ABSOLUTE stop/take-profit on MANUAL positions of a
+    kernel-managed strategy.
+
+    The kernel reconciler only manages kernel-opened trades (those carrying
+    kernel_entry_time); and because manage_positions_via_kernel short-circuits the
+    legacy manage_positions, a manually-opened position would otherwise have its
+    manual SL/TP silently ignored. This closes that gap for paper positions
+    (manual_pause still detaches a position entirely)."""
+    out: list[str] = []
+    price = _coerce_positive_float(current_price)
+    if price is None:
+        return out
+    for trade in _get_open_trades(strat_id):
+        sd = parse_trade_signal_data(trade.get("signal_data"))
+        if sd.get("kernel_managed") or sd.get("manual_pause"):
+            continue  # reconciler owns kernel trades; manual_pause = fully detached
+        direction = str(trade.get("direction") or "long").strip().lower()
+        reason = _manual_price_exit_reason(price, direction, sd)
+        if not reason:
+            continue
+        trade_id = str(trade.get("id"))
+        entry_price = _coerce_positive_float(
+            trade.get("fill_entry_price") or trade.get("entry_price") or trade.get("signal_entry_price")
+        ) or price
+        leverage = _coerce_positive_float(trade.get("leverage")) or 1.0
+        size = _coerce_positive_float(trade.get("size")) or 0.0
+        signed = 1.0 if direction != "short" else -1.0
+        pnl_pct = ((price - entry_price) / entry_price) * signed * leverage
+        pnl_usd = (price - entry_price) * size * signed  # units embed leverage
+        _update_trade_fill(trade_id=trade_id, fill_price=price, fill_kind="exit", signal_price=price)
+        _close_trade_db(trade_id, price, pnl_pct, pnl_usd, close_reason=reason)
+        out.append(f"MANUAL-{reason.upper()} {trade.get('asset')} @ {price:.6g}")
+    return out
+
+
+def _live_kernel_execution_enabled() -> bool:
+    """Gate for routing LIVE-stage strategies through the kernel (same decisions as
+    paper/backtest, REAL fills). Default OFF — opt-in, testnet-first."""
+    return _scanner_bool_setting("live_kernel_execution", False)
+
+
+def _is_live_kernel_stage(strat: dict) -> bool:
+    stage = str(strat.get("stage") or strat.get("status") or "").strip().lower()
+    return stage in ("live", "live_graduated", "deployed")
+
+
+def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity: float, leverage: float) -> str | None:
+    """Place a REAL Hyperliquid order on a kernel 'open' decision (gated live path).
+
+    The kernel DECIDES (same signal/stop/trailing/time-stop as paper+backtest); the
+    EXCHANGE determines the price. Reuses _execute_direct (halt re-assert, leverage,
+    market order + resting SL/TP, real avgPx fill) and the can_open safety gate;
+    sizes via the kernel's size_fraction off live account equity."""
+    from forven.exchange.risk import can_open
+    from forven.strategies import sizing as _sizing
+
+    asset = str(strat.get("asset") or "")
+    direction = action.direction
+    pos = action.position or {}
+    ref_price = _coerce_positive_float(pos.get("entry_price"))
+    if not asset or ref_price is None:
+        return None
+    # Keep the live safety gates (kill-switch/daily-halt/one-per-asset/cooldown); size
+    # authoritatively from the kernel (enforce_risk_caps=False keeps gates, drops the cap).
+    allowed, alloc_risk, why = can_open(asset, direction, strat_id, execution_type="live", enforce_risk_caps=False)
+    if not allowed:
+        return f"BLOCKED {asset} live — {why}"
+    size_fraction = float(pos.get("size_fraction") or 0.0)
+    units = round(_sizing.position_units(equity=float(sizing_equity), size_fraction=size_fraction, leverage=leverage, entry_price=ref_price), 6)
+    if units <= 0:
+        return None
+    stop_price = pos.get("stop_price")
+    target_price = pos.get("target_price")
+    risk_pct = float(alloc_risk) if alloc_risk else min(float(size_fraction), 1.0)
+    signal_data = {
+        "kernel_managed": True, "kernel_entry_time": action.entry_time,
+        "kernel_size_fraction": round(float(size_fraction), 8), "kernel_equity_at_entry": round(float(sizing_equity), 4),
+        "stop_loss": stop_price, "stop_loss_price": stop_price,
+        "take_profit": target_price, "take_profit_price": target_price,
+        "direction": direction, "source": "scanner.kernel.live",
+    }
+    try:
+        trade_id = _open_trade_db(strat_id, asset, direction, ref_price, units, risk_pct, float(leverage), signal_data, execution_type="live")
+    except sqlite3.IntegrityError:
+        return None  # duplicate-open guard (concurrent scan / pending reconcile)
+    try:
+        register(trade_id, asset, direction, strat_id, risk_pct, ref_price, execution_type="live")
+    except Exception:
+        pass
+    _execute_direct("open", trade_id, strat_id, asset, direction, units, ref_price,
+                    stop_loss=stop_price, take_profit=target_price, leverage=float(leverage))
+    return f"LIVE-KERNEL-OPEN {asset} {direction} x{units}"
+
+
+def _kernel_close_live_trade(strat_id: str, strat: dict, action) -> str | None:
+    """Close a live position on a kernel 'close' decision via a REAL reduce-only order,
+    then finalize like the legacy path (pnl from the real fill, retire protection
+    orders, release the risk slot)."""
+    row = (action.recorded or {}).get("_row")
+    if row is None:
+        return None  # backfill of a live trade we never recorded — cannot replay a real order
+    trade = action.trade or {}
+    trade_id = str(row.get("id"))
+    asset = str(row.get("asset") or strat.get("asset") or "")
+    direction = str(row.get("direction") or "long").strip().lower()
+    size = _coerce_positive_float(row.get("size")) or 0.0
+    ref_price = _coerce_positive_float(trade.get("exit_price")) or 0.0
+    reason = str(trade.get("exit_reason") or "signal")
+
+    result = _execute_direct("close", trade_id, strat_id, asset, direction, size, ref_price, close_reason=reason)
+    state = str(result.get("_close_reconcile_state") or "").strip().lower() if isinstance(result, dict) else ""
+    if state in ("pending", "partial"):
+        return f"LIVE-KERNEL-CLOSE {asset} {state}"
+
+    entry_price = _coerce_positive_float(
+        row.get("fill_entry_price") or row.get("entry_price") or row.get("signal_entry_price")
+    ) or ref_price
+    leverage = _coerce_positive_float(row.get("leverage")) or 1.0
+    signed = 1.0 if direction != "short" else -1.0
+    # close_trade_record prefers the recorded fill_exit_price; these are post-mortem
+    # fallbacks. units embed leverage → pnl_usd is lev-free (double-count already fixed).
+    pnl_pct = ((ref_price - entry_price) / entry_price) * signed * leverage if entry_price else 0.0
+    pnl_usd = (ref_price - entry_price) * size * signed
+    _close_trade_db(trade_id, ref_price, pnl_pct, pnl_usd, close_reason=reason)
+    try:
+        _vault = _resolve_trade_vault_address(trade_id)
+        _stop_oids = _trade_stop_oids(row)
+        if _vault:
+            _retire_trade_protection_orders(asset, _vault, stop_oids=_stop_oids)
+        else:
+            _retire_trade_protection_orders(asset, stop_oids=_stop_oids)
+    except Exception as exc:
+        log.warning("[%s] live kernel close: protection-order retire failed: %s", strat_id, exc)
+    try:
+        release(trade_id)
+    except Exception:
+        pass
+    return f"LIVE-KERNEL-CLOSE {asset} {reason}"
+
+
+def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=None, execution_type: str = "paper", diagnostics=None) -> list[str] | None:
+    """Kernel-driven paper execution: run the shared engine over the strategy's history
+    and reconcile its open/closed positions into paper trades. Returns the action
+    strings, or ``None`` when the strategy exposes no vectorized signals (the caller
+    falls back to the legacy per-bar ``manage_positions``)."""
+    from forven.strategies import backtest as _bt
+    from forven.strategies.paper_reconcile import reconcile
+
+    p = dict(strat.get("params") or {})
+    asset = str(strat.get("asset") or "").strip()
+    if not asset:
+        return None
+    timeframe = str(strat.get("timeframe") or p.get("timeframe") or "1h").strip().lower() or "1h"
+
+    try:
+        df = _enrich_scan_frame(
+            fetch_candles(asset, bars=_paper_kernel_history_bars(), interval=timeframe), asset, timeframe,
+        )
+        df = _trim_unclosed_latest_candle(df, timeframe)
+    except Exception as exc:
+        log.warning("[%s] kernel paper: candle fetch failed (%s); legacy path", strat_id, exc)
+        return None
+    if df is None or df.empty or len(df) < 20:
+        return None
+
+    strategy_instance = None
+    try:
+        from forven.strategies.registry import _TYPE_MAP, get_active, resolve_runtime_type
+        strategy_instance = get_active().get(strat_id)
+        if strategy_instance is None:
+            runtime_type, _meta = resolve_runtime_type(str(strat.get("type") or ""), strat.get("runtime_type"))
+            cls = _TYPE_MAP.get(runtime_type or "")
+            if cls is not None:
+                cp = dict(p)
+                cp.setdefault("_asset", asset)
+                strategy_instance = cls(strat_id, cp)
+    except Exception:
+        strategy_instance = None
+    if strategy_instance is None:
+        return None
+
+    leverage = float(p.get("leverage", 1.0) or 1.0)
+    _, fee_bps, slippage_bps = _resolve_trade_assumptions(p)
+    ec = _bt.execution_controls_from_params(p) or None
+    initial_capital = (
+        _coerce_positive_float((p.get("execution_profile") or {}).get("initial_capital"))
+        or _PAPER_SANDBOX_INITIAL_CAPITAL
+    )
+    trade_mode = _resolve_kernel_trade_mode(strat, strategy_instance)
+    strategy_type = str(strat.get("runtime_type") or strat.get("type") or "").strip() or None
+
+    try:
+        res = _bt.run_strategy_execution(
+            df, strategy_instance, params=p, warmup=200, leverage=leverage,
+            fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=False,
+            trade_mode=trade_mode, execution_controls=ec, initial_capital=initial_capital,
+            strategy_type=strategy_type,
+        )
+    except Exception as exc:
+        log.warning("[%s] kernel paper: run_strategy_execution failed (%s); legacy path", strat_id, exc)
+        return None
+    if res is None:
+        return None  # no vectorized signals → legacy per-bar path
+
+    is_live = str(execution_type).strip().lower() == "live"
+    sizing_equity = _get_account_equity() if is_live else _get_paper_strategy_equity(strat_id)
+    # Only RECORD activity from go-live forward — never replay the strategy's entire
+    # would-be history as trades (that flooded a fresh/reset book). The last couple of
+    # bars give scan-timing tolerance; pre-cutoff trades show on the chart as triggers,
+    # not as recorded trades. Closes/refreshes of already-recorded trades are unaffected.
+    recent_cutoff = str(df.index[-2]) if len(df) >= 2 else None
+    actions_plan = reconcile(res, _kernel_recorded_trades(strat_id), recent_cutoff=recent_cutoff)
+    open_applier = _kernel_open_live_trade if is_live else _kernel_open_paper_trade
+    close_applier = _kernel_close_live_trade if is_live else _kernel_close_paper_trade
+    label = "live" if is_live else "paper"
+
+    out: list[str] = []
+    for a in actions_plan:
+        try:
+            if a.kind == "open":
+                msg = open_applier(strat_id, strat, a, sizing_equity=sizing_equity, leverage=leverage)
+            elif a.kind in ("close", "backfill"):
+                msg = close_applier(strat_id, strat, a)
+            elif a.kind == "refresh":
+                msg = _kernel_refresh_paper_trade(a)
+            else:
+                msg = None
+            if msg:
+                out.append(msg)
+        except Exception as exc:
+            log.error("[%s] kernel %s %s action failed: %s", strat_id, label, a.kind, exc, exc_info=True)
+
+    # Operator-set manual SL/TP on manually-opened PAPER positions (the reconciler
+    # ignores non-kernel trades, and the legacy manual-exit path is short-circuited
+    # here). Live manual positions still need a real reduce-only order — deferred with
+    # the gated live path.
+    if not is_live:
+        try:
+            out.extend(_kernel_handle_manual_exits(strat_id, float(df["close"].iloc[-1])))
+        except Exception as exc:
+            log.error("[%s] kernel paper manual-exit check failed: %s", strat_id, exc, exc_info=True)
+
+    if diagnostics is not None:
+        diagnostics[strat_id] = {
+            "strategy_id": strat_id, "execution_decision": "kernel_managed",
+            "runtime_type": strategy_type, "actions": out,
+        }
+    return out
+
+
 def _scan_asset_group(
     asset: str,
     strategy_items: list[tuple[str, dict]],
@@ -5477,13 +5915,27 @@ def _apply_execution_actions(signal_rows: list[dict], diagnostics_out: dict[str,
         try:
             strat = item["strategy"]
             signal = item["signal"]
-            actions = manage_positions(
-                strat_id,
-                strat,
-                signal,
-                account_equity=account_equity,
-                diagnostics=diagnostics_out,
-            )
+            actions = None
+            # Parity path: strategies with vectorized signals are managed by the shared
+            # backtest kernel (paper trades == backtest trades; live takes the SAME
+            # decisions with real fills). Falls back to the legacy per-bar path when
+            # disabled or the strategy has no vectorized signals (→ None).
+            if _paper_kernel_execution_enabled() and _is_kernel_paper_strategy(strat):
+                actions = manage_positions_via_kernel(
+                    strat_id, strat, account_equity=account_equity, execution_type="paper", diagnostics=diagnostics_out,
+                )
+            elif _live_kernel_execution_enabled() and _is_live_kernel_stage(strat):
+                actions = manage_positions_via_kernel(
+                    strat_id, strat, account_equity=account_equity, execution_type="live", diagnostics=diagnostics_out,
+                )
+            if actions is None:
+                actions = manage_positions(
+                    strat_id,
+                    strat,
+                    signal,
+                    account_equity=account_equity,
+                    diagnostics=diagnostics_out,
+                )
             all_actions.extend(actions)
         except Exception as e:
             log.error("[%s] ERROR while applying execution actions: %s", strat_id, e, exc_info=True)
