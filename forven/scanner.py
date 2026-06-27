@@ -5215,14 +5215,42 @@ def _kernel_recorded_trades(strat_id: str) -> list[dict]:
     return out
 
 
-def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equity: float, leverage: float) -> str | None:
+def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equity: float, leverage: float,
+                             current_price: float | None = None, current_time: str | None = None) -> str | None:
     from forven.strategies import sizing as _sizing
 
     p = dict(strat.get("params") or {})
     asset = str(strat.get("asset") or "")
     direction = action.direction
     pos = action.position or {}
-    entry_price = float(pos.get("entry_price") or 0.0)
+    kernel_entry_price = float(pos.get("entry_price") or 0.0)
+    # LATE "hop-in": the kernel has held this position since before the recording window
+    # (a still-active signal we missed while off). Open it at the CURRENT price/time and
+    # re-anchor the stop/target to that price, PRESERVING the kernel position's risk
+    # geometry (stop/target distance as a fraction of entry) so the 1%-risk sizing still
+    # holds at the late entry. Otherwise: faithful open at the kernel's own entry.
+    late = bool(getattr(action, "late_entry", False)) and current_price is not None and float(current_price) > 0
+    if late:
+        entry_price = float(current_price)
+        _sgn = 1.0 if direction == "long" else -1.0
+        _k_stop = pos.get("stop_price")
+        if _k_stop and kernel_entry_price > 0:
+            _stop_dist = abs(kernel_entry_price - float(_k_stop)) / kernel_entry_price
+            stop_price = round(entry_price * (1.0 - _sgn * _stop_dist), 8)
+        else:
+            stop_price = None
+        _k_tp = pos.get("target_price")
+        if _k_tp and kernel_entry_price > 0:
+            _tp_dist = abs(float(_k_tp) - kernel_entry_price) / kernel_entry_price
+            target_price = round(entry_price * (1.0 + _sgn * _tp_dist), 8)
+        else:
+            target_price = None
+        opened_at_val = str(current_time) if current_time else action.entry_time
+    else:
+        entry_price = kernel_entry_price
+        stop_price = pos.get("stop_price")
+        target_price = pos.get("target_price")
+        opened_at_val = action.entry_time
     if entry_price <= 0 or not asset:
         return None
     size_fraction = float(pos.get("size_fraction") or 0.0)
@@ -5232,14 +5260,14 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
     ), 6)
     if units <= 0:
         return None
-    stop_price = pos.get("stop_price")
-    target_price = pos.get("target_price")
     alloc_risk = (
         _coerce_positive_float((p.get("execution_profile") or {}).get("risk_per_trade"))
         or min(float(size_fraction), 1.0)
     )
     signal_data = {
         "kernel_managed": True,
+        # Match key is ALWAYS the kernel's historical entry_time, even for a late hop-in,
+        # so the next scan reconciles it as a REFRESH of the still-held kernel position.
         "kernel_entry_time": action.entry_time,
         "kernel_entry_bar": int(pos.get("entry_bar") or 0),
         "kernel_size_fraction": round(float(size_fraction), 8),
@@ -5251,7 +5279,12 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         "stop_loss_price": stop_price,
         "take_profit": target_price,
         "take_profit_price": target_price,
-        "source": "scanner.kernel",
+        "source": "scanner.kernel" if not late else "scanner.kernel.late_entry",
+        # Tag late hop-ins so the close path keeps the entry-based PnL (the recorded entry
+        # differs from the kernel's historical entry) and the refresh path leaves the
+        # re-anchored stop/target alone.
+        "late_entry": late,
+        "kernel_historical_entry_price": round(kernel_entry_price, 8) if late else None,
         "sizing": {
             "method": "kernel", "size_fraction": round(float(size_fraction), 8),
             "units": units, "portfolio_equity": round(float(sizing_equity), 4),
@@ -5261,24 +5294,23 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
     trade_id = _open_trade_db(
         strat_id, asset, direction, entry_price, units,
         float(alloc_risk), float(leverage), signal_data, execution_type="paper",
-        opened_at=action.entry_time,  # the kernel's entry-BAR time, not wall-clock scan time
+        opened_at=opened_at_val,  # late hop-in: current bar time; else the kernel entry-BAR time
     )
     try:
         register(trade_id, asset, direction, strat_id, float(alloc_risk), entry_price, execution_type="paper")
     except Exception:
         pass
     _update_trade_fill(trade_id=trade_id, fill_price=entry_price, fill_kind="entry", signal_price=entry_price)
-    return f"KERNEL-OPEN {asset} {direction} @ {entry_price:.6g} size={units}"
+    return f"KERNEL-OPEN{' (late hop-in)' if late else ''} {asset} {direction} @ {entry_price:.6g} size={units}"
 
 
 def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, direction: str) -> str | None:
     trade_id = str(row.get("id"))
+    sd = parse_trade_signal_data(row.get("signal_data"))
+    late = bool(sd.get("late_entry"))
     exit_price = float(trade.get("exit_price") or 0.0)
     pnl_pct_net = float(trade.get("pnl_pct") or 0.0)  # kernel net, equity-fraction
-    equity_at_entry = (
-        _coerce_positive_float(parse_trade_signal_data(row.get("signal_data")).get("kernel_equity_at_entry"))
-        or _PAPER_SANDBOX_INITIAL_CAPITAL
-    )
+    equity_at_entry = _coerce_positive_float(sd.get("kernel_equity_at_entry")) or _PAPER_SANDBOX_INITIAL_CAPITAL
     pnl_usd = round(float(equity_at_entry) * pnl_pct_net, 4)
     exit_reason = str(trade.get("exit_reason") or "signal")
     _update_trade_fill(trade_id=trade_id, fill_price=exit_price, fill_kind="exit", signal_price=exit_price)
@@ -5287,13 +5319,28 @@ def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, d
         close_reason=exit_reason, close_price_source="kernel",
         extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
     )
-    # Override with the kernel's NET values (close_trade_record computes a gross,
-    # position-return pnl; the kernel pnl_pct is net-of-drag, size-scaled equity impact),
-    # and stamp closed_at with the kernel's actual EXIT-bar time (close_trade_record
-    # records wall-clock; the trade really closed on the bar the kernel exited on, so the
-    # recorded trade lands on the correct bars instead of the scan moment).
+    # Stamp closed_at with the kernel's actual EXIT-bar time (close_trade_record records
+    # wall-clock; the trade really closed on the bar the kernel exited on, so the recorded
+    # trade lands on the correct bars instead of the scan moment).
     _exit_time = trade.get("exit_time")
     _closed_at = str(_exit_time).replace(" ", "T") if _exit_time else None
+    if late:
+        # LATE hop-in: the recorded entry is the (later) hop-in price, NOT the kernel's
+        # historical entry — so close_trade_record's entry-based PnL is the correct one for
+        # this position. Do NOT override it with the kernel's historical-entry net pnl;
+        # only stamp the kernel exit-bar time. (Display pnl is computed from the recorded
+        # entry below for the log line.)
+        if _closed_at:
+            with get_db() as conn:
+                conn.execute("UPDATE trades SET closed_at=? WHERE id=?", (_closed_at, trade_id))
+        _our_entry = _coerce_positive_float(row.get("entry_price") or row.get("signal_entry_price")) or 0.0
+        _lev = float(row.get("leverage") or 1.0)
+        _sgn = 1.0 if str(direction).strip().lower() == "long" else -1.0
+        disp_pnl = ((exit_price - _our_entry) / _our_entry * _sgn * _lev) if _our_entry > 0 else 0.0
+        return f"KERNEL-CLOSE (late) {strat.get('asset')} {direction} @ {exit_price:.6g} pnl={disp_pnl * 100:.2f}% ({exit_reason})"
+    # Faithful kernel trade: override with the kernel's NET values (close_trade_record
+    # computes a gross, position-return pnl; the kernel pnl_pct is net-of-drag, size-scaled
+    # equity impact).
     with get_db() as conn:
         if _closed_at:
             conn.execute(
@@ -5336,6 +5383,12 @@ def _kernel_close_paper_trade(strat_id: str, strat: dict, action) -> str | None:
 def _kernel_refresh_paper_trade(action) -> str | None:
     row = (action.recorded or {}).get("_row")
     if row is None:
+        return None
+    # A late hop-in entered at a DIFFERENT price than the kernel's historical entry, so its
+    # stop/target were re-anchored to the hop-in price. The kernel's pos still carries the
+    # OLD (historical-entry) levels — don't clobber the re-anchored ones with them; leave
+    # the late trade's own SL/TP intact.
+    if bool(parse_trade_signal_data(row.get("signal_data")).get("late_entry")):
         return None
     pos = action.position or {}
     updates = {
@@ -5416,7 +5469,8 @@ def _is_live_kernel_stage(strat: dict) -> bool:
     return stage in ("live", "live_graduated", "deployed")
 
 
-def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity: float, leverage: float) -> str | None:
+def _kernel_open_live_trade(strat_id: str, strat: dict, action, *, sizing_equity: float, leverage: float,
+                            current_price: float | None = None, current_time: str | None = None) -> str | None:
     """Place a REAL Hyperliquid order on a kernel 'open' decision (gated live path).
 
     The kernel DECIDES (same signal/stop/trailing/time-stop as paper+backtest); the
@@ -5621,8 +5675,14 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     window_start = str(df.index[min(KERNEL_WARMUP + 1, len(df) - 1)]) if len(df) else None
     last_close = float(df["close"].iloc[-1]) if len(df) else 0.0
     last_time = str(df.index[-1]) if len(df) else ""
+    # Late "hop-in": when a kernel position is still held but its entry predates the
+    # recording window (a still-active signal missed while the system was off), take the
+    # position NOW at the current price instead of leaving it as a chart-only trigger.
+    # Paper-only + operator-gateable; the live path stays conservative (no auto hop-in).
+    late_entry_enabled = (not is_live) and _scanner_bool_setting("paper_kernel_late_entry", True)
     actions_plan = reconcile(
         res, _kernel_recorded_trades(strat_id), recent_cutoff=recent_cutoff, window_start=window_start,
+        late_entry=late_entry_enabled,
     )
     # Converge-close (orphan rescue) is paper-only and operator-gateable. Drop those
     # actions when disabled or on the live path (the gated live path handles its own).
@@ -5636,7 +5696,8 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     for a in actions_plan:
         try:
             if a.kind == "open":
-                msg = open_applier(strat_id, strat, a, sizing_equity=sizing_equity, leverage=leverage)
+                msg = open_applier(strat_id, strat, a, sizing_equity=sizing_equity, leverage=leverage,
+                                   current_price=last_close, current_time=last_time)
             elif a.kind in ("close", "backfill"):
                 msg = close_applier(strat_id, strat, a)
             elif a.kind == "refresh":

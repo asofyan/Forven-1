@@ -64,6 +64,11 @@ class ReconcileAction:
     trade: dict | None = None
     # For close/refresh: the recorded paper trade being acted on.
     recorded: dict | None = None
+    # For open: True when this is a LATE "hop-in" — the kernel has HELD this position since
+    # before the recording window (a still-active signal the scanner missed while off).
+    # Instead of replaying the stale historical entry, the scanner opens it at the CURRENT
+    # price/time and re-anchors stop/target to that price.
+    late_entry: bool = False
 
 
 def _canonical_ts(entry_time: str) -> str:
@@ -89,7 +94,7 @@ def _key(direction: str, entry_time: str) -> tuple[str, str]:
     return (str(direction or "long").strip().lower(), _canonical_ts(entry_time))
 
 
-def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | None = None, window_start: str | None = None) -> list[ReconcileAction]:
+def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | None = None, window_start: str | None = None, late_entry: bool = False) -> list[ReconcileAction]:
     """Diff the kernel's view against recorded paper trades → ordered actions.
 
     ``recorded`` is the strategy's paper trades (open and closed), each a dict with at
@@ -105,6 +110,14 @@ def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | N
     strategy's ENTIRE would-be history as trades. Closes/refreshes of ALREADY-recorded
     trades always proceed regardless of the cutoff. ``None`` (default) = full replay,
     which is the backtest-parity semantics the tests assert.
+
+    ``late_entry`` (paper only) changes how a STALE-but-still-held kernel position is
+    handled: when the kernel currently holds a position whose entry predates the cutoff
+    and there's no recorded counterpart, instead of leaving it untouched (a chart trigger
+    only), emit a ``late_entry`` open so the scanner HOPS IN at the current price/time.
+    This is the "the signal is still active, so take the position now" behaviour. Keyed
+    by the kernel's historical entry_time so subsequent scans REFRESH (not re-open) it.
+    ``False`` (default) keeps the original suppress-stale behaviour (and parity).
 
     Actions, in apply order:
       * ``close``    — a recorded OPEN trade the kernel has now finalized.
@@ -169,6 +182,13 @@ def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | N
             matched.add(id(r_dir))
         elif _recent(entry_time):  # don't adopt a position that opened before tracking began
             opens.append(ReconcileAction("open", direction, entry_time, position=pos))
+        elif late_entry:
+            # Stale-but-still-held signal: the kernel entered before the recording window
+            # and never exited, so the strategy STILL wants this position. Don't replay the
+            # old entry — HOP IN at the current price/time (the scanner re-anchors entry,
+            # stop and target to "now"). Keyed by the kernel's historical entry_time so the
+            # next scan reconciles it as a REFRESH, not a duplicate open.
+            opens.append(ReconcileAction("open", direction, entry_time, position=pos, late_entry=True))
 
     # ORPHAN CLOSE: a recorded OPEN trade the kernel can no longer see (no exact match,
     # not adopted) for a direction the kernel now holds NO position on → the kernel has
