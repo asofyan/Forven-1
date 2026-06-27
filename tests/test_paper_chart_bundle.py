@@ -123,6 +123,42 @@ def test_kernel_triggers_respect_prelive_cutoff():
         assert pd.Timestamp(m["timestamp"]) < cutoff
 
 
+def test_resolve_trigger_trade_mode():
+    assert paper_domain._resolve_trigger_trade_mode(None, {"trade_mode": "short_only"}) == "short_only"
+    assert paper_domain._resolve_trigger_trade_mode(None, {"trade_mode": "both"}) == "both"
+
+    class _ShortOnly:
+        supported_trade_modes = {"short_only"}
+
+    assert paper_domain._resolve_trigger_trade_mode(_ShortOnly(), {}) == "short_only"
+    assert paper_domain._resolve_trigger_trade_mode(None, {}) == "long_only"
+
+
+def test_short_only_strategy_emits_full_history_triggers():
+    """Regression: the chart replay used to default trade_mode=long_only, so a SHORT-
+    only strategy produced ZERO trades → NO trigger triangles (the 'no triangles on the
+    chart' bug). The trade mode must be resolved from the strategy."""
+    import numpy as np
+    from forven.strategies.custom.ETH_emabreakatrshort_s157270 import STRATEGY_CLASS
+
+    n = 600
+    idx = pd.date_range("2026-05-01", periods=n, freq="1h", tz="UTC")
+    close = np.linspace(2000.0, 1600.0, n) + np.sin(np.arange(n) / 5.0) * 12
+    frame = pd.DataFrame(
+        {"open": close, "high": close + 6, "low": close - 6, "close": close, "volume": 1000.0}, index=idx
+    )
+    strat = STRATEGY_CLASS("S-SHORT", {"_asset": "BTC", "ema_fast": 16, "ema_slow": 40, "atr_period": 12, "exit_k": 1.2})
+    assert paper_domain._resolve_trigger_trade_mode(strat, strat.params) == "short_only"
+
+    entries, exits = paper_domain._kernel_trigger_markers(
+        strat, frame, params=strat.params, leverage=2.0, strategy_type="emabreakatrshort_r3l12_h", cutoff=None,
+    )
+    assert entries, "short-only strategy emitted no triggers (trade_mode regression)"
+    # Short opens are SHORT (red ▼), closes are COVER (green ▲).
+    assert all(m["action"] == "short" for m in entries)
+    assert all(m["action"] == "cover" for m in exits)
+
+
 def test_chart_bundle_assembles_everything(monkeypatch):
     """End-to-end shape: bundle has real indicators, triggers, ACTUAL trade markers,
     and the open position's active stop/take-profit."""

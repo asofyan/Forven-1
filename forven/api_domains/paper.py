@@ -1812,6 +1812,22 @@ def _resolve_chart_strategy(session: dict, params: dict):
     return None
 
 
+def _resolve_trigger_trade_mode(strat, params: dict) -> str:
+    """The trade mode the chart's trigger replay must run under. CRITICAL: without
+    this it defaults to ``long_only`` and a SHORT-only strategy produces ZERO trades
+    → ZERO triggers (the 'no triangles on the chart' bug). Mirrors the scanner's
+    ``_resolve_kernel_trade_mode`` so the chart's would-be trades match paper's."""
+    tm = str((params or {}).get("trade_mode") or "").strip().lower()
+    if tm in ("long_only", "short_only", "both"):
+        return tm
+    modes = getattr(strat, "supported_trade_modes", None)
+    if modes and "both" in modes:
+        return "both"
+    if modes and set(modes) == {"short_only"}:
+        return "short_only"
+    return "long_only"
+
+
 def _kernel_trigger_markers(strat, frame, *, params, leverage, strategy_type, cutoff):
     """Discrete historical trigger points = the entries/exits the KERNEL would make
     over the whole frame (ungated). These are EVENTS (one per would-be position
@@ -1832,7 +1848,8 @@ def _kernel_trigger_markers(strat, frame, *, params, leverage, strategy_type, cu
     try:
         res = _bt.run_strategy_execution(
             frame, strat, params=params, warmup=200, leverage=leverage,
-            regime_gate=False, execution_controls=None, strategy_type=strategy_type,
+            regime_gate=False, trade_mode=_resolve_trigger_trade_mode(strat, params),
+            execution_controls=None, strategy_type=strategy_type,
         )
     except Exception:
         return entries, exits
