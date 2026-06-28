@@ -1692,14 +1692,31 @@ def fetch_candles(coin: str, bars: int = 300, interval: str = "1h") -> pd.DataFr
 
     cached_rows, cache_age = load_candle_snapshot(normalized_coin, interval=resolved_interval)
     cached_df = ohlcv_rows_to_dataframe(cached_rows)
-    if not cached_df.empty:
-        if cache_age is None or cache_age <= _CANDLE_CACHE_STALE_SECONDS:
-            return cached_df.tail(required_bars)
-        # Prefer stale cache over hard failure when direct fetch fallback is disabled.
-        if not _scanner_bool_setting("scanner_allow_direct_market_fetch", True):
-            return cached_df.tail(required_bars)
+    # RESTART-1: only serve from cache when it actually COVERS the request. The shared
+    # cache holds _CANDLE_CACHE_BARS (~360) rows, but the kernel replay asks for up to
+    # _paper_kernel_history_bars (1500). Returning the short tail TRUNCATES the replay,
+    # so a position held longer than the cache scrolls out of the window and loses ALL
+    # kernel exit enforcement (a zombie that can ride past its stop / time-stop). When
+    # the cache is too short, direct-fetch the FULL window below and republish a cache
+    # that covers it.
+    cache_fresh = cache_age is None or cache_age <= _CANDLE_CACHE_STALE_SECONDS
+    cache_covers = (not cached_df.empty) and len(cached_df) >= required_bars
+    if cache_covers and cache_fresh:
+        return cached_df.tail(required_bars)
 
     if not _scanner_bool_setting("scanner_allow_direct_market_fetch", True):
+        # Direct fetch disabled (strict no-fallback): serve the cache even if short or
+        # stale (better than a hard failure), but make a truncated kernel window VISIBLE
+        # so a silently-shortened replay can't strand a long-held position unnoticed.
+        if not cached_df.empty:
+            if len(cached_df) < required_bars:
+                log.warning(
+                    "[%s] candle cache holds %d rows < requested %d (%s) and direct fetch is "
+                    "disabled — kernel replay window TRUNCATED; a long-held position can lose "
+                    "exit enforcement. Raise the daemon cache window or enable direct fetch.",
+                    normalized_coin, len(cached_df), required_bars, resolved_interval,
+                )
+            return cached_df.tail(required_bars)
         raise RuntimeError(f"Candle cache unavailable/stale for {normalized_coin}")
 
     # Source-aware (Binance by default): paper trades on the SAME exchange the

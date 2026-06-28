@@ -70,3 +70,55 @@ def test_daemon_running_but_process_dead_is_red(forven_db, monkeypatch):
     monkeypatch.setattr(rh, "normalize_daemon_state",
                         lambda **k: {"running": True, "process_alive": False, "age_seconds": 1200.0})
     assert check_daemon_liveness().state == State.RED
+
+
+# ─── RESTART-1: kernel replay window is not truncated by a short candle cache ────
+
+def _ohlcv(n):
+    import pandas as pd
+    idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}, index=idx
+    )
+
+
+def test_fetch_candles_refetches_when_cache_shorter_than_request(monkeypatch):
+    """A 360-row cache must NOT satisfy a 1500-bar kernel request by returning the
+    short tail (which truncates the replay and strands a long-held position)."""
+    import forven.scanner as sc
+
+    monkeypatch.setattr("forven.sim.clock.is_sim_active", lambda: False)
+    monkeypatch.setattr(sc, "load_candle_snapshot", lambda coin, interval="1h": (_ohlcv(360), 0))
+    monkeypatch.setattr(sc, "ohlcv_rows_to_dataframe", lambda rows: rows)
+    monkeypatch.setattr(sc, "_scanner_bool_setting", lambda k, d=True: True)
+    fetched = {"called": False}
+
+    def _fmc(coin, bars, interval, clean):
+        fetched["called"] = True
+        assert bars >= 1500  # fetches the FULL requested window
+        return _ohlcv(1500)
+
+    monkeypatch.setattr(sc, "fetch_market_candles", _fmc)
+    monkeypatch.setattr(sc, "publish_candle_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(sc, "dataframe_to_ohlcv_rows", lambda df, max_rows=None: df)
+
+    out = sc.fetch_candles("BTC", bars=1500, interval="1h")
+    assert fetched["called"] is True
+    assert len(out) == 1500
+
+
+def test_fetch_candles_serves_cache_when_it_covers_request(monkeypatch):
+    """When the cache already covers the request, serve it (no needless direct fetch)."""
+    import forven.scanner as sc
+
+    monkeypatch.setattr("forven.sim.clock.is_sim_active", lambda: False)
+    monkeypatch.setattr(sc, "load_candle_snapshot", lambda coin, interval="1h": (_ohlcv(1500), 0))
+    monkeypatch.setattr(sc, "ohlcv_rows_to_dataframe", lambda rows: rows)
+    monkeypatch.setattr(sc, "_scanner_bool_setting", lambda k, d=True: True)
+
+    def _fmc(*a, **k):
+        raise AssertionError("must not direct-fetch when the cache covers the request")
+
+    monkeypatch.setattr(sc, "fetch_market_candles", _fmc)
+    out = sc.fetch_candles("BTC", bars=1500, interval="1h")
+    assert len(out) == 1500
