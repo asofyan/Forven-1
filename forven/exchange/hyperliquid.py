@@ -438,6 +438,41 @@ def _assert_execution_allowed(testnet: bool) -> None:
     )
 
 
+def _assert_withdrawal_safe_wallet_for_mainnet(
+    testnet: bool, main_wallet: str, agent_wallet: str
+) -> None:
+    """Live MAINNET trading must use a Hyperliquid API/agent wallet, not a master key.
+
+    An API/agent wallet (created via ``approveAgent``) is protocol-barred from
+    withdrawals and transfers, so even a full host compromise that exfiltrates the
+    configured signing key is limited to *trading* — it cannot move funds off the
+    exchange. A master-account private key, by contrast, can sign ``withdraw3`` /
+    ``usdSend`` and drain the account. We therefore refuse to place REAL-money
+    orders with a master key unless the operator explicitly accepts that exposure
+    via ``FORVEN_HL_ALLOW_MASTER_KEY=1``. Paper/testnet is unaffected — no real
+    funds, no withdrawal risk. ``main_wallet`` != ``agent_wallet`` (a distinct,
+    on-chain-approved agent; approval itself is verified by
+    ``_ensure_agent_authorized_for_trading``) is the agent-wallet signature.
+    """
+    if testnet:
+        return
+    if _is_agent_trading_on_behalf(main_wallet, agent_wallet):
+        return  # distinct approved agent wallet — withdrawal-incapable by protocol
+    if _is_truthy(os.environ.get("FORVEN_HL_ALLOW_MASTER_KEY")):
+        log.warning(
+            "HyperLiquid live trading with a MASTER-account key (withdrawal-capable): "
+            "FORVEN_HL_ALLOW_MASTER_KEY override is set. A host compromise could move "
+            "funds off the exchange with this key — prefer a separate API/agent wallet."
+        )
+        return
+    raise RuntimeError(
+        "Refusing live mainnet trading with a master-account private key. Hyperliquid "
+        "API/agent wallets cannot withdraw or transfer, so the safe setup is a separate "
+        "API wallet (approveAgent) plus your main wallet address in Settings. To trade "
+        "with a withdrawal-capable master key anyway, set FORVEN_HL_ALLOW_MASTER_KEY=1."
+    )
+
+
 def _hl_encryption_disabled() -> bool:
     env_value = os.environ.get("FORVEN_HL_DISABLE_ENCRYPTION")
     if env_value is not None and str(env_value).strip():
@@ -1009,6 +1044,8 @@ def _exchange_for_trading(
     _ensure_agent_authorized_for_trading(
         exchange, info, auth_wallet, str(getattr(exchange, "base_url", ""))
     )
+    _agent_wallet = str(getattr(getattr(exchange, "wallet", None), "address", "") or "").strip()
+    _assert_withdrawal_safe_wallet_for_mainnet(testnet, auth_wallet, _agent_wallet)
     return exchange, info, address
 
 

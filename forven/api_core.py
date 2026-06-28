@@ -2382,6 +2382,13 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
         if private_key_payload_key:
             private_key = str(payload.get(private_key_payload_key) or "").strip()
             if private_key:
+                # Normalize to a 0x-prefixed key at the storage boundary so every
+                # later read is 0x-anchored and the log redactor (which matches
+                # 0x + 64 hex) always catches the funds-controlling key if it ever
+                # leaks. A bare 64-hex key would slip past the redactor (audit P1.5).
+                private_key = private_key.strip("'\"").strip()
+                if private_key and not private_key.lower().startswith("0x"):
+                    private_key = "0x" + private_key
                 secrets["hyperliquid_private_key"] = private_key
                 # Only auto-derive if the payload and existing settings do not already pin an API address.
                 if not api_address_payload_key and not str(updates.get("hyperliquid_api_address") or "").strip():
@@ -2596,10 +2603,15 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
         if "discord_bot_token" in payload:
             bot_token = str(payload.get("discord_bot_token") or "").strip()
             if bot_token:
-                # Save main bot token to config.json (used by get_bot_token())
+                # Save main bot token to config.json (used by get_bot_token()),
+                # ENCRYPTED at rest like every other secret — never plaintext. The
+                # Discord webhook two blocks below already routes through the
+                # encrypted secrets store; the bot token must not be the lone
+                # cleartext credential on disk (audit P1.5).
                 from forven.config import load_config, save_config
+                from forven.secret_storage import encrypt_secret
                 cfg = load_config()
-                cfg["discord_token"] = bot_token
+                cfg["discord_token"] = encrypt_secret(bot_token)
                 save_config(cfg)
         if "discord_webhook_url" in payload:
             webhook_url = str(payload.get("discord_webhook_url") or "").strip()

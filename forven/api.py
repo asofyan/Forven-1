@@ -16,9 +16,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from forven.api_core import ForvenV1CompatMiddleware, _on_startup
 from forven.api_security import (
     ApiKeyMiddleware,
+    CsrfOriginMiddleware,
     assert_auth_keys_configured,
     assert_safe_bind_host,
     get_allowed_cors_origins,
+    is_cross_site_state_change,
 )
 from forven.async_utils import spawn
 from forven.correlation import CorrelationIdMiddleware, RequestIdLogFilter
@@ -583,6 +585,11 @@ app = FastAPI(
 
 app.add_middleware(ForvenV1CompatMiddleware)
 app.add_middleware(ApiKeyMiddleware)
+# Drive-by CSRF guard: reject cross-site state-changing requests. The local API
+# is reachable from a browser at 127.0.0.1, so a page the operator visits could
+# POST to it; CORS only hides the response, it does not stop the side effect.
+# Same-origin and CORS-allowlisted origins pass; no-Origin (launcher/CLI) passes.
+app.add_middleware(CsrfOriginMiddleware)
 # DNS rebinding guard. Even though uvicorn is bound to 127.0.0.1, a browser
 # page on the tester's machine that resolves attacker-controlled.com to
 # 127.0.0.1 can still reach us — the browser just dials the loopback socket
@@ -675,6 +682,13 @@ async def shutdown(request: Request):
     client_host = request.client.host if request.client else ""
     if client_host not in ("127.0.0.1", "::1"):
         raise HTTPException(status_code=403, detail="localhost only")
+    # The loopback check alone is NOT enough: a malicious page the operator visits
+    # POSTs here from the browser's own loopback socket, so client_host is 127.0.0.1
+    # too. Reject anything carrying a cross-site browser Origin/Referer (the local
+    # launcher/controller sends neither). The global CsrfOriginMiddleware also blocks
+    # this; this is a local backstop on the highest-value drive-by target.
+    if is_cross_site_state_change(request):
+        raise HTTPException(status_code=403, detail="cross-origin shutdown rejected")
 
     async def _exit_soon():
         await asyncio.sleep(0.25)
