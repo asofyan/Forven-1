@@ -3403,6 +3403,18 @@ def _execute_direct(
             if result.get("error"):
                 raise RuntimeError(result.get("error"))
             fill, exchange_order_id, order_meta = _extract_order_meta(result)
+            # LIVE-6: a missing avgPx means the fill price is UNKNOWN — an IOC that didn't
+            # fill, or a filled response that omitted avgPx. Do NOT record the aggressive
+            # 2% limit as the real entry (it mis-prices PnL/stop distance) or book an
+            # unfilled IOC as a full position. Treat the fill as unknown and mark
+            # pending_open_reconcile so the periodic reconcile verifies the real position +
+            # avgPx (confirming the true fill) or cleans up a genuine no-fill. The entry
+            # order id (if any) is still recorded below so the reconcile can match it.
+            if result.get("fill_price_unknown") and not is_sim_active():
+                order_meta["pending_open_reconcile"] = True
+                order_meta["pending_open_reconcile_at"] = get_now().isoformat()
+                order_meta["open_fill_unconfirmed_price"] = fill
+                fill = None
             if stop_loss is not None:
                 order_meta["exchange_stop_price"] = float(stop_loss)
             order_meta["exchange_stop_requested"] = stop_loss is not None
@@ -6255,8 +6267,16 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     cross_asset_open_rows: list[dict] = []
     for _rec in _recorded:
         _rec_asset = str((_rec.get("_row") or {}).get("asset") or "").strip().upper()
-        if _rec.get("status") == "open" and _rec_asset and _strat_asset_u and _rec_asset != _strat_asset_u:
+        _cross_asset = bool(_rec_asset and _strat_asset_u and _rec_asset != _strat_asset_u)
+        if _cross_asset and _rec.get("status") == "open":
             cross_asset_open_rows.append(_rec["_row"])
+        elif _cross_asset:
+            # RECON-1: a cross-asset CLOSED row (leftover from a symbol/asset flip) must
+            # NOT enter the reconciler snapshot. Both assets share the candle grid, so its
+            # (direction, bar-timestamp) can collide with the CURRENT asset's kernel open/
+            # close and either suppress a real entry or mis-bind a close. It's already
+            # closed — just drop it from this asset's reconcile view.
+            continue
         else:
             same_asset_recorded.append(_rec)
     actions_plan = reconcile(

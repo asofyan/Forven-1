@@ -1476,6 +1476,12 @@ def market_order(
             "%s %s entry filled but protective leg(s) %s were rejected (%s) — caller must arm them",
             asset, side, protective_leg_failed, payload["protective_leg_error"],
         )
+    # LIVE-6: signal when the entry price is the FALLBACK aggressive limit (no avgPx
+    # in the response) so the caller doesn't record a non-real fill — either an IOC
+    # that didn't fill, or a filled response that omitted avgPx. entry_price stays as
+    # the limit for display, but flagged unconfirmed.
+    if actual_fill is None:
+        payload["fill_price_unknown"] = True
     return payload
 
 

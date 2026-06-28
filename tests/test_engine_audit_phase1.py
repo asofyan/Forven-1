@@ -89,6 +89,23 @@ def test_market_order_keeps_fill_when_stop_leg_rejected(monkeypatch):
     assert "stop_order_id" not in res
 
 
+def test_market_order_flags_unknown_fill_when_avgpx_missing(monkeypatch):
+    """LIVE-6: an entry with an oid but NO avgPx (IOC didn't fill / response omitted it)
+    is flagged fill_price_unknown so the caller won't record the aggressive limit as a
+    real fill."""
+    pytest.importorskip("hyperliquid")
+    import forven.exchange.hyperliquid as hl
+
+    class _Ex:
+        def bulk_orders(self, orders):
+            return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": "E1"}}]}}}
+
+    _patch_hl(monkeypatch, hl, _Ex())
+    res = hl.market_order("BTC", "buy", 1.0)
+    assert res.get("fill_price_unknown") is True
+    assert res.get("entry_order_id") == "E1"  # the order id is still surfaced for reconcile
+
+
 def test_market_order_still_raises_when_entry_itself_missing(monkeypatch):
     pytest.importorskip("hyperliquid")
     import forven.exchange.hyperliquid as hl

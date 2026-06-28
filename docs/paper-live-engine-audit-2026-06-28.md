@@ -61,6 +61,11 @@ Convention decision refined (operator, 2026-06-28): the literal "every close wri
 
 **Milestone:** both CRITICALs + every HIGH-severity finding across Phases 1–3 are now fixed and tested (19/19 highs + PNL-1's gate impact). Remaining work is MEDIUM/LOW robustness + cleanup + the population re-baseline.
 
+### MEDIUM-severity fixes (in progress)
+- **RECON-1** ✅ — cross-asset CLOSED rows are now excluded from the reconciler snapshot (not just cross-asset OPEN rows), so a leftover symbol-flip close can't collide on the shared bar grid with the current asset's kernel open/close and suppress/mis-bind it. `scanner.py`.
+- **LIVE-6** ✅ — a live entry with no `avgPx` (IOC didn't fill, or the response omitted it) is no longer recorded at the aggressive 2% limit or booked as a full fill: `market_order` flags `fill_price_unknown` and `_execute_direct` marks the trade `pending_open_reconcile` so the reconcile verifies the real position + avgPx (or cleans up a no-fill). `hyperliquid.py` + `scanner.py`. Tests in `tests/test_engine_audit_phase1.py` + `phase3.py`.
+- **FLIP-1** (refuted critical) — re-examined: the live funding fold (`net -= cumFunding.sinceOpen/margin`, "positive = cost") is internally self-consistent and both verifiers refuted the inversion; NOT flipped speculatively (a wrong flip would introduce the bug). **Operator verification:** compare one real testnet trade's recorded funding component against the HL UI.
+
 ### Phase 4 — pending
 Parity/cleanup (KERNEL/KCOPY/RECON edges, DATA-1/3/6 timeframe coverage, the many lows) + the population re-baseline. Per-finding detail below.
 
