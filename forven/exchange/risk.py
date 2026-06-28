@@ -2020,6 +2020,45 @@ def reconcile_exchange_positions(
                         continue
                     ghost_trades.append(trade)
 
+        # LIVE-EXCHANGE-RECONCILE-6: a user_state read can SUCCEED at the HTTP level yet
+        # return an empty/partial assetPositions (valid JSON, no exception). That makes
+        # every tracked live position look absent and would mass-ghost-close real
+        # positions — fabricated PnL, stripped protective stops, abandoned positions.
+        # Require N CONSECUTIVE empty-while-holding reads before mass-ghost-closing: a
+        # single glitch is skipped (retry), while a genuine simultaneous flatten (sustained
+        # empty) still reconciles. The streak persists in KV per routed account.
+        _real_ghosts = [t for t in ghost_trades if not is_local_only_paper_trade(t)]
+        _empty_streak_key = f"reconcile_empty_read_streak:{scope_address or 'master'}"
+        if _real_ghosts and not normalized_positions:
+            try:
+                _empty_streak = int(kv_get(_empty_streak_key, 0) or 0) + 1
+            except Exception:
+                _empty_streak = 1
+            try:
+                _empty_confirm = max(int((_load_risk_settings() or {}).get("reconcile_empty_read_confirm_count", 2) or 2), 1)
+            except Exception:
+                _empty_confirm = 2
+            if _empty_streak < _empty_confirm:
+                kv_set_best_effort(_empty_streak_key, _empty_streak, timeout_seconds=_RISK_WRITE_TIMEOUT_SECONDS)
+                log.error(
+                    "Reconcile: exchange returned ZERO positions while %d open live trade(s) are "
+                    "tracked on this account — SUSPICIOUS empty read (%d/%d). Skipping ghost-close "
+                    "to avoid fabricated closes / stripped stops; will retry next pass.",
+                    len(_real_ghosts), _empty_streak, _empty_confirm,
+                )
+                return {
+                    "error": "exchange returned no positions while open trades exist (suspicious empty read)",
+                    "error_kind": "fetch_unavailable",
+                    "suspicious_empty_read_streak": _empty_streak,
+                }
+            log.warning(
+                "Reconcile: %d consecutive empty reads (>= %d) while holding %d open trade(s) — "
+                "treating as a genuine flatten and proceeding with ghost reconciliation.",
+                _empty_streak, _empty_confirm, len(_real_ghosts),
+            )
+        # Non-suspicious read (positions present, or confirmed flatten): reset the streak.
+        kv_set_best_effort(_empty_streak_key, 0, timeout_seconds=_RISK_WRITE_TIMEOUT_SECONDS)
+
         for asset, position in hl_by_asset.items():
             if asset in db_by_asset:
                 local_trades = db_by_asset.get(asset, [])

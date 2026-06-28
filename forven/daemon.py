@@ -264,6 +264,58 @@ def _set_recovery_state(state: dict, **updates) -> dict[str, object]:
     return payload
 
 
+def mark_boot_recovery_pending() -> None:
+    """BOOT-1: force the startup-recovery gate CLOSED at process start, BEFORE the
+    scheduler/scanner thread can run a live execution scan.
+
+    A cleanly-exited prior run persists recovery_active=False; without this stamp the
+    scanner (a separate thread that starts with the same delay) could open a live
+    position in the boot window BEFORE the daemon's boot reconcile re-verifies the
+    exchange. The daemon's reconcile clears/re-sets it on the real outcome; a
+    daemon-spawn failure clears it via clear_boot_recovery_pending. Best-effort.
+    """
+    try:
+        raw = kv_get("daemon_state", {}) or {}
+        state = dict(raw) if isinstance(raw, dict) else {}
+        # Leave an already-active genuine operator block (blocked/error) intact.
+        if bool(state.get("recovery_active")) and str(state.get("recovery_status") or "").strip().lower() in {"blocked", "error"}:
+            return
+        _set_recovery_state(
+            state,
+            recovery_active=True,
+            recovery_status="checking",
+            recovery_started_at=_iso_now(),
+            recovery_summary="Startup exchange reconcile pending — new entries blocked until the boot reconcile verifies the exchange.",
+        )
+        kv_set_best_effort("daemon_state", state)
+        log.info("BOOT-1: stamped startup-recovery gate (checking) before runtime threads start.")
+    except Exception as exc:
+        log.warning("Could not stamp boot recovery gate: %s", exc)
+
+
+def clear_boot_recovery_pending(reason: str = "daemon_unavailable") -> None:
+    """Release the BOOT-1 startup-recovery gate when the daemon will NOT run in this
+    process (its boot reconcile would otherwise never clear the 'checking' stamp,
+    wedging paper trading). Only clears a 'checking' stamp — never an operator
+    'blocked'/'error' state."""
+    try:
+        raw = kv_get("daemon_state", {}) or {}
+        state = dict(raw) if isinstance(raw, dict) else {}
+        if str(state.get("recovery_status") or "").strip().lower() != "checking":
+            return
+        _set_recovery_state(
+            state,
+            recovery_active=False,
+            recovery_status=str(reason or "daemon_unavailable"),
+            recovery_last_checked_at=_iso_now(),
+            recovery_summary="Startup recovery gate released (daemon not running this process).",
+        )
+        kv_set_best_effort("daemon_state", state)
+        log.info("BOOT-1: released startup-recovery gate (%s).", reason)
+    except Exception as exc:
+        log.warning("Could not clear boot recovery gate: %s", exc)
+
+
 def publish_recovery_operator_state(state: dict, *, action_key: str = "exchange_recovery") -> dict[str, object]:
     recovery = _default_recovery_state()
     for key in recovery:

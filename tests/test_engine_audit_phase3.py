@@ -122,3 +122,69 @@ def test_fetch_candles_serves_cache_when_it_covers_request(monkeypatch):
     monkeypatch.setattr(sc, "fetch_market_candles", _fmc)
     out = sc.fetch_candles("BTC", bars=1500, interval="1h")
     assert len(out) == 1500
+
+
+# ─── RECONCILE-6: a glitchy empty exchange read must not mass-ghost-close ────────
+
+def test_reconcile_skips_mass_ghost_close_on_suspicious_empty_read(forven_db, monkeypatch):
+    """A successful-but-EMPTY positions read while holding open live trades must NOT
+    ghost-close them on the first read (fabricated PnL / stripped stops); it bails
+    with fetch_unavailable and retries."""
+    import forven.exchange.risk as risk
+    from forven.db import get_db
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO trades (id, strategy_id, strategy, asset, direction, size, entry_price, "
+            "status, execution_type) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("LR1", "s-live", "s-live", "BTC", "long", 1.0, 100.0, "OPEN", "live"),
+        )
+
+    # Successful HTTP read that returns NO positions (the glitch), and a high confirm
+    # count so a single read can never mass-close (keeps the test off the network path).
+    monkeypatch.setattr(risk, "_snapshot_exchange_state",
+                        lambda **k: {"positions": [], "open_orders": [], "price_map": {}})
+    monkeypatch.setattr(risk, "_load_risk_settings", lambda: {"reconcile_empty_read_confirm_count": 5})
+
+    result = risk.reconcile_exchange_positions(testnet=True)
+    assert result.get("error_kind") == "fetch_unavailable"
+    assert "suspicious" in str(result.get("error", "")).lower()
+
+    with get_db() as conn:
+        row = dict(conn.execute("SELECT status FROM trades WHERE id='LR1'").fetchone())
+    assert row["status"] == "OPEN"  # the real position was NOT ghost-closed
+
+
+# ─── BOOT-1: startup-recovery gate is closed before the scanner can run ──────────
+
+def test_boot_recovery_gate_blocks_until_cleared(forven_db):
+    """A cleanly-exited prior run leaves recovery_active=False; the boot stamp must
+    close the gate so a live entry can't slip through before the daemon re-verifies."""
+    from forven.daemon import mark_boot_recovery_pending, clear_boot_recovery_pending
+    from forven.exchange.risk import is_trading_allowed
+    from forven.db import kv_get
+
+    mark_boot_recovery_pending()
+    ds = kv_get("daemon_state", {})
+    assert ds.get("recovery_active") is True
+    assert ds.get("recovery_status") == "checking"
+    allowed, reason = is_trading_allowed()
+    assert allowed is False
+    assert "recovery" in reason.lower()
+
+    # Daemon-spawn-failure path releases the gate (so paper isn't wedged).
+    clear_boot_recovery_pending("daemon_unavailable")
+    assert kv_get("daemon_state", {}).get("recovery_active") is False
+    allowed2, _ = is_trading_allowed()
+    assert allowed2 is True
+
+
+def test_boot_recovery_stamp_preserves_operator_block(forven_db):
+    """The boot stamp must NOT downgrade a genuine operator 'blocked'/'error' state."""
+    from forven.daemon import mark_boot_recovery_pending
+    from forven.db import kv_get, kv_set
+
+    kv_set("daemon_state", {"recovery_active": True, "recovery_status": "blocked",
+                            "recovery_summary": "operator block"})
+    mark_boot_recovery_pending()
+    assert kv_get("daemon_state", {}).get("recovery_status") == "blocked"

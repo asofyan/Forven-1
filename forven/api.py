@@ -430,6 +430,15 @@ async def lifespan(_app: FastAPI):
             brain_limit = _env_int("FORVEN_HEADLESS_BRAIN_LIMIT", 2, minimum=1, maximum=8)
             runtime_thread_mode = _env_bool("FORVEN_API_RUNTIME_THREAD_MODE", True)
             runtime_start_delay = _env_float("FORVEN_API_RUNTIME_START_DELAY_SECONDS", 5.0, minimum=0.0, maximum=60.0)
+            # BOOT-1: close the startup-recovery gate BEFORE the scheduler/scanner thread
+            # can run a live execution scan, so a stale recovery_active=False persisted by
+            # a cleanly-exited prior run can't let a live entry through during the boot
+            # window before the daemon's boot reconcile re-verifies the exchange.
+            try:
+                from forven.daemon import mark_boot_recovery_pending
+                mark_boot_recovery_pending()
+            except Exception:
+                log.warning("Could not stamp boot recovery gate", exc_info=True)
             if runtime_thread_mode:
                 _runtime_threads.extend(
                     [
@@ -492,6 +501,14 @@ async def lifespan(_app: FastAPI):
                 )
             except Exception:
                 log.exception("Failed to start in-process daemon loop.")
+                # BOOT-1: no daemon will run its boot reconcile in this process, so
+                # release the startup-recovery gate we stamped above (else paper trading
+                # is wedged forever). Live still fails closed on missing real equity.
+                try:
+                    from forven.daemon import clear_boot_recovery_pending
+                    clear_boot_recovery_pending("daemon_unavailable")
+                except Exception:
+                    log.warning("Could not release boot recovery gate after daemon-start failure", exc_info=True)
                 log.info(
                     "API runtime worker started: scheduler + headless agent loop "
                     "(concurrency=%d) + headless brain loop (limit=%d) (daemon unavailable, thread_mode=%s, start_delay=%.1fs)",
