@@ -67,10 +67,25 @@ def test_daemon_alive_and_ticking_is_green(forven_db, monkeypatch):
 
 
 def test_daemon_running_but_process_dead_is_red(forven_db, monkeypatch):
+    # Dead pid AND a STALE tick (1200s > 600s default) => a genuine death -> RED.
     import forven.runtime_health as rh
     monkeypatch.setattr(rh, "normalize_daemon_state",
                         lambda **k: {"running": True, "process_alive": False, "age_seconds": 1200.0})
     assert check_daemon_liveness().state == State.RED
+
+
+def test_daemon_process_dead_but_tick_fresh_is_amber_not_red(forven_db, monkeypatch):
+    # The per-restart false-positive: during a daemon changeover the OLD pid is dead
+    # but the last tick is still fresh (~28s). That is a restart in progress, NOT a
+    # death (a real death's tick goes minutes stale), so it must be AMBER/transient —
+    # never the CRITICAL "process not alive" that fired on every restart and
+    # self-recovered ~30s later.
+    import forven.runtime_health as rh
+    monkeypatch.setattr(rh, "normalize_daemon_state",
+                        lambda **k: {"running": True, "process_alive": False, "age_seconds": 28.0})
+    status = check_daemon_liveness()
+    assert status.state == State.AMBER
+    assert "not alive" not in status.message
 
 
 # ─── RESTART-1: kernel replay window is not truncated by a short candle cache ────

@@ -541,16 +541,30 @@ def check_daemon_liveness() -> ComponentStatus:
                 name="daemon", state=State.GREEN, last_seen=last_seen,
                 message="Daemon running (no tick telemetry yet)",
             )
-        if process_alive is False:
-            return ComponentStatus(
-                name="daemon", state=State.RED, last_seen=last_seen,
-                message=f"Daemon process not alive (last tick {int(age)}s ago)",
-            )
         try:
             from forven.db import kv_get
             max_stale = float((kv_get("forven:settings", {}) or {}).get("daemon_tick_max_stale_seconds", 600) or 600)
         except Exception:
             max_stale = 600.0
+        if process_alive is False:
+            # A dead stored PID with a FRESH tick is a restart/changeover in progress
+            # (the new process has not re-stamped its PID yet), NOT a death — a
+            # genuinely dead daemon's tick goes minutes stale. Only escalate to RED
+            # when the tick is ALSO stale (mirrors normalize_daemon_state's
+            # stale_process condition); otherwise treat it as a transient changeover
+            # (AMBER) and let the next poll confirm recovery. Without this gate, every
+            # daemon restart fired a CRITICAL false-positive ("Daemon process not
+            # alive (last tick ~30s ago)") that self-recovered ~30s later — crying
+            # wolf and eroding trust in the real frozen-daemon signal.
+            if age <= max_stale:
+                return ComponentStatus(
+                    name="daemon", state=State.AMBER, last_seen=last_seen,
+                    message=f"Daemon process changing over (tick {int(age)}s ago)",
+                )
+            return ComponentStatus(
+                name="daemon", state=State.RED, last_seen=last_seen,
+                message=f"Daemon process not alive (last tick {int(age)}s ago)",
+            )
         if age > max_stale:
             return ComponentStatus(
                 name="daemon", state=State.RED, last_seen=last_seen,
