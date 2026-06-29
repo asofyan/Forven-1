@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount, onDestroy } from 'svelte';
 	import PaperTrades from '$lib/components/trading/PaperTrades.svelte';
 	import PaperSessionSummary from '$lib/components/dashboard/PaperSessionSummary.svelte';
 	import type { ForvenDashboardResponse } from '$lib/api';
@@ -9,6 +10,24 @@
 	// strategies via include_deployed so the manual controls can drive REAL positions.
 	type SessionView = 'paper' | 'live' | 'all';
 	let view: SessionView = 'paper';
+
+	// The position alert (paper-only) can fire while we're on the 'live' view, where
+	// paper sessions aren't loaded. Drop back to 'paper' so the remounted PaperTrades
+	// reads the stored session id on mount and selects it. 'paper'/'all' already list
+	// the session, so PaperTrades handles those in place without a view change.
+	function handleSelectSessionRequest() {
+		if (view === 'live') view = 'paper';
+	}
+
+	onMount(() => {
+		window.addEventListener('forven:select-session', handleSelectSessionRequest);
+	});
+
+	onDestroy(() => {
+		if (typeof window !== 'undefined') {
+			window.removeEventListener('forven:select-session', handleSelectSessionRequest);
+		}
+	});
 	const VIEWS: { id: SessionView; label: string; hint: string }[] = [
 		{ id: 'paper', label: 'Paper', hint: 'Paper-stage sessions only (fast).' },
 		{ id: 'live', label: 'Live', hint: 'Deployed / graduated strategies — REAL orders.' },

@@ -239,6 +239,7 @@
 	let selectedSessionRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	let livePriceUnsubscribe: (() => void) | null = null;
 	let forvenEventUnsubscribe: (() => void) | null = null;
+	let selectSessionUnsubscribe: (() => void) | null = null;
 	let latestLivePrices: Record<string, number> = {};
 	const compatSessionPrefix = 'compat:strategy:';
 
@@ -943,6 +944,10 @@
 			const eventHandler = () => handleForvenRealtimeEvent();
 			window.addEventListener('forven:event', eventHandler);
 			forvenEventUnsubscribe = () => window.removeEventListener('forven:event', eventHandler);
+
+			const selectHandler = (event: Event) => handleSelectSessionRequest(event);
+			window.addEventListener('forven:select-session', selectHandler);
+			selectSessionUnsubscribe = () => window.removeEventListener('forven:select-session', selectHandler);
 		}
 
 		const strategyParam = $page.url.searchParams.get('strategy');
@@ -1002,6 +1007,8 @@
 		livePriceUnsubscribe = null;
 		forvenEventUnsubscribe?.();
 		forvenEventUnsubscribe = null;
+		selectSessionUnsubscribe?.();
+		selectSessionUnsubscribe = null;
 		stopLiveChartPolling();
 		stopSelectedSessionSync();
 		if (typeof window !== 'undefined') {
@@ -1392,6 +1399,24 @@
 		startSelectedSessionSync();
 		applyLatestRealtimeSnapshot();
 		void loadSessionTrades(session.id);
+	}
+
+	async function handleSelectSessionRequest(event: Event) {
+		const detail = (event as CustomEvent<{ sessionId?: string }>).detail ?? {};
+		const sessionId = String(detail.sessionId ?? '').trim();
+		if (!sessionId) return;
+		// Already selected — nothing to switch, just make sure it's the visible panel.
+		if (selectedSession?.id === sessionId) {
+			showNewSession = false;
+			return;
+		}
+		let target = sessions.find((s) => s.id === sessionId);
+		if (!target) {
+			// Stale list (e.g. position opened since the last poll) — refresh once.
+			await loadSessions();
+			target = sessions.find((s) => s.id === sessionId);
+		}
+		if (target) selectSession(target);
 	}
 
 	function updateSession(updated: PaperTradingSession) {
