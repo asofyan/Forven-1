@@ -7368,6 +7368,7 @@ def sweep_pending_close_reconcile() -> dict:
     """
     from forven.db import get_db, log_activity, kv_set
     from forven.trade_state import (
+        _coerce_optional_float,
         _normalize_trade_direction,
         close_trade_record,
         is_local_only_paper_trade,
@@ -7472,11 +7473,25 @@ def sweep_pending_close_reconcile() -> dict:
             # Local-only paper trades never reached the exchange, so there is no
             # exchange truth to reconcile against. Paper closes are local by
             # design: close at the exit price recorded when the close was
-            # requested (mark_trade_pending_close_reconcile persists
-            # signal_exit_price; close_trade_record resolves it). If no price
-            # was recorded the close is marked incomplete — never fabricated.
+            # requested. Resolve it from the pending-close metadata so the close
+            # finalizes WITH a price (the recurring "unknown close" was this
+            # branch closing with no price while a usable one sat in signal_data).
+            # close_trade_record falls back to the row's signal_exit_price when
+            # this is None, and only marks the close incomplete when NO price
+            # exists anywhere — never fabricated.
+            sweep_exit_price = None
+            for _exit_key in (
+                "pending_close_requested_exit_price",
+                "pending_close_requested_execution_price",
+                "pending_close_mid_price",
+            ):
+                sweep_exit_price = _coerce_optional_float(signal_data.get(_exit_key))
+                if sweep_exit_price is not None:
+                    break
             close_trade_record(
                 trade_id,
+                signal_exit_price=sweep_exit_price,
+                exit_price=sweep_exit_price,
                 close_reason="reconcile_sweep_paper_local_close",
                 close_price_source="reconcile_sweep_paper_local",
                 only_if_open=True,

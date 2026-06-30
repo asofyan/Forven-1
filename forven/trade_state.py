@@ -110,12 +110,28 @@ def mark_trade_pending_close_reconcile(
             signal_data["pending_close_reason"] = str(close_reason)
         if close_price_source is not None:
             signal_data["pending_close_price_source"] = str(close_price_source)
-        if signal_exit_price is not None:
-            signal_data["pending_close_requested_exit_price"] = float(signal_exit_price)
+        normalized_signal_exit = _coerce_optional_float(signal_exit_price)
+        if normalized_signal_exit is None:
+            # No explicit exit price was supplied (e.g. an exchange close that
+            # returned no immediate fill, only a requested/mid price). Derive a
+            # usable exit from the pending-close metadata so the eventual close
+            # finalizes WITH a price instead of an "unknown"/incomplete close —
+            # the reconcile-sweep bug where a real price sat in signal_data but
+            # was never used. Order: requested execution price → mid.
+            for _fallback_key in (
+                "pending_close_requested_execution_price",
+                "pending_close_mid_price",
+            ):
+                _fallback_exit = _coerce_optional_float(signal_data.get(_fallback_key))
+                if _fallback_exit is not None:
+                    normalized_signal_exit = _fallback_exit
+                    break
+
+        if normalized_signal_exit is not None:
+            signal_data["pending_close_requested_exit_price"] = float(normalized_signal_exit)
         else:
             signal_data.pop("pending_close_requested_exit_price", None)
 
-        normalized_signal_exit = _coerce_optional_float(signal_exit_price)
         persisted_signal_exit = (
             round(float(normalized_signal_exit), 8)
             if normalized_signal_exit is not None

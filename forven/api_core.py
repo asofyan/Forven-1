@@ -7578,7 +7578,8 @@ _PROTECTED_AGENT_IDS: frozenset[str] = frozenset(
         "quant-researcher",
         "simulation-agent",
         "risk-manager",
-        "execution-trader",
+        # execution-trader retired 2026-06-30 (deleted via deprecated_agents) —
+        # no longer a protected system agent.
         "full-stack-engineer",
         "strategy-developer",
     }

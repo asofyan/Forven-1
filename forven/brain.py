@@ -57,7 +57,10 @@ STAGE_TO_AGENT = {
     "research_only": "strategy-developer",
     "gauntlet": "simulation-agent",
     "paper": "risk-manager",
-    "live_graduated": "execution-trader",
+    # Live execution is automated by the scanner's parity kernel; the retired
+    # execution-trader agent no longer exists, so live oversight ownership falls
+    # to risk-manager (which already owns paper + live risk/allocation).
+    "live_graduated": "risk-manager",
     "archived": None,
     "rejected": None,
 }
@@ -519,7 +522,11 @@ def _normalize_strategy_owner(value: str | None) -> str | None:
         return "brain"
     if normalized == "backtest-engineer":
         return "simulation-agent"
-    if normalized in {"quant-researcher", "strategy-developer", "simulation-agent", "risk-manager", "execution-trader", "ceo", "brain"}:
+    # execution-trader is retired; carry its historical ownerships forward to
+    # risk-manager (which now owns live oversight).
+    if normalized == "execution-trader":
+        return "risk-manager"
+    if normalized in {"quant-researcher", "strategy-developer", "simulation-agent", "risk-manager", "ceo", "brain"}:
         return normalized
     return None
 

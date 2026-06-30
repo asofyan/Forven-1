@@ -129,7 +129,7 @@ VALID_CONTEXTS: tuple[str, ...] = ("scheduled", "interactive", "recovery", "rese
 _CANONICAL_AGENT_ROLES = frozenset(
     {
         "brain",
-        "execution-trader",
+        # execution-trader retired 2026-06-30 (no LLM execution path).
         "full-stack-engineer",
         "quant-researcher",
         "risk-manager",
@@ -151,7 +151,6 @@ def _role_tokens_from_text(value: object) -> set[str]:
 
     alias_checks = {
         "brain": ("brain", "orchestrator"),
-        "execution-trader": ("execution trader", "execution-trader"),
         "full-stack-engineer": ("full stack engineer", "full-stack-engineer"),
         "quant-researcher": ("quant researcher", "quant-researcher"),
         "risk-manager": ("risk manager", "risk-manager"),

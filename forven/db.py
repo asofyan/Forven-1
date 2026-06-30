@@ -2690,7 +2690,7 @@ def _run_migrations(conn: sqlite3.Connection):
     # CEO manual review lane removed: promote legacy CEO-owned strategies directly to deployment.
     conn.execute(
         "UPDATE strategies "
-        "SET stage = 'live_graduated', status = 'live_graduated', owner = 'execution-trader', stage_changed_at = ?, updated_at = ? "
+        "SET stage = 'live_graduated', status = 'live_graduated', owner = 'risk-manager', stage_changed_at = ?, updated_at = ? "
         "WHERE LOWER(TRIM(COALESCE(owner, ''))) = 'ceo' "
         "OR LOWER(TRIM(COALESCE(stage, status, ''))) IN ('ceo_review', 'ceoreview', 'ceo-review', 'review')",
         (now_iso, now_iso),
@@ -4677,7 +4677,8 @@ def create_strategy_container(
         "research_only": "strategy-developer",
         "gauntlet": "simulation-agent",
         "paper": "risk-manager",
-        "live_graduated": "execution-trader",
+        # execution-trader retired — live oversight owned by risk-manager.
+        "live_graduated": "risk-manager",
         "archived": None,
         "rejected": None,
     }
@@ -4994,7 +4995,8 @@ _STAGE_TO_OWNER_FOR_LOCK = {
     "quick_screen": "simulation-agent",
     "gauntlet": "simulation-agent",
     "paper": "risk-manager",
-    "live_graduated": "execution-trader",
+    # execution-trader retired — live oversight owned by risk-manager.
+    "live_graduated": "risk-manager",
 }
 
 
@@ -5048,6 +5050,7 @@ def _claim_ownership_for_task(conn: sqlite3.Connection, agent_id: str, task: sql
                 input_data = {}
         strategy_id = _extract_strategy_id(input_data if isinstance(input_data, dict) else None)
 
+    # Deterministic scanner execution tasks (no LLM) bypass the ownership check.
     if normalized_agent == "execution-trader" and task_type == "execution":
         return strategy_id or "ok", None
 
