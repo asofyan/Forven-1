@@ -614,18 +614,26 @@ class _GuardVisitor(ast.NodeVisitor):
                         self._add(node, "Forbidden call: '.load(..., allow_pickle=...)' (pickle deserialization)")
                         break
             elif func.attr == "query":
-                # pandas DataFrame.query(engine='python') routes an attacker string
-                # through the python evaluator (attribute reads + method calls), a
-                # confirmed RCE gadget hidden in an opaque string the AST can't see.
-                # (.eval is already blocked as a FORBIDDEN_CALL_ATTR.)
-                for kw in node.keywords:
-                    if (
-                        kw.arg == "engine"
-                        and isinstance(kw.value, ast.Constant)
-                        and kw.value.value == "python"
-                    ):
-                        self._add(node, "Forbidden call: '.query(..., engine=\"python\")' (python-engine eval)")
-                        break
+                # pandas DataFrame.query routes an opaque attacker string through an
+                # evaluator. The 'python' engine allows attribute reads + method calls — a
+                # confirmed RCE gadget (df.query("close.__init__.__globals__[...]...")) — and
+                # when numexpr is not installed pandas SILENTLY DEFAULTS to the python
+                # engine, so an ABSENT or NON-CONSTANT engine is just as dangerous as an
+                # explicit engine="python". Allow ONLY a constant engine="numexpr" (numeric-
+                # only, no attribute access); reject every other form. (.eval is already a
+                # FORBIDDEN_CALL_ATTR.)
+                safe_numexpr = any(
+                    kw.arg == "engine"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "numexpr"
+                    for kw in node.keywords
+                )
+                if not safe_numexpr:
+                    self._add(
+                        node,
+                        "Forbidden call: '.query(...)' without a constant engine=\"numexpr\" "
+                        "(the python engine — used by default when numexpr is absent — evals attacker strings)",
+                    )
 
         # Bare getattr/setattr/delattr with a NON-constant attribute key is the
         # dynamic-attribute escape primitive (e.g. getattr(b, 'ev'+'al')). The

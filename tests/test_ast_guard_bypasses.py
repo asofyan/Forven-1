@@ -106,6 +106,14 @@ BYPASS_PAYLOADS = {
         "import pandas as pd\n"
         "def g(df):\n    return df.query('a.__class__', engine='python')\n"
     ),
+    # .query python-engine evasions: an ABSENT engine (pandas defaults to python when
+    # numexpr is unavailable) and a NON-CONSTANT engine both reach the python evaluator.
+    "pandas_query_absent_engine": (
+        "def g(df):\n    return df.query('close.__init__.__globals__')\n"
+    ),
+    "pandas_query_computed_engine": (
+        "def g(df):\n    e = 'pyth' + 'on'\n    return df.query('a.__class__', engine=e)\n"
+    ),
     # CRIT-6: write-serializer file-write primitives (-> overwrite __init__.py).
     "ndarray_tofile_self": "import numpy as np\nnp.frombuffer(b'x', np.uint8).tofile(__file__)\n",
     "df_to_csv": "def g(df):\n    df.to_csv('x.csv')\n",
@@ -164,6 +172,9 @@ LEGIT_PAYLOADS = {
     "forven_indicator_facade_ok": "from forven.strategies.indicators import atr, rsi, adx\n",
     # 2026-06-29 hardening must NOT regress these real corpus idioms.
     "ohlcv_subscript_open": "def g(df):\n    return df['open'] + df['close'] - df['low']\n",
+    # .query with an explicit constant engine="numexpr" is numeric-only (no attribute
+    # access) and stays allowed — only the python engine is the RCE gadget.
+    "pandas_query_numexpr_ok": "def g(df):\n    return df.query('close > 100', engine='numexpr')\n",
     "dataclass_params_dict": (
         "from dataclasses import dataclass\n"
         "@dataclass\n"
