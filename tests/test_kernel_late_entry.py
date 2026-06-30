@@ -412,3 +412,27 @@ def test_late_hopin_exit_at_or_before_entry_closes_clamped_not_stranded(forven_d
     assert r["status"] == "CLOSED"
     # closed_at is clamped to opened_at (12:00), never the backwards exit_time (11:00).
     assert sc._parse_iso_ts(r["closed_at"]) >= sc._parse_iso_ts(r["opened_at"])
+
+
+# ── FILL-NOW MARK: fill at the candle feed (latest 1m close), never the lagging snapshot ─────
+# The live-price snapshot's updated_at is its PUBLISH time (market_cache.publish_price_snapshot),
+# so a stale price VALUE still passes the 120s age gate — the ~6-min lag that filled a short ~$80
+# ABOVE the candle it opened on. _fill_now_mark uses the latest 1m candle close (what the chart
+# shows), ignoring the snapshot entirely.
+
+def _m1(closes, lows, highs):
+    idx = pd.date_range("2026-06-30 16:59", periods=len(closes), freq="1min", tz="UTC")
+    return pd.DataFrame({"open": closes, "high": highs, "low": lows, "close": closes}, index=idx)
+
+
+def test_fill_now_mark_uses_latest_1m_close_not_snapshot(monkeypatch):
+    m1 = _m1([58497.0, 58474.0], [58466.0, 58450.0], [58506.0, 58478.0])
+    monkeypatch.setattr(sc, "fetch_candles", lambda a, bars=2, interval="1m": m1)
+    # a stale-but-timestamp-fresh snapshot ($80 above the candle) must be IGNORED
+    monkeypatch.setattr(sc, "_load_live_price_cache", lambda: ({"BTC": 58553.99}, 3.0))
+    assert sc._fill_now_mark("BTC", last_close=58497.65) == 58474.0  # the latest 1m close
+
+
+def test_fill_now_mark_falls_back_to_last_close_without_1m(monkeypatch):
+    monkeypatch.setattr(sc, "fetch_candles", lambda a, bars=2, interval="1m": None)
+    assert sc._fill_now_mark("BTC", last_close=58497.65) == 58497.65

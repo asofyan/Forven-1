@@ -682,6 +682,29 @@ def _load_live_price_cache() -> tuple[dict[str, float], float | None]:
     return load_price_snapshot()
 
 
+def _fill_now_mark(asset: str, last_close: float) -> float:
+    """The price a FILL-NOW paper open fills at — the latest 1m candle close, i.e. the SAME
+    candle feed the chart and kernel use, so a paper fill can never land off the visible candle.
+
+    Deliberately NOT the live-price snapshot (``market:prices``). The snapshot's ``updated_at`` is
+    its PUBLISH time, not when the price was observed (``market_cache.publish_price_snapshot``
+    stamps ``_iso_now()``), so a feed delivering a STALE value still passes the 120s age gate — a
+    ~6-min lag that filled a short ~$80 ABOVE the candle it opened on, and observed drifting tens
+    of dollars off the Binance candle feed even live. The latest 1m close is current to <=1 bar
+    and is exactly what the operator sees on the chart. Falls back to the strategy-timeframe last
+    close when 1m candles are unavailable."""
+    a = str(asset or "").strip().upper()
+    try:
+        m1 = fetch_candles(a, bars=2, interval="1m")
+        if m1 is not None and not getattr(m1, "empty", True) and len(m1):
+            close = _coerce_positive_float(m1["close"].iloc[-1])
+            if close is not None:
+                return float(close)
+    except Exception:
+        pass
+    return float(last_close)
+
+
 def _scanner_bool_setting(name: str, default: bool) -> bool:
     try:
         settings = kv_get("forven:settings", {})
@@ -6342,21 +6365,15 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             )
 
     # A FILL-NOW entry opens at the REAL current price + wall-clock NOW (a market order placed
-    # the moment we detect the signal), NOT the historical fill bar — that's the whole point
-    # (paper mirrors live instead of back-stamping the trade onto an old candle). The TIME is
-    # ALWAYS now; the PRICE is the live-cache mark (the same mark the dashboard shows) when
-    # fresh, falling back to the last CLOSED bar's close only when the live mark is
-    # missing/stale — never the bar's OPEN timestamp (that's what produced the "opened an hour
-    # ago at the low" artifact). Faithful back-stamp opens (fresh_cutoff None) never reach here.
-    hop_price, hop_time = last_close, get_now().isoformat()
+    # the moment we detect the signal), NOT the historical fill bar. The TIME is ALWAYS now; the
+    # PRICE comes from _fill_now_mark, which anchors to the CANDLE feed (the chart's price) and
+    # REJECTS a lagging live-price snapshot — the snapshot's updated_at is its PUBLISH time, so a
+    # stale price VALUE passes the 120s age gate (the ~6-min lag that put a short's fill ~$80
+    # above the candle it opened on). Faithful back-stamp opens (fresh_cutoff None) never reach here.
+    hop_time = get_now().isoformat()
+    hop_price = last_close
     if any(a.kind == "open" and getattr(a, "late_entry", False) for a in actions_plan):
-        try:
-            _lp_prices, _lp_age = _load_live_price_cache()
-            _lp = _coerce_positive_float((_lp_prices or {}).get(asset))
-            if _lp and (_lp_age is None or _lp_age <= _PRICE_CACHE_STALE_SECONDS):
-                hop_price = _lp
-        except Exception:
-            pass
+        hop_price = _fill_now_mark(asset, last_close)
 
     out: list[str] = []
     # Resolve cross-asset orphans held out of reconcile above. Paper: flat-close the
