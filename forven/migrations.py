@@ -469,6 +469,93 @@ def _m_2026_06_paper_book_go_live_stamp(conn: sqlite3.Connection) -> None:
     log.info("Stamped paper-book go-live = %s (kernel records forward; no pre-upgrade replay)", now_iso)
 
 
+# The PURE indicator helpers the forven.strategies.indicators facade re-exports — the only
+# forven.scanner names safe to redirect (no DB / network / deputy reach).
+_R3_FACADE_INDICATORS = frozenset(
+    {
+        "rsi", "adx", "atr", "stochastic", "williams_r", "vwap",
+        "oi_price_divergence", "funding_rate_zscore", "ema_cross_thresholds",
+    }
+)
+
+
+def redirect_pure_scanner_imports(text: str) -> str:
+    """Rewrite ``from forven.scanner import <pure indicators>`` -> the allowlisted
+    ``forven.strategies.indicators`` facade in ONE module's source. SAFE-ONLY: a line is
+    redirected only when it is a simple single-line ``from forven.scanner import …`` whose every
+    imported name is a pure facade indicator. A line importing a non-pure / deputy symbol
+    (fetch_candles, get_db, _execute_direct, …) — or a parenthesised/multiline import — is left
+    untouched, so a self-fetching / confused-deputy strategy stays rejected. Returns the
+    (possibly unchanged) source; idempotent (no matching line remains after one pass)."""
+    old_prefix = "from forven.scanner import "
+    new_prefix = "from forven.strategies.indicators import "
+    if old_prefix not in text:
+        return text
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith(old_prefix) and "(" not in line:
+            names_part = line.split(old_prefix, 1)[1].split("#", 1)[0]
+            base_names = [n.split(" as ")[0].strip() for n in names_part.split(",") if n.strip()]
+            if base_names and all(bn in _R3_FACADE_INDICATORS for bn in base_names):
+                line = line.replace(old_prefix, new_prefix, 1)
+        out.append(line)
+    return "".join(out)
+
+
+def rewrite_custom_scanner_imports_in_dir(custom_dir) -> list[str]:
+    """Apply :func:`redirect_pure_scanner_imports` to every ``*.py`` in ``custom_dir`` (skipping
+    ``__init__``), writing back only the files that changed. Returns the changed filenames.
+    Best-effort per file (unreadable / unwritable files are skipped, never raised)."""
+    rewritten: list[str] = []
+    for path in sorted(custom_dir.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue  # non-utf8 / unreadable → already rejected by the byte-scan; leave it
+        new_text = redirect_pure_scanner_imports(text)
+        if new_text != text:
+            try:
+                path.write_text(new_text, encoding="utf-8")
+                rewritten.append(path.name)
+            except Exception as exc:  # noqa: BLE001 — never fail the upgrade on a file-write hiccup
+                log.warning("R3 custom-import migration: could not rewrite %s: %s", path.name, exc)
+    return rewritten
+
+
+def _m_2026_06_rewrite_custom_scanner_imports(conn: sqlite3.Connection) -> None:
+    """R3: ``forven.scanner`` was removed from the untrusted-strategy import allowlist (it
+    re-exports get_db / kv_get / _execute_direct); its PURE indicator helpers now live behind the
+    allowlisted ``forven.strategies.indicators`` facade. The shipped builtins/composites were
+    migrated in-tree, but a user's OWN custom strategies (``forven/strategies/custom/*.py`` —
+    local + gitignored) were not: an active custom doing ``from forven.scanner import rsi`` is now
+    scan-rejected and silently stops loading after the upgrade.
+
+    One-time, on upgrade: redirect those imports to the facade (pure-indicator lines only;
+    deputy/self-fetch imports stay rejected) so the strategies keep working. Idempotent; recorded
+    once in schema_migrations. ``conn`` is unused — strategy files live on disk, not in the DB."""
+    import os
+    from pathlib import Path
+
+    # This is the only migration with an on-disk side effect (it edits custom/ strategy files).
+    # Skip that under pytest so the migration-safety suite (which applies EVERY migration) never
+    # mutates a developer's local strategies — the rewrite logic itself is covered directly by
+    # test_custom_scanner_import_migration via rewrite_custom_scanner_imports_in_dir.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    custom_dir = Path(__file__).resolve().parent / "strategies" / "custom"
+    if not custom_dir.is_dir():
+        return
+    rewritten = rewrite_custom_scanner_imports_in_dir(custom_dir)
+    if rewritten:
+        log.info(
+            "R3 custom-import migration: redirected forven.scanner -> forven.strategies.indicators "
+            "in %d custom strategy file(s): %s%s",
+            len(rewritten), ", ".join(rewritten[:25]), " …" if len(rewritten) > 25 else "",
+        )
+
+
 # Append new migrations to the END of this list. Never reorder, rename, or
 # delete existing entries — doing so will cause migrations to re-run on
 # databases that already applied them under the old name, or to silently
@@ -504,6 +591,10 @@ MIGRATIONS: list[Migration] = [
     Migration(
         name="2026_06_strategy_sandbox_only",
         up=_m_2026_06_strategy_sandbox_only,
+    ),
+    Migration(
+        name="2026_06_rewrite_custom_scanner_imports",
+        up=_m_2026_06_rewrite_custom_scanner_imports,
     ),
 ]
 

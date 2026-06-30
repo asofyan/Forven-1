@@ -74,3 +74,42 @@ recovery, live-exchange edge cases). Full report: [`paper-live-engine-audit-2026
   empty read mass-closing real positions).
 - `scanner_max_candle_staleness_bars` (default 2) — how many bars past close before candle data
   is treated as stale and new entries are blocked.
+
+---
+
+## Security hardening release (2026-06)
+
+A security audit closed an in-process strategy-import RCE chain and tightened the sandbox. Most
+of it is transparent; a few things are worth knowing. Full report:
+[`strategy-share-security-audit-2026-06-29.md`](strategy-share-security-audit-2026-06-29.md).
+
+### What happens automatically (no action needed)
+
+- **Custom-strategy imports are auto-migrated.** The strategy sandbox no longer lets untrusted
+  code import `forven.scanner` (it re-exports the database handle, secret decryption, and a
+  live-order sink). Its *pure indicator* helpers (`rsi`, `atr`, `adx`, `stochastic`, …) now live
+  behind the allowlisted `forven.strategies.indicators` facade. A one-time startup migration
+  rewrites your own `custom/` strategies' `from forven.scanner import rsi, atr, …` to
+  `from forven.strategies.indicators import …`, so a strategy that used those indicators keeps
+  working with no edit. (Shipped builtins/composites were migrated in the release itself.)
+- **Code-bundled strategy import runs out-of-process.** Importing a *shared* strategy that bundles
+  Python now executes that code only inside a locked-down worker (no DB, no network, no secrets),
+  never in the app process. Import/backtest still works — it's just contained.
+
+### Behavior changes to expect (awareness only)
+
+- **Cross-asset / self-fetching custom strategies stop loading.** A custom strategy that fetched
+  its OWN market data inside the strategy — `from forven.data import …`, `from forven.data_manager
+  import …`, `from forven.strategies.sentiment import fetch_funding_rates`, or `from forven.scanner
+  import fetch_candles` — is now refused: the sandbox can't supply a second asset's series, so it
+  would run on incomplete data. These are **not** auto-migrated (there is no safe rewrite). If you
+  have one, it needs reworking to take its data from the engine (single-asset funding/OI is already
+  enriched for you) or it stays inactive. The pure-indicator case above is the common one and is
+  handled for you.
+- **Live concurrency default bumps 1 → 5.** A migration rewrites a *persisted* live
+  `max_concurrent_positions` of exactly `1` (the old default) to `5`; a value you set yourself is
+  left alone. (Live trades **testnet** by default; mainnet stays gated behind `FORVEN_ALLOW_MAINNET`.)
+- **Mainnet requires an agent wallet.** Live trading on mainnet — only when you explicitly set
+  `FORVEN_ALLOW_MAINNET=1` — now refuses a master-account private key and requires a verified
+  agent/API wallet, so even a full compromise cannot move funds off the platform. Testnet is
+  unaffected.
