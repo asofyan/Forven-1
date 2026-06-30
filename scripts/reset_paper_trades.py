@@ -21,7 +21,8 @@ doesn't open a fresh trade mid-reset.
 from __future__ import annotations
 
 import argparse
-import shutil
+import shutil  # noqa: F401  (retained for callers/compat; backup now uses the sqlite3 backup API)
+import sqlite3
 import sys
 import time
 
@@ -79,7 +80,20 @@ def main(argv=None) -> int:
 
     db_path = str(cfg.FORVEN_DB)
     backup = f"{db_path}.bak-{int(time.time())}"
-    shutil.copy2(db_path, backup)
+    # Online backup via SQLite's backup API — correct for a LIVE/WAL DB held open by the
+    # running daemon. A plain file copy (shutil.copy2) fails with PermissionError on the
+    # locked file (and would capture a torn WAL state mid-write); the backup API copies a
+    # consistent snapshot cooperatively while the daemon keeps running.
+    _src = sqlite3.connect(db_path)
+    try:
+        _dst = sqlite3.connect(backup)
+        try:
+            with _dst:
+                _src.backup(_dst)
+        finally:
+            _dst.close()
+    finally:
+        _src.close()
     print(f"\nBacked up DB -> {backup}")
 
     # Stamp the paper-book reset so the kernel's recording window restarts HERE — BEFORE any
