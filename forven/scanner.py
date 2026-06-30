@@ -5539,11 +5539,18 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
             "leverage": leverage, "mirror_sized": True,
         },
     }
-    trade_id = _open_trade_db(
-        strat_id, asset, direction, entry_price, units,
-        float(alloc_risk), float(leverage), signal_data, execution_type="paper",
-        opened_at=opened_at_val,  # late hop-in: current bar time; else the kernel entry-BAR time
-    )
+    try:
+        trade_id = _open_trade_db(
+            strat_id, asset, direction, entry_price, units,
+            float(alloc_risk), float(leverage), signal_data, execution_type="paper",
+            opened_at=opened_at_val,  # late hop-in: current bar time; else the kernel entry-BAR time
+        )
+    except sqlite3.IntegrityError:
+        # A position for this strategy/asset/direction is already OPEN (the unique-open
+        # partial index). Don't crash the scan loop and drop the cycle — the existing
+        # position stands; skip this duplicate open. (Mirrors the live opener's guard.)
+        log.warning("[%s] kernel paper: duplicate open blocked for %s %s (already open)", strat_id, asset, direction)
+        return None
     try:
         register(trade_id, asset, direction, strat_id, float(alloc_risk), entry_price, execution_type="paper")
     except Exception:
@@ -5552,7 +5559,10 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
     return f"KERNEL-OPEN{' (fill-now)' if late else ''} {asset} {direction} @ {entry_price:.6g} size={units}"
 
 
-def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, direction: str) -> str | None:
+def _kernel_close_recorded(
+    strat_id: str, strat: dict, row: dict, trade: dict, direction: str,
+    *, closed_at_override: str | None = None,
+) -> str | None:
     trade_id = str(row.get("id"))
     sd = parse_trade_signal_data(row.get("signal_data"))
     late = bool(sd.get("late_entry"))
@@ -5564,8 +5574,12 @@ def _kernel_close_recorded(strat_id: str, strat: dict, row: dict, trade: dict, d
     _update_trade_fill(trade_id=trade_id, fill_price=exit_price, fill_kind="exit", signal_price=exit_price)
     # closed_at = the kernel's actual EXIT-bar time (the trade really closed on the bar the
     # kernel exited on, not the scan moment). close_trade_record stamps it directly.
+    # closed_at_override clamps it (used when a fill-now exit lands at/before the fill time)
+    # so the trade is never negative-duration while still realizing the kernel exit PRICE.
     _exit_time = trade.get("exit_time")
     _closed_at = str(_exit_time).replace(" ", "T") if _exit_time else None
+    if closed_at_override:
+        _closed_at = str(closed_at_override).replace(" ", "T")
     if late:
         # FILL-NOW entry: the recorded entry is the current-mark fill price, NOT the kernel's
         # historical entry — so the kernel's historical-entry pnl_pct does NOT describe this
@@ -5630,14 +5644,21 @@ def _kernel_close_paper_trade(strat_id: str, strat: dict, action) -> str | None:
             # partial-close while paused must not be re-closed at full size = double-count).
             return None
         if sd.get("late_entry"):
-            # Never record an exit AT/BEFORE the hop-in entry: a kernel signal/time exit that
-            # fills on the very bar we hopped in on would stamp closed_at <= opened_at — a
-            # backwards, negative-duration trade with nonsense PnL. Defer it; a later bar's
-            # exit or the re-anchored monitor closes it (same closed-bars-only spirit as the
-            # monitor's idx > hop_ts skip).
+            # The kernel's signal/time exit lands AT/BEFORE our fill-now entry: the signal
+            # round-tripped within the bar we filled into. We must NOT stamp closed_at <=
+            # opened_at (a backwards, negative-duration trade). The OLD code deferred (return
+            # None) — but for a fast-exit (≈1-bar-hold) strategy the kernel exit_time is fixed
+            # and always ≤ opened_at, so it deferred on EVERY scan FOREVER: the position
+            # stranded OPEN and, via the unique-open index, froze the strategy's whole book
+            # (no re-entry). Instead, resolve it now — close at the kernel exit PRICE (the move
+            # from our fill IS realized, recomputed from our entry in _kernel_close_recorded)
+            # but CLAMP closed_at to our fill time so duration is never negative.
             _ex_t, _op_t = _parse_iso_ts(trade.get("exit_time")), _parse_iso_ts(row.get("opened_at"))
             if _ex_t is not None and _op_t is not None and _ex_t <= _op_t:
-                return None
+                return _kernel_close_recorded(
+                    strat_id, strat, row, trade, action.direction,
+                    closed_at_override=row.get("opened_at"),
+                )
             # A LATE hop-in's PRICE exits are owned by its RE-ANCHORED stop/target (enforced
             # intrabar by _kernel_handle_late_entry_exits), NOT by the kernel's historical
             # stop/target — those sit at the original entry's geometry, far from the hop-in

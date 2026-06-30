@@ -392,16 +392,23 @@ def test_trailing_only_late_hopin_price_exit_is_not_deferred(forven_db):
         assert dict(c.execute("SELECT status FROM trades WHERE id=?", (tid,)).fetchone())["status"] == "CLOSED"
 
 
-def test_late_hopin_exit_at_or_before_entry_is_deferred(forven_db):
-    """A kernel signal/time exit that fills AT/BEFORE the hop-in entry (closed_at <= opened_at)
-    would record a backwards, negative-duration trade — defer it (a later bar's exit or the
-    re-anchored monitor closes it instead)."""
+def test_late_hopin_exit_at_or_before_entry_closes_clamped_not_stranded(forven_db):
+    """A kernel signal/time exit that lands AT/BEFORE the fill-now entry (exit_time <= opened_at)
+    must NOT be deferred forever. For a fast-exit (~1-bar-hold) strategy the kernel exit_time is
+    fixed and ALWAYS <= opened_at, so the old defer-forever stranded the position OPEN and — via
+    the unique-open index — froze the strategy's whole book (no re-entry). The fix closes it NOW
+    at the kernel exit price, with closed_at CLAMPED to opened_at so the trade is never
+    negative-duration."""
     tid, row = _open_late(forven_db, current_time="2026-06-27 12:00:00+00:00")
     action = ReconcileAction(
         "close", "short", STALE_ENTRY, recorded={"_row": row},
         trade={"exit_price": 1580.0, "pnl_pct": 0.10, "exit_reason": "signal",
                "exit_time": "2026-06-27 11:00:00+00:00"},  # BEFORE opened_at
     )
-    assert sc._kernel_close_paper_trade("S-LATE", STRAT, action) is None  # deferred
+    msg = sc._kernel_close_paper_trade("S-LATE", STRAT, action)
+    assert msg is not None and "KERNEL-CLOSE" in msg  # closed, NOT deferred/stranded
     with get_db() as c:
-        assert dict(c.execute("SELECT status FROM trades WHERE id=?", (tid,)).fetchone())["status"] == "OPEN"
+        r = dict(c.execute("SELECT status, opened_at, closed_at FROM trades WHERE id=?", (tid,)).fetchone())
+    assert r["status"] == "CLOSED"
+    # closed_at is clamped to opened_at (12:00), never the backwards exit_time (11:00).
+    assert sc._parse_iso_ts(r["closed_at"]) >= sc._parse_iso_ts(r["opened_at"])
