@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from forven.strategies import backtest as bt
 from forven.strategies import execution_kernel as ek
