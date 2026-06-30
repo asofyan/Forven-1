@@ -316,9 +316,34 @@ def dataset_market_type(asset_class: str) -> str:
     return normalized or "unknown"
 
 
+def _assert_safe_dataset_component(label: str, comp: str) -> str:
+    """P3.1: a dataset path component must not be able to escape DATA_DIR. ``timeframe``
+    is interpolated into the filename raw, and ``symbol_to_fs`` (to_fs) only swaps
+    ``/``/``_``→``-`` + uppercases — it does NOT strip ``..``, ``\\`` or ``:`` — so a
+    crafted symbol/timeframe is a path-traversal write-/read-anywhere primitive (CSV
+    upload, dataset read). Reject separators / traversal / leading dots; a single dot in
+    the middle (e.g. ``BRK.B``) stays allowed."""
+    comp = str(comp or "").strip()
+    if (
+        not comp
+        or len(comp) > 64
+        or comp.startswith(".")
+        or comp in (".", "..")
+        or any(bad in comp for bad in ("/", "\\", "..", ":", "\x00"))
+    ):
+        raise ValueError(f"invalid dataset {label}: {comp!r}")
+    return comp
+
+
 def parquet_path(symbol: str, timeframe: str) -> Path:
-    fs_symbol = symbol_to_fs(symbol)
-    return DATA_DIR / fs_symbol / f"{timeframe}.parquet"
+    fs_symbol = _assert_safe_dataset_component("symbol", symbol_to_fs(symbol))
+    tf = _assert_safe_dataset_component("timeframe", timeframe)
+    # Hard backstop: even if a component slips past the charset checks, resolve() and
+    # assert the final path stays under DATA_DIR before any read/write touches it.
+    path = (DATA_DIR / fs_symbol / f"{tf}.parquet").resolve()
+    if not path.is_relative_to(DATA_DIR.resolve()):
+        raise ValueError(f"dataset path escapes the data directory: {symbol!r}/{timeframe!r}")
+    return path
 
 
 def _data_engine_read_enabled() -> bool:
