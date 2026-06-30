@@ -5050,10 +5050,6 @@ def _claim_ownership_for_task(conn: sqlite3.Connection, agent_id: str, task: sql
                 input_data = {}
         strategy_id = _extract_strategy_id(input_data if isinstance(input_data, dict) else None)
 
-    # Deterministic scanner execution tasks (no LLM) bypass the ownership check.
-    if normalized_agent == "execution-trader" and task_type == "execution":
-        return strategy_id or "ok", None
-
     # strategy-developer codes containers at any stage; ownership is irrelevant.
     if normalized_agent == "strategy-developer" and task_type in (
         "code_strategy",

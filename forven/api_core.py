@@ -1621,7 +1621,6 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "notify_health_reports": True,
     "notify_errors": True,
     "scanner_execution_enabled": True,
-    "execution_fast_path_enabled": True,
     "relaxed_trade_filters_enabled": False,
     "strict_regime_gating": True,
     "regime_min_confidence": 0.3,
@@ -2667,8 +2666,6 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
                 payload.get("scanner_execution_enabled"),
                 bool(updates.get("scanner_execution_enabled", True)),
             )
-        if "execution_fast_path_enabled" in payload:
-            updates["execution_fast_path_enabled"] = _coerce_bool(payload.get("execution_fast_path_enabled"), updates["execution_fast_path_enabled"])
         if "auto_restart_on_crash" in payload:
             updates["auto_restart_on_crash"] = _coerce_bool(payload.get("auto_restart_on_crash"), updates["auto_restart_on_crash"])
         if "auto_approve_code_edits" in payload:

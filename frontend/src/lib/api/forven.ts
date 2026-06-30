@@ -2046,7 +2046,6 @@ export interface ForvenSettings {
 	maintenance_end_hour: number | null;
 	data_refresh_seconds: number;
 	scanner_execution_enabled: boolean;
-	execution_fast_path_enabled: boolean;
 	throughput_auto_scheduler_control: boolean;
 	adaptive_pipeline_throughput_enabled: boolean;
 	pipeline_target_clear_hours: number;

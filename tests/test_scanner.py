@@ -1315,7 +1315,6 @@ def test_manage_positions_marks_trade_pending_reconcile_when_open_execution_fail
     # same way. Force routing through _execute_direct.
     monkeypatch.setattr(scanner_mod, "_paper_stage_local_execution_only_enabled", lambda: False)
     monkeypatch.setattr(scanner_mod, "_paper_test_mode_enabled", lambda: False)
-    monkeypatch.setattr(scanner_mod, "_execution_fast_path_enabled", lambda: True)
     monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
 
     actions = manage_positions(

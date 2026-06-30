@@ -719,15 +719,6 @@ def _scanner_execution_enabled() -> bool:
     return _scanner_bool_setting("scanner_execution_enabled", True)
 
 
-def _execution_fast_path_enabled() -> bool:
-    return _scanner_bool_setting("execution_fast_path_enabled", True)
-
-
-def is_execution_fast_path_enabled() -> bool:
-    """Backward-compatible alias for scanner execution routing state."""
-    return _execution_fast_path_enabled()
-
-
 def _resolve_trade_assumptions(params: dict) -> tuple[float, float, float]:
     min_risk_reward_ratio = _coerce_non_negative_float(params.get("min_risk_reward_ratio"))
     if min_risk_reward_ratio is None:
@@ -882,75 +873,6 @@ def _normalize_execution_side(value: object, fallback: str = "long") -> str:
     if normalized in {"sell", "s", "short"}:
         return "short"
     return fallback
-
-
-def _queue_trade_execution_intent(intent: dict) -> tuple[bool, str | None, str | None]:
-    """Queue a deterministic execution-trader task for a structured trade intent."""
-    if not isinstance(intent, dict):
-        return False, None, "invalid execution intent payload"
-
-    action = str(intent.get("action") or "").strip().lower()
-    trade_id = str(intent.get("trade_id") or "").strip()
-    strategy_id = str(intent.get("strategy_id") or intent.get("strategy") or "").strip()
-    asset = str(intent.get("asset") or "").strip().upper()
-    if action not in {"open", "close"}:
-        return False, None, f"unsupported execution action: {action or 'unknown'}"
-    if not trade_id or not strategy_id or not asset:
-        return False, None, "execution intent requires action, trade_id, strategy_id, and asset"
-
-    payload = dict(intent)
-    payload["action"] = action
-    payload["trade_id"] = trade_id
-    payload["strategy_id"] = strategy_id
-    payload["asset"] = asset
-    payload["side"] = _normalize_execution_side(payload.get("side"), "long")
-    payload["source"] = str(payload.get("source") or "scanner").strip() or "scanner"
-    payload.setdefault("stop_loss", None)
-    payload.setdefault("take_profit", None)
-    payload.setdefault("price", 0.0)
-    payload.setdefault("size", 0.0)
-
-    title = f"Trade execution {action}: {trade_id} {asset}"
-    description = (
-        f"Execute deterministic scanner trade intent for {strategy_id} "
-        f"({action} {asset}, trade={trade_id})."
-    )
-
-    try:
-        from forven.brain import assign_task_direct
-
-        task_id = assign_task_direct(
-            agent_id="execution-trader",
-            task_type="trade_execution",
-            title=title,
-            description=description,
-            input_data=payload,
-            strategy_id=None,
-            priority=1,
-        )
-        task_display_id = format_prefixed_id("T", int(task_id))
-    except Exception as exc:
-        return False, None, str(exc)
-
-    queued_at = get_now().isoformat()
-    _update_trade_signal_data(
-        trade_id,
-        {
-            "pending_execution_action": action,
-            "pending_execution_task_id": task_display_id,
-            "pending_execution_requested_at": queued_at,
-            "pending_execution_source": payload["source"],
-        },
-    )
-    log_activity(
-        "info",
-        "scanner",
-        (
-            f"Queued deterministic trade execution {action} for {strategy_id} "
-            f"{asset} trade={trade_id} task={task_display_id}"
-        ),
-    )
-    return True, task_display_id, None
 
 
 def _get_registered_position(trade_id: str) -> dict | None:
@@ -3999,7 +3921,6 @@ def manage_positions(
     paper_test_mode = _paper_test_mode_enabled()
     paper_test_bypass_gates = _paper_test_bypass_gates_enabled()
     paper_test_local_execution = _paper_test_local_execution_for(strat)
-    execution_fast_path = _execution_fast_path_enabled()
     stop_loss_pct = _coerce_positive_float(p.get("stop_loss_pct"))
     take_profit_pct = _coerce_positive_float(p.get("take_profit_pct"))
     min_risk_reward_ratio, risk_fee_bps, risk_slippage_bps = _resolve_trade_assumptions(p)
@@ -4016,39 +3937,6 @@ def manage_positions(
                 signal_price=exit_price,
             )
             return True
-        if not execution_fast_path:
-            queued, task_display_id, error = _queue_trade_execution_intent(
-                {
-                    "action": "close",
-                    "trade_id": str(trade["id"]),
-                    "strategy_id": strat_id,
-                    "asset": trade["asset"],
-                    "side": trade.get("direction", "long"),
-                    "size": trade.get("size", 0),
-                    "price": exit_price,
-                    "stop_loss": None,
-                    "source": "scanner.execution_scan",
-                    "pnl_pct_signal": pnl_pct,
-                    "close_reason": close_reason,
-                }
-            )
-            if queued:
-                log.info(
-                    "[%s] QUEUED close for %s trade=%s via %s",
-                    strat_id,
-                    trade["asset"],
-                    trade["id"],
-                    task_display_id,
-                )
-                return False
-            log.error("Queue close failed for %s %s: %s", strat_id, trade["asset"], error)
-            _report_execution_failure(
-                strategy_id=strat_id,
-                action="close_queue",
-                trade_id=trade.get("id"),
-                reason=error,
-            )
-            return None
         try:
             result = _execute_direct(
                 action="close",
@@ -4098,32 +3986,6 @@ def manage_positions(
                 signal_price=price,
             )
             return True, None
-        if not execution_fast_path:
-            queued, task_display_id, error = _queue_trade_execution_intent(
-                {
-                    "action": "open",
-                    "trade_id": trade_id,
-                    "strategy_id": strat_id,
-                    "asset": trade_asset,
-                    "side": direction,
-                    "size": size,
-                    "price": price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "source": "scanner.execution_scan",
-                    "leverage": p.get("leverage", 1.0),
-                }
-            )
-            if queued:
-                return True, task_display_id
-            log.error("Queue open failed for %s %s: %s", strat_id, trade_asset, error)
-            _report_execution_failure(
-                strategy_id=strat_id,
-                action="open_queue",
-                trade_id=trade_id,
-                reason=error,
-            )
-            return False, str(error or "execution queueing failed")
         try:
             _execute_direct(
                 action="open",
@@ -4232,10 +4094,6 @@ def manage_positions(
         )
 
         close_result = _close_via_execution(trade, exit_price, pnl_pct, exit_reason)
-        if close_result is False:
-            strategy_diag["execution_decision"] = "queued_close"
-            actions.append(f"QUEUED close {trade['asset']} {exit_reason}")
-            continue
         if close_result == "pending":
             strategy_diag["execution_decision"] = "close_pending_reconcile"
             actions.append(f"PENDING close {trade['asset']} {exit_reason}")
@@ -4881,20 +4739,6 @@ def manage_positions(
                 "opened" if opened_ok else "pending_open_reconcile",
             )
             if opened_ok:
-                if open_error:
-                    strategy_diag["execution_decision"] = "queued_open"
-                    actions.append(f"QUEUED {direction} {strat['asset']} @ ${price:,}")
-                    log_activity(
-                        "trade",
-                        "scanner",
-                        (
-                            f"QUEUED {strat_id} {direction_label} {strat['asset']} @ ${price:,.2f} "
-                            f"task={open_error} [{mode_label}]"
-                        ),
-                    )
-                    if diagnostics is not None:
-                        diagnostics[strat_id] = strategy_diag
-                    return actions
                 strategy_diag["execution_decision"] = "opened"
                 log.info("[%s] OPENED %s %s @ $%.2f | size=%s | risk=$%.2f [%s]",
                          strat_id, direction_label, strat["asset"], price, size, risk_usd, mode_label)
@@ -7112,7 +6956,6 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
     init_db()
     requested_execution = bool(execute_positions)
     execution_allowed = bool(requested_execution and _scanner_execution_enabled())
-    execution_fast_path_enabled = _execution_fast_path_enabled()
     if execution_allowed:
         scan_mode = "signal_execution"
     elif requested_execution:
@@ -7151,10 +6994,8 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
 
     ts = get_now().strftime("%H:%M UTC")
     log.info("=" * 50)
-    if execution_allowed and execution_fast_path_enabled:
+    if execution_allowed:
         mode_detail = "signal+execution (direct)"
-    elif execution_allowed:
-        mode_detail = "signal+execution (queued)"
     elif requested_execution:
         mode_detail = "signal-only; execution disabled by policy"
     else:
@@ -7165,9 +7006,7 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
         ts,
         len(active_strategies),
     )
-    if execution_allowed and not execution_fast_path_enabled:
-        log.info("Execution fast-path is disabled in settings; execution actions will be queued.")
-    elif requested_execution and not execution_allowed:
+    if requested_execution and not execution_allowed:
         log.warning("Execution scan requested but scanner execution is disabled by policy.")
     if relaxed_trade_filters:
         if execution_mode == "paper":
@@ -7300,7 +7139,6 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
                 "actions_count": len(all_actions),
                 "requested_execution": requested_execution,
                 "execution_allowed": execution_allowed,
-                "execution_fast_path_enabled": execution_fast_path_enabled,
                 "last_execution_scan": scan_ts,
                 "last_execution_actions_count": len(all_actions),
                 "paper_test_mode": paper_test_mode,
@@ -7320,7 +7158,6 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
         "requested_execution": requested_execution,
         "execution_requested": requested_execution,
         "execution_allowed": execution_allowed,
-        "execution_fast_path_enabled": execution_fast_path_enabled,
         "execution_enabled": execution_allowed,
         "mode": scan_mode,
         "actions_count": len(all_actions),

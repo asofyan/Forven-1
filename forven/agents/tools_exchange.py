@@ -147,13 +147,6 @@ def _check_task_owner(
     normalized_agent = _normalize_agent_id(agent_id)
     normalized_task_type = str(task_type or "").strip().lower()
 
-    # A DETERMINISTIC scanner trade-execution task (no LLM) must not be blocked by
-    # strategy ownership. (execution-trader is retired as an LLM delegate — it has
-    # no order tools and the brain can't assign to it — but this generic, deterministic
-    # path stays exempt for the legacy fast-path-off execution route.)
-    if normalized_agent == "execution-trader" and normalized_task_type in {"execution", "trade_execution"}:
-        return None, True
-
     # strategy-developer codes containers at any stage; ownership is irrelevant.
     if normalized_agent == "strategy-developer" and normalized_task_type in (
         "code_strategy", "code_strategy_container", "coding_cycle", "phantom_repair",
