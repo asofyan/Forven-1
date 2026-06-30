@@ -1697,31 +1697,7 @@ def import_strategy_container(payload: object) -> dict:
     # strategies are reconstructed from their definition below and are unaffected.
     source_code = payload.get("source_code") if isinstance(payload.get("source_code"), dict) else None
     if source_code and str(source_code.get("content") or "").strip():
-        try:
-            log_activity(
-                "warning",
-                "strategy_import",
-                "Rejected a code-bundled strategy import — code execution is disabled "
-                "until sandboxed execution ships",
-                {
-                    "source_strategy_id": source_id or None,
-                    "module": str(source_code.get("module_name") or ""),
-                },
-            )
-        except Exception:
-            pass
-        return {
-            "ok": False,
-            "error": (
-                "This export bundles custom strategy code, which can't be imported "
-                "safely yet: importing it would run the author's Python on your "
-                "machine. Code-bundled import is disabled until sandboxed execution "
-                "ships. Param/registry-type strategies still import normally."
-            ),
-            "warnings": warnings,
-            "source_strategy_id": source_id or None,
-            "requires_code_execution": True,
-        }
+        return _import_code_strategy(source_code, source_id, warnings)
 
     body = LifecycleCreateBody(
         name=name or None,
@@ -1792,9 +1768,15 @@ def _apply_import_attribution(new_id: str, source_id: str, source_ref: str | Non
 
 
 def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]) -> dict:
-    """Write a bundled custom strategy file and register it through the intake
-    pipeline (AST scan + banned-import gate + lookahead probe + quick_screen
-    container). Never overwrites a differing local file."""
+    """Import a bundled custom-code strategy as SANDBOX-ONLY (R2).
+
+    The author's Python is written to ``forven/strategies/imported/<module>.py``
+    (NEVER ``custom/``, which the trusted parent imports), validated in the
+    locked-down worker subprocess, and registered as a ``sandbox_only`` container.
+    Its code is never imported into the host process; every later execution
+    (gauntlet/backtest/scanner) is routed through the worker. Never overwrites a
+    differing local file. See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    """
     import re as _re
     from pathlib import Path
 
@@ -1807,9 +1789,8 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
             status_code=400, detail=f"invalid module name in export: {raw_module or '(none)'}"
         )
 
-    # Pre-write static guard so obviously-unsafe code never touches disk; the
-    # intake path re-scans (and adds the banned-import + lookahead gates) before
-    # importing.
+    # Pre-write static guard (SCAN ONLY — never executes) so obviously-unsafe code
+    # never touches disk; the worker re-scans before importing.
     try:
         from forven.sandbox.ast_guard import scan_source
 
@@ -1823,11 +1804,11 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
             detail=f"imported strategy code rejected by security scan: {findings}",
         )
 
-    from forven.strategies import custom
-    from forven.strategies.intake import register_custom_strategy_file
+    from forven.strategies import imported as imported_pkg
+    from forven.strategies.intake import register_imported_strategy_file
 
-    custom_dir = Path(custom.__file__).resolve().parent
-    target = custom_dir / f"{raw_module}.py"
+    imported_dir = Path(imported_pkg.__file__).resolve().parent
+    target = imported_dir / f"{raw_module}.py"
 
     wrote_file = False
     if target.exists():
@@ -1839,7 +1820,7 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"a different strategy file already exists at custom/{raw_module}.py — "
+                    f"a different imported strategy already exists at imported/{raw_module}.py — "
                     "rename or remove it before importing"
                 ),
             )
@@ -1848,7 +1829,9 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
         wrote_file = True
 
     try:
-        reg = register_custom_strategy_file(file_path=str(target), source="import")
+        reg = register_imported_strategy_file(
+            module_name=raw_module, source="import", source_id=source_id
+        )
     except ValueError as exc:
         msg = str(exc)
         if wrote_file:
@@ -1856,7 +1839,7 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
                 target.unlink()
             except Exception:
                 pass
-        if "already registered" in msg.lower():
+        if "already registered" in msg.lower() or "already present" in msg.lower():
             return {
                 "ok": False,
                 "error": f"This strategy is already present on this machine ({msg}).",
@@ -1864,6 +1847,13 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
                 "source_strategy_id": source_id or None,
             }
         raise HTTPException(status_code=400, detail=f"import failed: {msg}") from exc
+    except Exception as exc:
+        if wrote_file:
+            try:
+                target.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=400, detail=f"import failed: {exc}") from exc
 
     new_id = str((reg or {}).get("strategy_id") or "").strip()
     if not new_id:
@@ -1875,6 +1865,11 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
         raise HTTPException(status_code=500, detail="registration returned no strategy id")
 
     stage = _apply_import_attribution(new_id, source_id, str(target))
+    warnings = list(warnings)
+    warnings.append(
+        "Imported as a SANDBOX-ONLY strategy: its code runs only inside the isolated "
+        "worker (secret-free, network-denied), never in the main app."
+    )
     if not bool((reg or {}).get("certified", True)):
         cert_err = (reg or {}).get("certification_error")
         warnings.append(
@@ -1888,6 +1883,7 @@ def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]
         "state": None,
         "warnings": warnings,
         "source_strategy_id": source_id or None,
+        "sandbox_only": True,
     }
 
 

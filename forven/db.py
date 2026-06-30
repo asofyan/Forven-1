@@ -4598,6 +4598,7 @@ def create_strategy_container(
     strategy_id: str | None = None,
     parent_strategy_id: str | None = None,
     origin_task_id: str | None = None,
+    sandbox_only: bool = False,
 ) -> tuple[str, str, int]:
     """Create a strategy container row with canonical immutable Sxxxxx IDs.
 
@@ -4686,8 +4687,8 @@ def create_strategy_container(
     normalized_origin_task_id = str(origin_task_id or "").strip() or None
     conn.execute(
         "INSERT INTO strategies "
-        "(id, name, type, runtime_type, symbol, timeframe, params, status, stage, owner, hypothesis_id, base_id, display_id, last_prefix, model, model_id, source, source_ref, stage_changed_at, audit_summary, parent_strategy_id, origin_task_id, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)",
+        "(id, name, type, runtime_type, symbol, timeframe, params, status, stage, owner, hypothesis_id, base_id, display_id, last_prefix, model, model_id, source, source_ref, stage_changed_at, audit_summary, parent_strategy_id, origin_task_id, sandbox_only, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?)",
         (
             final_strategy_id,
             generated_name,
@@ -4710,6 +4711,7 @@ def create_strategy_container(
             now,
             normalized_parent,
             normalized_origin_task_id,
+            1 if sandbox_only else 0,
             now,
             now,
         ),

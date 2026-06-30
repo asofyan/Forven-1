@@ -204,6 +204,7 @@ def _validate_custom_module(workdir: Path) -> dict:
     resulting metadata (type/params/asset/certified/lookahead) crosses back, as data."""
     request = json.loads((workdir / "request.json").read_text(encoding="utf-8"))
     module_name = str(request["module_name"])
+    package = str(request.get("package") or "custom")
 
     import importlib
 
@@ -213,9 +214,9 @@ def _validate_custom_module(workdir: Path) -> dict:
 
     # Belt-and-suspenders re-scan in the child (the parent already scanned before
     # write; re-checking here means the worker never imports an unscanned module).
-    registry.assert_custom_module_safe(module_name)
+    registry.assert_custom_module_safe(module_name, package=package)
 
-    module = importlib.import_module(f"forven.strategies.custom.{module_name}")
+    module = importlib.import_module(f"forven.strategies.{package}.{module_name}")
 
     strategy_cls = getattr(module, "STRATEGY_CLASS", None)
     if isinstance(strategy_cls, str):
@@ -584,9 +585,13 @@ def compute_per_bar_signals_isolated(
 
 
 def validate_custom_module_isolated(
-    module_name: str, *, timeout: int = VALIDATE_TIMEOUT_SECONDS
+    module_name: str, *, package: str = "custom", timeout: int = VALIDATE_TIMEOUT_SECONDS
 ) -> dict:
     """Validate a custom strategy module OUT-OF-PROCESS and return its metadata dict.
+
+    ``package`` selects the source package — ``"custom"`` (locally-authored) or
+    ``"imported"`` (untrusted-origin, sandbox-only). Either way the module is
+    imported only inside the locked-down child, never the trusted parent.
 
     Spawns a one-shot, secret-free, network-denied, FS-confined, resource-capped child
     that imports the module, builds the probe, certifies, and lookahead-scans it — so
@@ -597,7 +602,8 @@ def validate_custom_module_isolated(
     with tempfile.TemporaryDirectory(prefix="forven_validate_") as tmp:
         workdir = Path(tmp)
         (workdir / "request.json").write_text(
-            json.dumps({"module_name": str(module_name)}), encoding="utf-8"
+            json.dumps({"module_name": str(module_name), "package": str(package)}),
+            encoding="utf-8",
         )
         env = _build_worker_env()
         proc = subprocess.Popen(

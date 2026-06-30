@@ -201,6 +201,29 @@ def _m_2026_04_strategy_pinned_backtest(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m_2026_06_strategy_sandbox_only(conn: sqlite3.Connection) -> None:
+    """Mark untrusted-origin (imported / shared) strategies as sandbox-only.
+
+    A strategy imported from another machine carries author-controlled Python that
+    must NEVER be imported into the trusted parent process. Its module lives in
+    forven/strategies/imported/ (invisible to in-process discovery) and this flag
+    is the durable, authoritative record that its execution must be routed through
+    the locked-down subprocess worker (the file path / source label are not a trust
+    boundary). See docs/strategy-share-security-audit-2026-06-29.md (R2).
+    """
+    strat_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(strategies)").fetchall()
+    }
+    if "sandbox_only" not in strat_cols:
+        conn.execute(
+            "ALTER TABLE strategies ADD COLUMN sandbox_only INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategies_sandbox_only "
+        "ON strategies (sandbox_only) WHERE sandbox_only = 1"
+    )
+
+
 def _m_2026_06_portfolio_position_execution_type(conn: sqlite3.Connection) -> None:
     """Scope portfolio positions by execution type for per-session isolation.
 
@@ -477,6 +500,10 @@ MIGRATIONS: list[Migration] = [
     Migration(
         name="2026_06_paper_book_go_live_stamp",
         up=_m_2026_06_paper_book_go_live_stamp,
+    ),
+    Migration(
+        name="2026_06_strategy_sandbox_only",
+        up=_m_2026_06_strategy_sandbox_only,
     ),
 ]
 

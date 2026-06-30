@@ -283,6 +283,76 @@ def test_isolated_validation_matches_in_process(monkeypatch):
         pytest.skip("no pure custom strategy available for isolated-validation parity")
 
 
+def test_sandbox_only_proxy_force_routes_to_worker(monkeypatch):
+    """SECURITY LINCHPIN (R2): a sandbox-only strategy is driven through
+    run_strategy_execution by the non-executing proxy, and its signals are produced
+    OUT-OF-PROCESS even with the global isolation flag OFF. The proxy's in-process
+    methods fail closed, so author code can never run in the trusted parent."""
+    import sys as _sys
+    from pathlib import Path
+
+    monkeypatch.delenv("FORVEN_IN_STRATEGY_WORKER", raising=False)
+    monkeypatch.delenv("FORVEN_ISOLATED_STRATEGY_EXEC", raising=False)  # global isolation OFF
+
+    from forven.strategies import imported as imported_pkg
+    from forven.strategies import backtest as bt
+    from forven.strategies.registry import imported_runtime_type
+    from forven.strategies.sandbox_proxy import SandboxOnlyStrategy, SandboxOnlyExecutionError
+    import forven.sandbox.strategy_worker as sw
+
+    module_name = "wp_sandbox_proxy_probe"
+    src = "\n".join(
+        [
+            "import pandas as pd",
+            "from forven.strategies.base import BaseStrategy, Signal, DirectionalSignals",
+            "TYPE_NAME = 'wp_sandbox_proxy_type'",
+            "class WpSandboxProxy(BaseStrategy):",
+            "    @property",
+            "    def name(self): return 'wp'",
+            "    @property",
+            "    def asset(self): return 'BTC'",
+            "    @property",
+            "    def strategy_type(self): return TYPE_NAME",
+            "    @property",
+            "    def default_params(self): return {}",
+            "    def generate_signal(self, df):",
+            "        return Signal(price=float(df['close'].iloc[-1]) if len(df.index) else 0.0)",
+            "    def generate_signals(self, df):",
+            "        f = df['close'].ewm(span=5).mean(); s = df['close'].ewm(span=20).mean()",
+            "        le = ((f > s) & (f.shift(1) <= s.shift(1))).fillna(False)",
+            "        lx = ((f < s) & (f.shift(1) >= s.shift(1))).fillna(False)",
+            "        z = pd.Series(False, index=df.index)",
+            "        return DirectionalSignals(long_entries=le, long_exits=lx, short_entries=z, short_exits=z)",
+            "STRATEGY_CLASS = WpSandboxProxy",
+        ]
+    )
+    target = Path(imported_pkg.__file__).resolve().parent / f"{module_name}.py"
+    target.write_text(src, encoding="utf-8")
+    sw._reset_worker()  # next isolated call respawns + discovers imported/
+    try:
+        rt = imported_runtime_type(module_name)
+        proxy = SandboxOnlyStrategy("S-wp", {}, runtime_type=rt)
+
+        # The proxy must NEVER run author code in-process — it fails closed.
+        with pytest.raises(SandboxOnlyExecutionError):
+            proxy.generate_signals(_frame())
+        # The parent must not have imported the untrusted module.
+        assert f"forven.strategies.imported.{module_name}" not in _sys.modules
+
+        res = bt.run_strategy_execution(
+            _frame(), proxy, params={}, warmup=50, leverage=2.0, fee_bps=4.5,
+            slippage_bps=2.0, regime_gate=True, trade_mode="long_only",
+            initial_capital=10000.0, strategy_type=rt,
+        )
+        # A real KernelResult means the worker produced the signals out-of-process.
+        assert res is not None
+        assert f"forven.strategies.imported.{module_name}" not in _sys.modules
+    finally:
+        if target.exists():
+            target.unlink()
+        sw._reset_worker()
+
+
 def test_isolated_validation_rejects_unknown_module():
     """An unknown custom module yields a structured failure, not a crash/None."""
     from forven.sandbox.strategy_worker import validate_custom_module_isolated

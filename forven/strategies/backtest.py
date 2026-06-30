@@ -306,17 +306,26 @@ def _isolated_backtest_worker(
     """
     strategy_obj = None
     checker = SIGNAL_CHECKERS.get(family_strategy_type)
-    # Load only the registry slice this backtest needs: built-in strategies skip the
-    # ~12s custom-module import+AST-scan that full discover() pays on every spawn.
-    cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
-    if cls:
-        try:
-            strategy_obj = cls(strategy_id, params)
-        except Exception as e:
-            return {"error": f"Failed to instantiate strategy: {e}"}
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
 
-    if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
-        return {"error": f"Unknown strategy type: {original_strategy_type}"}
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: NEVER resolve/instantiate its real
+        # class in this process. Build the non-executing proxy — run_strategy_execution
+        # force-routes its signal generation to the locked-down sandbox worker.
+        strategy_obj = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        checker = None
+    else:
+        # Load only the registry slice this backtest needs: built-in strategies skip the
+        # ~12s custom-module import+AST-scan that full discover() pays on every spawn.
+        cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
+        if cls:
+            try:
+                strategy_obj = cls(strategy_id, params)
+            except Exception as e:
+                return {"error": f"Failed to instantiate strategy: {e}"}
+
+        if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
+            return {"error": f"Unknown strategy type: {original_strategy_type}"}
 
     split_idx = int(len(df) * 0.70)
     is_df = df.iloc[:split_idx]
@@ -7105,13 +7114,25 @@ def _isolated_strategy_exec_enabled() -> bool:
 
 
 def _strategy_should_isolate(strategy_obj) -> bool:
-    """Isolate ONLY untrusted custom strategies (forven.strategies.custom.*) — builtins
-    and composites are first-party and run in-process. Requires a vectorized
-    generate_signals; the per-bar generate_signal path is not yet isolated."""
+    """Isolate untrusted strategies — locally-authored custom (forven.strategies.custom.*)
+    AND untrusted-origin imported (sandbox_only) ones. Builtins/composites are
+    first-party and run in-process. Requires a vectorized generate_signals; the
+    per-bar generate_signal path is also isolated when reached."""
     if strategy_obj is None or not hasattr(strategy_obj, "generate_signals"):
         return False
+    # Untrusted-origin (imported) strategies are ALWAYS sandboxed — the proxy never
+    # holds the real class, so its signals MUST come from the worker.
+    if getattr(strategy_obj, "sandbox_only", False):
+        return True
     module = str(getattr(type(strategy_obj), "__module__", "") or "")
-    return ".custom." in module or module.endswith(".strategies.custom")
+    return ".custom." in module or module.endswith(".strategies.custom") or ".imported." in module
+
+
+def _force_isolated_exec(strategy_obj) -> bool:
+    """A sandbox-only strategy MUST run out-of-process regardless of the global
+    isolation flag — its code is never available in the trusted parent, so the
+    in-process fallback would fail closed (the proxy raises)."""
+    return bool(getattr(strategy_obj, "sandbox_only", False))
 
 
 def run_strategy_execution(
@@ -7149,16 +7170,19 @@ def run_strategy_execution(
         runtime_params.get("direction") or runtime_params.get("position") or "long"
     ).strip().lower()
 
-    if _isolated_strategy_exec_enabled() and _strategy_should_isolate(strategy_obj):
-        # Run the untrusted custom strategy's signal logic OUT-OF-PROCESS (secret-free
-        # env, network denied, confined FS). The worker normalizes with this exact
+    if (_isolated_strategy_exec_enabled() or _force_isolated_exec(strategy_obj)) and _strategy_should_isolate(strategy_obj):
+        # Run the untrusted strategy's signal logic OUT-OF-PROCESS (secret-free env,
+        # network denied, confined FS). The worker normalizes with this exact
         # trade_mode/default_direction, so re-normalizing below is idempotent and the
         # result is byte-identical to the in-process path. Returns None when the
-        # strategy has no vectorized generate_signals (→ per-bar path, in-process).
+        # strategy has no vectorized generate_signals (→ per-bar path). A sandbox-only
+        # strategy is forced here regardless of the global flag (its class is never
+        # in this process). runtime_params (from the params ARG) is used, so a proxy
+        # object with no real params attr still ships the right params.
         from forven.sandbox.strategy_worker import compute_directional_signals_isolated
         _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
         vectorized = compute_directional_signals_isolated(
-            df, str(_iso_type), dict(getattr(strategy_obj, "params", {}) or {}),
+            df, str(_iso_type), dict(getattr(strategy_obj, "params", None) or runtime_params),
             trade_mode=trade_mode, default_direction=default_direction,
         )
     else:
@@ -7172,13 +7196,13 @@ def run_strategy_execution(
         # routes each entry/exit by the signal's direction (one both-mode kernel run, no
         # long+short straddle). Backtest reaches this BEFORE _run_signal_walk's 'both'
         # split (run_strategy_execution is tried first), so backtest+scanner agree.
-        if _isolated_strategy_exec_enabled() and _strategy_should_isolate(strategy_obj):
-            # Walk the untrusted custom strategy's per-bar generate_signal OUT-OF-PROCESS
-            # too — byte-identical (same _signals_from_per_bar runs in the worker).
+        if (_isolated_strategy_exec_enabled() or _force_isolated_exec(strategy_obj)) and _strategy_should_isolate(strategy_obj):
+            # Walk the untrusted strategy's per-bar generate_signal OUT-OF-PROCESS too —
+            # byte-identical (same _signals_from_per_bar runs in the worker).
             from forven.sandbox.strategy_worker import compute_per_bar_signals_isolated
             _iso_type = getattr(strategy_obj, "strategy_type", None) or strategy_type
             vectorized = compute_per_bar_signals_isolated(
-                df, str(_iso_type), dict(getattr(strategy_obj, "params", {}) or {}),
+                df, str(_iso_type), dict(getattr(strategy_obj, "params", None) or runtime_params),
                 warmup=warmup, trade_mode=trade_mode,
             )
         else:
@@ -7851,12 +7875,21 @@ def backtest_strategy(
 
     params = canonical.params if hasattr(canonical, "params") else params
     strategy_probe = None
-    strategy_cls = _resolve_strategy_class(original_strategy_type)
-    if strategy_cls is not None:
-        try:
-            strategy_probe = strategy_cls(strategy_id, params)
-        except Exception:
-            strategy_probe = None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
+
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: a non-executing proxy stands in for
+        # the probe (trade-mode + metadata resolution). Its real class is never
+        # imported in the trusted parent; execution routes to the sandbox worker.
+        strategy_probe = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        strategy_cls = SandboxOnlyStrategy  # non-None → skips the orphan guard
+    else:
+        strategy_cls = _resolve_strategy_class(original_strategy_type)
+        if strategy_cls is not None:
+            try:
+                strategy_probe = strategy_cls(strategy_id, params)
+            except Exception:
+                strategy_probe = None
 
     # Orphan guard: if there is no class AND no known param family, the backtest
     # would silently produce zero signals (the `_vectorized_signals` ladder only
@@ -8355,7 +8388,14 @@ def backtest_strategy(
     # Run the AI's signal generation in a separate OS process so that
     # infinite loops, memory explosions, or uncaught exceptions in
     # strategy code cannot freeze the main Forven backend.
-    if _should_use_process_isolation():
+    #
+    # Sandbox-only (imported) strategies take the INLINE path instead: their signal
+    # generation is already force-routed to the dedicated sandbox worker by
+    # run_strategy_execution, so the generic backtest-isolation spawn would be a
+    # redundant (and secret-bearing) second subprocess. Inline → single isolation.
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type as _is_sandbox_only
+
+    if _should_use_process_isolation() and not _is_sandbox_only(original_strategy_type):
         n_bars = len(df)
         backtest_timeout = _resolve_backtest_timeout(n_bars)
         log.info("Submitting backtest %s to isolated worker (timeout=%ds, bars=%d)", strategy_id, backtest_timeout, n_bars)
@@ -10183,12 +10223,21 @@ def walk_forward(
 
 
     strategy_probe = None
-    strategy_cls = _resolve_strategy_class(original_strategy_type)
-    if strategy_cls is not None:
-        try:
-            strategy_probe = strategy_cls(strategy_id, params)
-        except Exception:
-            strategy_probe = None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type, SandboxOnlyStrategy
+
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: a non-executing proxy stands in for
+        # the probe (trade-mode + metadata resolution). Its real class is never
+        # imported in the trusted parent; execution routes to the sandbox worker.
+        strategy_probe = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        strategy_cls = SandboxOnlyStrategy  # non-None → skips the orphan guard
+    else:
+        strategy_cls = _resolve_strategy_class(original_strategy_type)
+        if strategy_cls is not None:
+            try:
+                strategy_probe = strategy_cls(strategy_id, params)
+            except Exception:
+                strategy_probe = None
 
     # Orphan guard (walk-forward path). See backtest_strategy() for rationale.
     if strategy_cls is None:

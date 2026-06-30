@@ -222,86 +222,90 @@ def test_export_bundles_source_code_for_code_class(forven_db, monkeypatch, tmp_p
     assert f"TYPE_NAME = '{type_name}'" in sc["content"]
 
 
-def test_code_class_round_trip_registers_on_fresh_machine(forven_db, monkeypatch, tmp_path):
-    temp_custom_dir = _isolate_custom_dir(monkeypatch, tmp_path)
-    type_name = "portability_probe_rt"
-    strategy_file = temp_custom_dir / f"{type_name}.py"
-    _write_custom_strategy(strategy_file, type_name=type_name, class_name="PortabilityProbeRt")
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
-
-    reg = intake_mod.register_custom_strategy_file(file_path=str(strategy_file), source="ai_dropzone")
-    source_id = reg["strategy_id"]
-    env = lifecycle.build_container_export(source_id)
-    assert "source_code" in env
-
-    # Simulate a fresh machine: the file, the registered class, and the source
-    # container don't exist on the importing side.
-    strategy_file.unlink()
-    with get_db() as conn:
-        conn.execute("DELETE FROM strategies WHERE id = ?", (source_id,))
-    registry.reset()
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
-    importlib.invalidate_caches()
-    assert not strategy_file.exists()
-
-    # SECURITY (2026-06-29 audit, R1): code-bundled import is DISABLED until the
-    # untrusted lifecycle runs out-of-process. Importing must reject WITHOUT writing
-    # the file or executing the author's code, not recreate the container.
-    result = lifecycle.import_strategy_container(env)
-
-    assert result["ok"] is False
-    assert result.get("requires_code_execution") is True
-    assert "disabled" in result["error"].lower()
-    assert not strategy_file.exists()  # nothing written, nothing executed
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM strategies WHERE type = ?", (type_name,)
-        ).fetchone()
-    assert row["c"] == 0
+_SANDBOX_PROBE_SRC = "\n".join(
+    [
+        "import pandas as pd",
+        "from forven.strategies.base import BaseStrategy, Signal, DirectionalSignals",
+        "TYPE_NAME = 'portability_sandbox_probe_type'",
+        "class PortabilitySandboxProbe(BaseStrategy):",
+        "    @property",
+        "    def name(self): return 'Sandbox Probe'",
+        "    @property",
+        "    def asset(self): return 'BTC'",
+        "    @property",
+        "    def strategy_type(self): return TYPE_NAME",
+        "    @property",
+        "    def default_params(self): return {'fast': 8, 'slow': 21}",
+        "    def generate_signal(self, df):",
+        "        return Signal(price=float(df['close'].iloc[-1]) if len(df.index) else 0.0)",
+        "    def generate_signals(self, df):",
+        "        f = df['close'].ewm(span=8).mean(); s = df['close'].ewm(span=21).mean()",
+        "        le = ((f > s) & (f.shift(1) <= s.shift(1))).fillna(False)",
+        "        lx = ((f < s) & (f.shift(1) >= s.shift(1))).fillna(False)",
+        "        z = pd.Series(False, index=df.index)",
+        "        return DirectionalSignals(long_entries=le, long_exits=lx, short_entries=z, short_exits=z)",
+        "STRATEGY_CLASS = PortabilitySandboxProbe",
+    ]
+)
 
 
-def test_code_class_round_trip_handles_string_strategy_class(forven_db, monkeypatch, tmp_path):
-    # Reproduces the reported "Class validation failed: not a class" failure: a
-    # strategy whose STRATEGY_CLASS is the class *name* (a string). Both creating
-    # the source and importing it must now succeed.
-    temp_custom_dir = _isolate_custom_dir(monkeypatch, tmp_path)
-    type_name = "portability_probe_strslip"
-    strategy_file = temp_custom_dir / f"{type_name}.py"
-    _write_custom_strategy(
-        strategy_file,
-        type_name=type_name,
-        class_name="PortabilityProbeStr",
-        strategy_class_as_string=True,
-    )
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
+def test_code_class_import_is_sandboxed(forven_db):
+    """R2: a code-bundled import is registered SANDBOX-ONLY — written to
+    forven/strategies/imported/ (never custom/), validated OUT-OF-PROCESS, marked
+    sandbox_only, and its module is NEVER imported into the trusted parent."""
+    from pathlib import Path
 
-    reg = intake_mod.register_custom_strategy_file(file_path=str(strategy_file), source="ai_dropzone")
-    source_id = reg["strategy_id"]
-    env = lifecycle.build_container_export(source_id)
-    assert "source_code" in env
+    from forven.strategies import imported as imported_pkg
+    from forven.sandbox.strategy_worker import _reset_worker
 
-    # Fresh machine: drop the file, the class, and the source container.
-    strategy_file.unlink()
-    with get_db() as conn:
-        conn.execute("DELETE FROM strategies WHERE id = ?", (source_id,))
-    registry.reset()
-    sys.modules.pop(f"forven.strategies.custom.{type_name}", None)
-    importlib.invalidate_caches()
+    module_name = "portability_sandbox_probe"
+    env = {
+        "forven_export": {"kind": "strategy_container", "version": "1.0", "source_strategy_id": "S00001"},
+        "configuration": {
+            "type": "portability_sandbox_probe_type",
+            "symbol": "BTC",
+            "timeframe": "1h",
+            "params": {"fast": 8, "slow": 21},
+        },
+        "source_code": {"module_name": module_name, "filename": f"{module_name}.py", "content": _SANDBOX_PROBE_SRC},
+    }
+    imported_dir = Path(imported_pkg.__file__).resolve().parent
+    target = imported_dir / f"{module_name}.py"
+    try:
+        result = lifecycle.import_strategy_container(env)
+        assert result["ok"] is True, result.get("error")
+        assert result.get("sandbox_only") is True
+        sid = result["strategy_id"]
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT type, runtime_type, sandbox_only, source FROM strategies WHERE id = ?",
+                (sid,),
+            ).fetchone()
+        assert row["sandbox_only"] == 1
+        assert row["runtime_type"] == f"imported__{module_name}"
+        assert row["source"] == "import"
+        assert target.exists()  # written to imported/, NOT custom/
+        # The trusted parent must NEVER import the untrusted module.
+        assert f"forven.strategies.imported.{module_name}" not in sys.modules
+        registry.discover()
+        assert row["runtime_type"] not in registry._TYPE_MAP
+    finally:
+        if target.exists():
+            target.unlink()
+        registry.reset()
+        try:
+            _reset_worker()
+        except Exception:
+            pass
 
-    # The string-STRATEGY_CLASS slip is now moot: code-bundled import is rejected
-    # before the file is ever written or parsed (R1).
-    result = lifecycle.import_strategy_container(env)
 
-    assert result["ok"] is False
-    assert result.get("requires_code_execution") is True
-    assert not strategy_file.exists()
+def test_code_class_import_rejects_unsafe_source(forven_db):
+    """Obviously-unsafe bundled code is rejected by the pre-write AST scan BEFORE it
+    is ever written to imported/ or sent to the worker."""
+    from pathlib import Path
 
+    from forven.strategies import imported as imported_pkg
 
-def test_code_class_import_rejected_until_sandbox(forven_db, monkeypatch, tmp_path):
-    # R1: ANY code-bundled import is refused (the code never runs / is never even
-    # written), regardless of whether the bundled source is "obviously" unsafe — the
-    # AST guard is not the boundary, so we do not execute author code at all yet.
-    _isolate_custom_dir(monkeypatch, tmp_path)
     env = {
         "forven_export": {"kind": "strategy_container", "version": "1.0", "source_strategy_id": "S1"},
         "configuration": {"type": "evil_strat", "symbol": "BTC", "timeframe": "1h", "params": {}},
@@ -312,9 +316,9 @@ def test_code_class_import_rejected_until_sandbox(forven_db, monkeypatch, tmp_pa
         },
     }
 
-    result = lifecycle.import_strategy_container(env)
+    with pytest.raises(HTTPException) as exc:
+        lifecycle.import_strategy_container(env)
 
-    assert result["ok"] is False
-    assert result.get("requires_code_execution") is True
-    # Nothing was written to the custom dir and nothing executed.
-    assert not (tmp_path / "custom" / "evil_strat.py").exists()
+    assert exc.value.status_code == 400
+    target = Path(imported_pkg.__file__).resolve().parent / "evil_strat.py"
+    assert not target.exists()  # nothing written, nothing executed
