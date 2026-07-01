@@ -502,15 +502,39 @@ _AGENT_MODEL_CATALOG = [
     {"provider": "together", "model_id": "Qwen/Qwen2.5-72B-Instruct-Turbo", "label": "Together Qwen 2.5 72B Turbo"},
     {"provider": "together", "model_id": "deepseek-ai/DeepSeek-V3", "label": "Together DeepSeek V3"},
     {"provider": "together", "model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1", "label": "Together Mixtral 8x7B"},
-    # NVIDIA NIM (build.nvidia.com) — curated tool-capable chat models. The live
-    # /v1/models list is also discovered; these are reliable, function-calling
-    # instruct/reasoning families (vendor/model ids passed through unchanged).
+    # NVIDIA NIM (build.nvidia.com) — curated tool-capable chat models across the
+    # top open-source families. The live /v1/models list is also discovered; these
+    # are reliable, function-calling instruct/reasoning models (vendor/model ids
+    # passed through unchanged). Ids verified against the live catalog.
+    # Meta Llama
     {"provider": "nvidia", "model_id": "meta/llama-3.3-70b-instruct", "label": "NVIDIA Llama 3.3 70B Instruct"},
+    {"provider": "nvidia", "model_id": "meta/llama-4-maverick-17b-128e-instruct", "label": "NVIDIA Llama 4 Maverick 17B×128E"},
+    {"provider": "nvidia", "model_id": "meta/llama-3.1-70b-instruct", "label": "NVIDIA Llama 3.1 70B Instruct"},
+    {"provider": "nvidia", "model_id": "meta/llama-3.1-8b-instruct", "label": "NVIDIA Llama 3.1 8B Instruct (fast/cheap)"},
+    # NVIDIA Nemotron (NVIDIA-tuned, strong tool-calling)
+    {"provider": "nvidia", "model_id": "nvidia/llama-3.1-nemotron-ultra-253b-v1", "label": "NVIDIA Nemotron Ultra 253B"},
+    {"provider": "nvidia", "model_id": "nvidia/nemotron-3-super-120b-a12b", "label": "NVIDIA Nemotron 3 Super 120B"},
+    {"provider": "nvidia", "model_id": "nvidia/llama-3.3-nemotron-super-49b-v1.5", "label": "NVIDIA Nemotron Super 49B v1.5"},
     {"provider": "nvidia", "model_id": "nvidia/llama-3.1-nemotron-70b-instruct", "label": "NVIDIA Nemotron 70B Instruct"},
-    {"provider": "nvidia", "model_id": "nvidia/llama-3.3-nemotron-super-49b-v1", "label": "NVIDIA Nemotron Super 49B"},
-    {"provider": "nvidia", "model_id": "deepseek-ai/deepseek-r1", "label": "NVIDIA DeepSeek R1"},
-    {"provider": "nvidia", "model_id": "qwen/qwen2.5-coder-32b-instruct", "label": "NVIDIA Qwen2.5 Coder 32B"},
-    {"provider": "nvidia", "model_id": "meta/llama-3.1-8b-instruct", "label": "NVIDIA Llama 3.1 8B Instruct"},
+    # Qwen
+    {"provider": "nvidia", "model_id": "qwen/qwen3.5-397b-a17b", "label": "NVIDIA Qwen3.5 397B"},
+    {"provider": "nvidia", "model_id": "qwen/qwen3-next-80b-a3b-instruct", "label": "NVIDIA Qwen3-Next 80B"},
+    # DeepSeek
+    {"provider": "nvidia", "model_id": "deepseek-ai/deepseek-v4-pro", "label": "NVIDIA DeepSeek V4 Pro"},
+    {"provider": "nvidia", "model_id": "deepseek-ai/deepseek-v4-flash", "label": "NVIDIA DeepSeek V4 Flash"},
+    # MiniMax
+    {"provider": "nvidia", "model_id": "minimaxai/minimax-m3", "label": "NVIDIA MiniMax M3"},
+    {"provider": "nvidia", "model_id": "minimaxai/minimax-m2.7", "label": "NVIDIA MiniMax M2.7"},
+    # Moonshot Kimi
+    {"provider": "nvidia", "model_id": "moonshotai/kimi-k2.6", "label": "NVIDIA Kimi K2.6"},
+    # Zhipu GLM
+    {"provider": "nvidia", "model_id": "z-ai/glm-5.1", "label": "NVIDIA GLM-5.1"},
+    # Mistral
+    {"provider": "nvidia", "model_id": "mistralai/mistral-large-3-675b-instruct-2512", "label": "NVIDIA Mistral Large 3 675B"},
+    {"provider": "nvidia", "model_id": "mistralai/mixtral-8x22b-v0.1", "label": "NVIDIA Mixtral 8x22B"},
+    # OpenAI open-weight
+    {"provider": "nvidia", "model_id": "openai/gpt-oss-120b", "label": "NVIDIA GPT-OSS 120B"},
+    {"provider": "nvidia", "model_id": "openai/gpt-oss-20b", "label": "NVIDIA GPT-OSS 20B"},
     # OpenCode Zen: live-discovered via /v1/models; these seed sensible defaults
     # and a fallback when discovery is unavailable.
     {"provider": "opencode-zen", "model_id": "grok-code", "label": "OpenCode Zen Grok Code Fast"},

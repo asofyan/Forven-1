@@ -68,12 +68,37 @@ def test_registered_in_api_core():
     assert all(m["model_id"] and m["label"] for m in nvidia_catalog)
 
 
+def test_top_open_source_models_pinned():
+    # The curated NVIDIA catalog must offer the top open-source families as
+    # selections — including the MiniMax / Qwen / Kimi the operator asked for.
+    catalog_ids = {m["model_id"] for m in ac._AGENT_MODEL_CATALOG if m["provider"] == "nvidia"}
+    for expected in (
+        "meta/llama-3.3-70b-instruct",
+        "meta/llama-4-maverick-17b-128e-instruct",
+        "qwen/qwen3.5-397b-a17b",
+        "minimaxai/minimax-m3",
+        "moonshotai/kimi-k2.6",
+        "deepseek-ai/deepseek-v4-pro",
+        "z-ai/glm-5.1",
+        "mistralai/mistral-large-3-675b-instruct-2512",
+        "openai/gpt-oss-120b",
+    ):
+        assert expected in catalog_ids, f"missing curated NVIDIA model: {expected}"
+    # Guard against regressing to ids that no longer exist on the live endpoint.
+    assert "deepseek-ai/deepseek-r1" not in catalog_ids
+    assert "qwen/qwen2.5-coder-32b-instruct" not in catalog_ids
+
+
 def test_discovery_belong_rules():
-    # chat / instruct / reasoning families are kept
+    # chat / instruct / reasoning families are kept (across top OSS vendors)
     assert ac._discovery_model_should_belong("nvidia", "meta/llama-3.3-70b-instruct")
     assert ac._discovery_model_should_belong("nvidia", "nvidia/llama-3.1-nemotron-70b-instruct")
-    assert ac._discovery_model_should_belong("nvidia", "deepseek-ai/deepseek-r1")
-    assert ac._discovery_model_should_belong("nvidia", "qwen/qwen2.5-coder-32b-instruct")
+    assert ac._discovery_model_should_belong("nvidia", "deepseek-ai/deepseek-v4-pro")
+    assert ac._discovery_model_should_belong("nvidia", "qwen/qwen3.5-397b-a17b")
+    assert ac._discovery_model_should_belong("nvidia", "minimaxai/minimax-m3")
+    assert ac._discovery_model_should_belong("nvidia", "moonshotai/kimi-k2.6")
+    assert ac._discovery_model_should_belong("nvidia", "z-ai/glm-5.1")
+    assert ac._discovery_model_should_belong("nvidia", "openai/gpt-oss-120b")
     # non-chat modalities are dropped (not tool-callable agent models)
     assert not ac._discovery_model_should_belong("nvidia", "nvidia/nv-embedqa-e5-v5")
     assert not ac._discovery_model_should_belong("nvidia", "nvidia/rerank-qa-mistral-4b")
