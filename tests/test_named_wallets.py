@@ -357,6 +357,33 @@ class TestExchangeActions:
         assert subaccounts.can_transfer_funds() is False
 
 
+class TestStopFlatten:
+    """LIVE-STOP-1: stopping a live bot flattens its live positions."""
+
+    def test_flatten_noop_for_paper_bot(self, forven_db):
+        from forven.bot_factory.manager import BotManager
+        from forven.db import get_bot
+
+        bot_id = _make_bot()
+        mgr = BotManager.get_instance()
+        assert mgr._flatten_live_positions_on_stop(get_bot(bot_id), reason="x") == []
+
+    def test_flatten_calls_live_exec_for_live_bot(self, forven_db):
+        from forven.bot_factory.manager import BotManager
+        from forven.db import get_bot, set_bot_execution_mode
+
+        bot_id = _make_bot(stop_loss_pct=2.0)
+        set_bot_execution_mode(bot_id, "live")
+        mgr = BotManager.get_instance()
+        sentinel = [{"state": "closed", "trade_id": "E1"}]
+        with patch(
+            "forven.bot_factory.live_exec.flatten_live_positions", return_value=sentinel
+        ) as m:
+            out = mgr._flatten_live_positions_on_stop(get_bot(bot_id), reason="bot_stopped")
+        assert out == sentinel
+        assert m.called
+
+
 class TestReconcileTimeoutScaling:
     def test_budget_scales_with_wallet_count(self, forven_db):
         """One more registered wallet = one more sequential reconcile pass.

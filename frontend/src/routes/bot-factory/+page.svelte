@@ -77,8 +77,18 @@
 		confirmStop = null;
 		setBotBusy(id, true);
 		try {
-			await stopBot(id);
-			addToast('Bot stopped', 'success');
+			const res = await stopBot(id);
+			const flattened = res.flattened ?? [];
+			const closed = flattened.filter((f) => f.state === 'closed').length;
+			const pending = flattened.filter((f) => f.state === 'pending').length;
+			const failed = flattened.filter((f) => f.state === 'failed').length;
+			if (failed > 0) {
+				addToast(`Bot stopped — ${failed} live close(s) FAILED, check positions`, 'error', undefined, 12_000);
+			} else if (closed || pending) {
+				addToast(`Bot stopped — ${closed + pending} live position(s) closed`, 'success', undefined, 8000);
+			} else {
+				addToast('Bot stopped', 'success');
+			}
 			await load();
 		} catch (e: any) {
 			addToast(`Stop failed: ${e.message}`, 'error');
@@ -339,7 +349,8 @@
 					<div class="mt-auto flex gap-1.5 border-t border-[#1a1a1a] px-4 py-2.5 text-[10px]">
 						{#if status === 'running'}
 							{#if confirmStop === bot.id}
-								<button on:click={() => handleStop(bot.id)} disabled={isBusy} aria-busy={isBusy} class="terminal-button-danger px-2 py-1 text-[10px]">{isBusy ? 'Stopping…' : 'Confirm'}</button>
+								{@const closesLive = isLive && (bot.open_positions ?? 0) > 0}
+								<button on:click={() => handleStop(bot.id)} disabled={isBusy} aria-busy={isBusy} title={closesLive ? `Closes ${bot.open_positions} live position(s) on Hyperliquid` : ''} class="terminal-button-danger px-2 py-1 text-[10px]">{isBusy ? 'Stopping…' : closesLive ? `Confirm + Close ${bot.open_positions}` : 'Confirm'}</button>
 								<button on:click={() => (confirmStop = null)} disabled={isBusy} class="terminal-button px-2 py-1 text-[10px]">Cancel</button>
 							{:else}
 								<button on:click={() => (confirmStop = bot.id)} disabled={isBusy} class="terminal-button-danger px-2 py-1 text-[10px]">Stop</button>

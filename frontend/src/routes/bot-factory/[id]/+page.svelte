@@ -120,6 +120,11 @@
 	// trades (from the daemon snapshot); paper shows the simulated sandbox
 	// equity. Drawdown math above stays on the session-scoped currentEquity.
 	$: liveWalletEquity = positions?.live_wallet_equity ?? null;
+	// Live positions that stopping will close (reduce-only) — drives the
+	// stop-confirmation warning so closing real positions is never a surprise.
+	$: liveOpenCount = (positions?.open_positions ?? []).filter(
+		(p) => p.execution_type === 'live'
+	).length;
 
 	function statusColor(s: string): string {
 		if (s === 'running') return 'text-emerald-400';
@@ -169,8 +174,21 @@
 		confirmStop = false;
 		if (!botId) return;
 		try {
-			await stopBot(botId);
-			addToast('Bot stopped', 'success');
+			const res = await stopBot(botId);
+			const flattened = res.flattened ?? [];
+			const closed = flattened.filter((f) => f.state === 'closed').length;
+			const pending = flattened.filter((f) => f.state === 'pending').length;
+			const failed = flattened.filter((f) => f.state === 'failed').length;
+			if (failed > 0) {
+				addToast(`Bot stopped — ${failed} live close(s) FAILED, check positions`, 'error', undefined, 12_000);
+			} else if (closed || pending) {
+				const parts = [];
+				if (closed) parts.push(`${closed} position(s) closed`);
+				if (pending) parts.push(`${pending} pending exchange reconcile`);
+				addToast(`Bot stopped — ${parts.join(', ')}`, 'success', undefined, 8000);
+			} else {
+				addToast('Bot stopped', 'success');
+			}
 			await load();
 		} catch (e: any) {
 			addToast(`Stop failed: ${e.message}`, 'error');
@@ -466,7 +484,9 @@
 				<div class="flex gap-2">
 					{#if isRunning}
 						{#if confirmStop}
-							<button on:click={handleStop} class="terminal-button-danger text-xs">Confirm Stop</button>
+							<button on:click={handleStop} class="terminal-button-danger text-xs">
+								{isLiveMode && liveOpenCount > 0 ? `Confirm Stop + Close ${liveOpenCount}` : 'Confirm Stop'}
+							</button>
 							<button on:click={() => (confirmStop = false)} class="terminal-button text-xs">Cancel</button>
 						{:else}
 							<button on:click={() => (confirmStop = true)} class="terminal-button-danger text-xs">Stop</button>
@@ -488,6 +508,13 @@
 				</div>
 			</div>
 		</div>
+
+		{#if confirmStop && isLiveMode && liveOpenCount > 0}
+			<div class="mb-6 border border-red-900 bg-red-500/5 px-4 py-3 text-xs text-red-400">
+				Stopping will close {liveOpenCount} open live position{liveOpenCount === 1 ? '' : 's'} on Hyperliquid
+				({bot.live_wallet || 'master'}) with reduce-only market order{liveOpenCount === 1 ? '' : 's'}. This is real and irreversible — confirm to proceed.
+			</div>
+		{/if}
 
 		{#if goLiveOpen && !isRunning && !isLiveMode}
 			<div class="mb-6 border border-red-900 bg-red-500/5 p-4">
@@ -567,12 +594,15 @@
 			</div>
 		{/if}
 
-		<!-- Stats bar -->
-		<div class="mb-6 grid grid-cols-2 gap-px border border-[#222] bg-[#222] md:grid-cols-6">
-			<div class="bg-[#050505] px-4 py-3">
-				<div class="text-[10px] uppercase tracking-wider text-[#666]">Capital</div>
-				<div class="mt-1 text-base font-bold text-white">${bot.capital_allocation?.toLocaleString()}</div>
-			</div>
+		<!-- Stats bar. Paper shows Capital (the sim sandbox); live drops it — the
+		     real Wallet balance is the only meaningful figure there. -->
+		<div class="mb-6 grid grid-cols-2 gap-px border border-[#222] bg-[#222] {isLiveMode ? 'md:grid-cols-5' : 'md:grid-cols-6'}">
+			{#if !isLiveMode}
+				<div class="bg-[#050505] px-4 py-3">
+					<div class="text-[10px] uppercase tracking-wider text-[#666]">Capital</div>
+					<div class="mt-1 text-base font-bold text-white">${bot.capital_allocation?.toLocaleString()}</div>
+				</div>
+			{/if}
 			<div class="bg-[#050505] px-4 py-3">
 				<div class="text-[10px] uppercase tracking-wider text-[#666]">{isLiveMode ? 'Wallet balance' : 'Equity'}</div>
 				{#if isLiveMode}

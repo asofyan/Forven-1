@@ -122,7 +122,17 @@ export async function startBot(id: string): Promise<{ status: string; pid: numbe
 	return fetchApi(`/bot-factory/bots/${id}/start`, { method: 'POST' });
 }
 
-export async function stopBot(id: string): Promise<{ status: string }> {
+export interface BotFlattenResult {
+	state: 'closed' | 'pending' | 'failed' | 'noop';
+	trade_id?: string;
+	fill_price?: number;
+	net_pnl?: number;
+	message?: string;
+}
+
+/** Stopping a LIVE bot flattens its open live positions (reduce-only closes);
+ * `flattened` reports the outcome per position. Paper bots return []. */
+export async function stopBot(id: string): Promise<{ status: string; flattened?: BotFlattenResult[] }> {
 	return fetchApi(`/bot-factory/bots/${id}/stop`, { method: 'POST' });
 }
 

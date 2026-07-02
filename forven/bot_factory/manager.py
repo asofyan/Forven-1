@@ -350,12 +350,51 @@ class BotManager:
         set_bot_status(bot_id, "stopped")
 
         bot = get_bot(bot_id)
+        # LIVE-STOP-1: a stopped bot no longer manages its positions, so leaving
+        # a REAL exchange position open (unmanaged) is unsafe and surprising.
+        # Flatten the bot's live positions now — the subprocess is already dead,
+        # so it can't race the reduce-only closes. Paper bots have no live rows,
+        # so this is a no-op for them.
+        flattened = self._flatten_live_positions_on_stop(bot, reason="bot_stopped")
+
+        summary = f"Bot '{(bot or {}).get('name', bot_id)}' stopped"
+        if flattened:
+            closed = sum(1 for r in flattened if r.get("state") == "closed")
+            pending = sum(1 for r in flattened if r.get("state") == "pending")
+            parts = []
+            if closed:
+                parts.append(f"{closed} live position(s) closed")
+            if pending:
+                parts.append(f"{pending} close(s) pending exchange reconcile")
+            if parts:
+                summary += " — " + ", ".join(parts)
         log_activity(
-            "info", "bot_factory",
-            f"Bot '{(bot or {}).get('name', bot_id)}' stopped",
-            {"bot_id": bot_id},
+            "info", "bot_factory", summary,
+            {"bot_id": bot_id, "flattened": flattened},
         )
-        return {"status": "stopped"}
+        return {"status": "stopped", "flattened": flattened}
+
+    def _flatten_live_positions_on_stop(self, bot: dict | None, *, reason: str) -> list[dict]:
+        """Reduce-only close every OPEN live position the bot holds. Best-effort:
+        a single failed close never blocks the stop, and the resting exchange
+        stop still protects a position whose close is pending reconcile."""
+        if not bot or str(bot.get("execution_mode") or "paper").strip().lower() != "live":
+            return []
+        try:
+            from forven.bot_factory.live_exec import flatten_live_positions
+
+            results = flatten_live_positions(bot, reason=reason)
+            if results:
+                logger.warning(
+                    "Bot %s stop flattened live positions: %s", bot.get("id"), results,
+                )
+            return results
+        except Exception as exc:
+            logger.error(
+                "Bot %s stop: live-position flatten FAILED: %s", (bot or {}).get("id"), exc,
+                exc_info=True,
+            )
+            return [{"state": "failed", "message": str(exc)}]
 
     def kill_all(self) -> dict:
         """Stop all running bots immediately."""
