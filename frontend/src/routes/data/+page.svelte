@@ -32,8 +32,12 @@
 		getBackfillStatus,
 		triggerBackfill,
 		cancelBackfill,
+		getCollectionHealth,
+		getDataHealth,
 		type DataUniverse,
 		type BackfillStatus,
+		type CollectionHealth,
+		type DataHealth,
 	} from '$lib/api/data';
 	import { dataFetchState, clearDataFetchTask } from '$lib/stores/dataFetch';
 	import { page } from '$app/stores';
@@ -178,12 +182,22 @@
 
 	async function loadData(preferred?: { symbol: string; timeframe: string }): Promise<void> {
 		const failures: string[] = [];
-		const [settingsResult, datasetsResult, runsResult, dataEngineResult] = await Promise.allSettled([
+		const [settingsResult, datasetsResult, runsResult, dataEngineResult, healthResult, lakeResult, universeResult] = await Promise.allSettled([
 			getSettings(),
 			getDatasets(),
 			getIngestionRuns({ limit: 500 }),
 			getDataEngineStatus(),
+			getCollectionHealth(),
+			getDataHealth(),
+			getDataUniverse(),
 		]);
+
+		collectionHealth = healthResult.status === 'fulfilled' ? healthResult.value : null;
+		lakeHealth = lakeResult.status === 'fulfilled' ? lakeResult.value : null;
+		if (universeResult.status === 'fulfilled') {
+			universe = universeResult.value;
+			opsLoaded = true;
+		}
 
 		if (settingsResult.status === 'fulfilled') {
 			const settings = settingsResult.value as ForvenSettings;
@@ -376,6 +390,35 @@
 	$: dataEngineCandleRemaining = dataEnginePlan
 		? dataEnginePlan.tasks.filter((t) => t.stream === 'candles').length
 		: 0;
+
+	// --- Overview trust strip ---
+	let collectionHealth: CollectionHealth | null = null;
+	let lakeHealth: DataHealth | null = null;
+
+	function formatBytes(bytes: number | null | undefined): string {
+		const value = Number(bytes) || 0;
+		if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(1)} GB`;
+		if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(0)} MB`;
+		return `${(value / 1024).toFixed(0)} KB`;
+	}
+
+	function scoreClass(score: number): string {
+		if (score >= 90) return 'text-green-400';
+		if (score >= 70) return 'text-yellow-400';
+		return 'text-red-400';
+	}
+
+	// Venue split from the stamped market identity of each series.
+	$: venueSplit = datasets.reduce(
+		(acc, dataset) => {
+			const market = String(dataset.market || 'unstamped').toLowerCase();
+			if (market === 'perp') acc.perp += 1;
+			else if (market === 'spot') acc.spot += 1;
+			else acc.other += 1;
+			return acc;
+		},
+		{ perp: 0, spot: 0, other: 0 }
+	);
 
 	// --- Research universe + deep-history operations (maintenance tab) ---
 	let universe: DataUniverse | null = null;
@@ -602,22 +645,49 @@
 	</div>
 
 	{#if activeTab === 'overview'}
-	<section class="grid grid-cols-1 md:grid-cols-4 gap-3">
+	<section class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Aggregate collection health across every stream (OHLCV, funding, OI, basis, IV, …)">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Data Health</div>
+			{#if collectionHealth}
+				<div class="text-lg font-semibold mt-1 font-mono {scoreClass(collectionHealth.score)}">{collectionHealth.score}<span class="text-[11px] text-gray-600">/100</span></div>
+			{:else}
+				<div class="text-lg font-semibold mt-1 text-gray-600">--</div>
+			{/if}
+		</div>
 		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
 			<div class="text-[10px] uppercase tracking-wider text-gray-500">Datasets</div>
 			<div class="text-lg font-semibold mt-1">{datasets.length}</div>
+			<div class="text-[10px] text-gray-500 mt-0.5">{totalBars.toLocaleString()} bars</div>
 		</div>
-		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
-			<div class="text-[10px] uppercase tracking-wider text-gray-500">Total Rows</div>
-			<div class="text-lg font-semibold mt-1">{totalBars.toLocaleString()}</div>
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Total parquet lake size on disk">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Lake Size</div>
+			<div class="text-lg font-semibold mt-1">{lakeHealth ? formatBytes(lakeHealth.total_parquet_bytes) : '--'}</div>
+			<div class="text-[10px] text-gray-500 mt-0.5">{lakeHealth ? `${lakeHealth.total_parquet_files.toLocaleString()} files` : ''}</div>
+		</div>
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Venue identity of stored series (perp = the venue semantics we execute on). Unstamped = legacy files; run the market reconcile.">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Venue Split</div>
+			<div class="text-sm font-semibold mt-1">
+				<span class="text-cyan-300">{venueSplit.perp} perp</span>
+				<span class="text-gray-600"> · </span>
+				<span class="text-amber-300">{venueSplit.spot} spot</span>
+			</div>
+			{#if venueSplit.other > 0}
+				<div class="text-[10px] text-gray-500 mt-0.5">{venueSplit.other} unstamped / other</div>
+			{/if}
+		</div>
+		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3" title="Symbol registry: perps listed on the venue vs the research universe planned for deep history">
+			<div class="text-[10px] uppercase tracking-wider text-gray-500">Universe</div>
+			{#if universe}
+				<div class="text-sm font-semibold mt-1">{universe.plan.length} planned<span class="text-gray-600"> / </span>{universe.active} listed</div>
+				<div class="text-[10px] text-gray-500 mt-0.5">{universe.delisted} delisted kept</div>
+			{:else}
+				<div class="text-lg font-semibold mt-1 text-gray-600">--</div>
+			{/if}
 		</div>
 		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
 			<div class="text-[10px] uppercase tracking-wider text-gray-500">Latest Download</div>
 			<div class="text-sm font-semibold mt-1">{latestDatasetLabel}</div>
-		</div>
-		<div class="border border-[#222] rounded bg-[#0a0a0a] p-3">
-			<div class="text-[10px] uppercase tracking-wider text-gray-500">Markets</div>
-			<div class="text-sm font-semibold mt-1">{availableMarketLabel}</div>
+			<div class="text-[10px] text-gray-500 mt-0.5">{availableMarketLabel}</div>
 		</div>
 	</section>
 

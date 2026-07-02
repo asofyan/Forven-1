@@ -8,6 +8,8 @@
 		triggerBackfill, getBackfillStatus,
 	} from '$lib/api';
 	import type { Dataset, DataQualityExtended, DataSource, CSVPreview, StreamsResponse, BackfillStatus } from '$lib/api';
+	import { getQualityGate, type QualityGateVerdict } from '$lib/api/data';
+	import { getDatasetVersions } from '$lib/api';
 	import SymbolSearch from '$lib/components/research/SymbolSearch.svelte';
 	import { ORDERED_TIMEFRAME_VALUES } from '$lib/config/timeframes';
 	import {
@@ -117,6 +119,48 @@
 
 	$: if (mode === 'details' && selectedDataset) {
 		void loadBackfillStatus();
+	}
+
+	// Series fitness: the gauntlet's fit-to-score verdict + restatement history
+	// (from the point-in-time revision log). Loaded once per selected series.
+	let gate: QualityGateVerdict | null = null;
+	let gateLoading = false;
+	let restatements: { count: number; latest: string | null } | null = null;
+	let _fitnessKey = '';
+
+	async function loadFitness(symbol: string, timeframe: string) {
+		gate = null;
+		restatements = null;
+		gateLoading = true;
+		try {
+			gate = await getQualityGate(symbol, timeframe);
+		} catch {
+			gate = null;
+		} finally {
+			gateLoading = false;
+		}
+		try {
+			const versions = await getDatasetVersions({ symbol, timeframe, limit: 50 });
+			const restated = versions.filter((v) => v.source === 'restatement');
+			restatements = { count: restated.length, latest: restated[0]?.created_at ?? null };
+		} catch {
+			restatements = null;
+		}
+	}
+
+	$: if (mode === 'details' && selectedDataset) {
+		const key = `${selectedDataset.symbol}|${selectedDataset.timeframe}`;
+		if (key !== _fitnessKey) {
+			_fitnessKey = key;
+			void loadFitness(selectedDataset.symbol, selectedDataset.timeframe);
+		}
+	}
+
+	function marketChip(market: string | undefined): { label: string; cls: string } {
+		const m = String(market || 'unstamped').toLowerCase();
+		if (m === 'perp') return { label: 'PERP', cls: 'border-cyan-800 text-cyan-300' };
+		if (m === 'spot') return { label: 'SPOT', cls: 'border-amber-800 text-amber-300' };
+		return { label: m.toUpperCase(), cls: 'border-[#333] text-gray-500' };
 	}
 
 	function streamStatusColor(status: string): string {
@@ -447,9 +491,16 @@
 				<div class="flex items-start justify-between gap-2">
 					<div>
 						<h3 class="text-lg font-bold text-white">{selectedDataset.symbol}</h3>
-						<div class="flex gap-2 text-xs text-gray-500 mt-1">
+						<div class="flex flex-wrap items-center gap-2 text-xs text-gray-500 mt-1">
 							<span class="bg-[#111] px-1 rounded">{selectedDataset.timeframe}</span>
 							<span class="bg-[#111] px-1 rounded uppercase">{selectedDataset.source}</span>
+							{#if selectedDataset.market !== undefined}
+								{@const chip = marketChip(selectedDataset.market)}
+								<span
+									class="border px-1 rounded text-[10px] font-mono {chip.cls}"
+									title="Venue identity of the stored bars (from the write path's market stamp). UNSTAMPED = legacy file — run the market reconcile."
+								>{chip.label}</span>
+							{/if}
 						</div>
 					</div>
 					<button
@@ -459,6 +510,41 @@
 					>
 						VIEW DATA
 					</button>
+				</div>
+
+				<!-- Gauntlet fitness: the exact data-gate verdict a strategy backtest
+				     on this series faces (fail-closed on gaps/staleness). -->
+				<div class="bg-[#111] border {gate ? (gate.ok ? 'border-green-900/60' : 'border-red-900/60') : 'border-[#222]'} p-2 space-y-1">
+					<div class="flex items-center justify-between">
+						<span class="text-[10px] text-gray-500 uppercase tracking-wider">Gauntlet fitness</span>
+						{#if gateLoading}
+							<span class="text-[10px] font-mono text-gray-500 animate-pulse">checking…</span>
+						{:else if gate}
+							<span class="text-[10px] font-bold tracking-widest {gate.ok ? 'text-green-400' : 'text-red-400'}">
+								{gate.ok ? 'FIT TO SCORE' : 'GATE BLOCKED'}
+							</span>
+						{:else}
+							<span class="text-[10px] font-mono text-gray-600">unavailable</span>
+						{/if}
+					</div>
+					{#if gate && !gate.ok}
+						<ul class="text-[11px] text-red-300/90 space-y-0.5">
+							{#each gate.reasons as reason}
+								<li class="font-mono truncate" title={reason}>• {reason}</li>
+							{/each}
+						</ul>
+						<div class="text-[10px] text-gray-500">Verdicts on this series are deferred until self-healing repairs it.</div>
+					{/if}
+					{#if restatements}
+						<div class="text-[10px] text-gray-500">
+							{#if restatements.count > 0}
+								{restatements.count} restatement event{restatements.count === 1 ? '' : 's'} in the revision log
+								{#if restatements.latest}(latest {new Date(restatements.latest).toLocaleDateString()}){/if}
+							{:else}
+								No restatements recorded — series has never been rewritten under a verdict.
+							{/if}
+						</div>
+					{/if}
 				</div>
 
 				{#if qualityLoading}

@@ -1152,6 +1152,12 @@ def _dataset_from_file(path: Path, symbol: str, timeframe: str) -> dict[str, Any
     start = _to_iso(pd.Timestamp(start_ms, unit="ms", tz="UTC")) if start_ms is not None else None
     end = _to_iso(pd.Timestamp(end_ms, unit="ms", tz="UTC")) if end_ms is not None else None
 
+    # Venue identity: the stamped forven_market (perp/spot) from the write
+    # path — distinct from market_type (asset-class bucket). "unstamped" =
+    # legacy file written before market stamping; the reconcile tool fixes it.
+    market_raw = keyvals.get(b"forven_market")
+    market = market_raw.decode("utf-8", errors="ignore") if market_raw else "unstamped"
+
     asset_class = classify_dataset_asset_class(symbol, source_name)
     return {
         "symbol": symbol_to_fs(symbol),
@@ -1162,6 +1168,7 @@ def _dataset_from_file(path: Path, symbol: str, timeframe: str) -> dict[str, Any
         "row_count": rows,
         "asset_class": asset_class,
         "market_type": dataset_market_type(asset_class),
+        "market": market,
     }
 
 

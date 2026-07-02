@@ -154,6 +154,12 @@ def get_quality_report(symbol: str, timeframe: str):
     return data_domain.get_quality_report(symbol=symbol, timeframe=timeframe)
 
 
+@router.get("/api/data/quality-gate")
+def get_quality_gate(symbol: str, timeframe: str, window_days: int | None = None):
+    """The gauntlet data-gate verdict for a series (fit to score / blocked + reasons)."""
+    return data_domain.get_quality_gate(symbol=symbol, timeframe=timeframe, window_days=window_days)
+
+
 @router.get("/api/data/versions")
 def get_dataset_versions(symbol: str | None = None, timeframe: str | None = None, limit: int = 50):
     """Dataset version history backed by the point-in-time revision log. The

@@ -1091,6 +1091,21 @@ def get_dataset_versions(symbol: str | None = None, timeframe: str | None = None
     return rows[: max(1, int(limit or 50))]
 
 
+def get_quality_gate(symbol: str, timeframe: str, window_days: int | None = None) -> dict:
+    """The exact fitness verdict the gauntlet's data gate applies before
+    scoring a strategy on this series (completeness, interior gaps, freshness,
+    listing window). Surfaces WHY a series is blocked in the UI instead of the
+    operator discovering it via a stalled gauntlet step."""
+    import pandas as pd
+
+    from forven.dataeng.quality_gate import check_series_quality
+
+    window_start = None
+    if window_days and int(window_days) > 0:
+        window_start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(window_days))
+    return check_series_quality(symbol, timeframe, window_start=window_start).as_dict()
+
+
 def get_data_health():
     """Return merged DB/parquet health + per-stream freshness snapshot.
 

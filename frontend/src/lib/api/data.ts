@@ -1103,6 +1103,26 @@ export async function cancelUniverseSeed(): Promise<{ status: string }> {
 	return fetchApi('/data/universe/seed/cancel', { method: 'POST' });
 }
 
+// ---------------------------------------------------------------------------
+// Data-quality gate (the gauntlet's fit-to-score verdict for a series)
+// ---------------------------------------------------------------------------
+
+export interface QualityGateVerdict {
+	ok: boolean;
+	reasons: string[];
+	details: Record<string, unknown>;
+}
+
+export async function getQualityGate(
+	symbol: string,
+	timeframe: string,
+	windowDays?: number
+): Promise<QualityGateVerdict> {
+	const params = new URLSearchParams({ symbol, timeframe });
+	if (windowDays) params.set('window_days', String(windowDays));
+	return fetchApi(`/data/quality-gate?${params}`);
+}
+
 export interface DataCoverageEntry {
 	rows: number;
 	from: string;
