@@ -1477,6 +1477,56 @@ def _candle_breaker(exchange_id: str):
         return breaker
 
 
+# ---------------------------------------------------------------------------
+# Venue-partitioned series (edge-data-expansion Run 5). A SECOND venue's
+# candles for the same symbol must not collide with the primary lake path, so
+# they live under the source=/market= partitioned layout the dataeng catalog
+# already knows how to parse:
+#   data/ohlcv/source=hyperliquid/market=perp/{SYMBOL}/{tf}.parquet
+# Primary-lake tooling ignores these directories (no *.parquet directly under
+# the source= dir), while catalog.scan_lake picks them up with the correct
+# source/market identity.
+# ---------------------------------------------------------------------------
+
+
+def venue_parquet_path(source: str, market: str, symbol: str, timeframe: str) -> Path:
+    src = _assert_safe_dataset_component("source", str(source or "").strip().lower())
+    mkt = _assert_safe_dataset_component("market", str(market or "").strip().lower())
+    fs_symbol = _assert_safe_dataset_component("symbol", symbol_to_fs(symbol))
+    tf = _assert_safe_dataset_component("timeframe", timeframe)
+    path = (DATA_DIR / f"source={src}" / f"market={mkt}" / fs_symbol / f"{tf}.parquet").resolve()
+    if not path.is_relative_to(DATA_DIR.resolve()):
+        raise ValueError(f"venue dataset path escapes the data directory: {source!r}/{symbol!r}")
+    return path
+
+
+def load_venue_frame(source: str, market: str, symbol: str, timeframe: str) -> pd.DataFrame | None:
+    """Normalized read of a venue series (None when absent)."""
+    path = venue_parquet_path(source, market, symbol, timeframe)
+    if not path.exists():
+        return None
+    if not _using_pyarrow():
+        _require_pyarrow_for_lake()
+    return _normalize_ohlcv_frame(pq.read_table(path).to_pandas())
+
+
+def save_venue_frame(df: pd.DataFrame, source: str, market: str, symbol: str, timeframe: str) -> int:
+    """Merge + atomically persist a venue series with the same write-boundary
+    invariants as the primary lake (normalize, OHLC sanity, closed bars only).
+    Returns rows added."""
+    path = venue_parquet_path(source, market, symbol, timeframe)
+    lock = _get_dataset_lock(f"{source}::{market}::{symbol_to_fs(symbol)}", timeframe)
+    with lock:
+        existing = load_venue_frame(source, market, symbol, timeframe)
+        merged = merge_and_dedup(existing, df)
+        merged = _reject_invalid_ohlc(merged, symbol, timeframe)
+        merged = _drop_unclosed_bars(merged, _timeframe_to_ms(timeframe), int(time.time() * 1000))
+        if merged is None or merged.empty:
+            return 0
+        _write_lake_parquet(merged, path, symbol=symbol, timeframe=timeframe, source=source)
+        return max(0, len(merged) - (len(existing) if existing is not None else 0))
+
+
 def _resolve_ohlcv_target(exchange_id: str, symbol: str) -> tuple[Any, str, str]:
     """(exchange, ccxt_symbol, source_id) for an OHLCV fetch.
 

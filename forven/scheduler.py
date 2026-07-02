@@ -64,6 +64,9 @@ _DEFAULT_JOB_IDS = {
     "forven-data-fng-collect",
     "forven-data-macro-collect",
     "forven-data-btcdom-collect",
+    "forven-data-basis-collect",
+    "forven-data-iv-collect",
+    "forven-data-hl-venue-collect",
     "forven-quant-skills-consolidation",
     "forven-stale-triage",
     "forven-auto-intake",
@@ -112,6 +115,9 @@ _DATA_MANAGER_TIMEOUT_DEFAULTS = {
     "data_manager_collect_fng": 120.0,
     "data_manager_collect_macro": 180.0,
     "data_manager_collect_btcdom": 120.0,
+    "data_manager_collect_basis": 120.0,
+    "data_manager_collect_iv": 120.0,
+    "hl_venue_collect": 180.0,
 }
 
 _DATA_MANAGER_JOB_PAYLOAD_DEFAULTS: dict[str, dict[str, object]] = {
@@ -131,6 +137,9 @@ _DATA_MANAGER_JOB_PAYLOAD_DEFAULTS: dict[str, dict[str, object]] = {
     "forven-data-fng-collect": {"kind": "data_manager_collect_fng", "timeout_seconds": 120},
     "forven-data-macro-collect": {"kind": "data_manager_collect_macro", "timeout_seconds": 180},
     "forven-data-btcdom-collect": {"kind": "data_manager_collect_btcdom", "timeout_seconds": 120},
+    "forven-data-basis-collect": {"kind": "data_manager_collect_basis", "timeout_seconds": 120},
+    "forven-data-iv-collect": {"kind": "data_manager_collect_iv", "timeout_seconds": 120},
+    "forven-data-hl-venue-collect": {"kind": "hl_venue_collect", "timeout_seconds": 180},
 }
 
 # Jobs that can be deferred when a user is actively running tests.
@@ -1878,6 +1887,42 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             )
             return "ok", None
 
+        # DataManager — premium-index basis collection (perp basis vs index)
+        if kind == "data_manager_collect_basis":
+            from forven.data_manager import data_manager
+            await _run_sync_job(
+                data_manager.collect_basis,
+                timeout_seconds=_coerce_timeout_seconds(
+                    payload.get("timeout_seconds"),
+                    _DATA_MANAGER_TIMEOUT_DEFAULTS["data_manager_collect_basis"],
+                ),
+            )
+            return "ok", None
+
+        # DataManager — Deribit DVOL implied volatility (BTC/ETH)
+        if kind == "data_manager_collect_iv":
+            from forven.data_manager import data_manager
+            await _run_sync_job(
+                data_manager.collect_iv,
+                timeout_seconds=_coerce_timeout_seconds(
+                    payload.get("timeout_seconds"),
+                    _DATA_MANAGER_TIMEOUT_DEFAULTS["data_manager_collect_iv"],
+                ),
+            )
+            return "ok", None
+
+        # Hyperliquid venue candles for the traded subset (venue-fidelity series)
+        if kind == "hl_venue_collect":
+            from forven.dataeng.venue import collect_hl_venue_series
+            await _run_sync_job(
+                collect_hl_venue_series,
+                timeout_seconds=_coerce_timeout_seconds(
+                    payload.get("timeout_seconds"),
+                    _DATA_MANAGER_TIMEOUT_DEFAULTS["hl_venue_collect"],
+                ),
+            )
+            return "ok", None
+
         # DataManager — Fear & Greed Index collection
         if kind == "data_manager_collect_fng":
             from forven.data_manager import data_manager
@@ -3359,6 +3404,40 @@ def seed_forven_jobs():
         command="data-btcdom-collect",
         timezone_str="UTC",
         payload={"kind": "data_manager_collect_btcdom", "timeout_seconds": 120},
+    )
+
+    # 22b. Perp basis (premium index) — hourly, crypto-native strategy stream
+    add_job(
+        job_id="forven-data-basis-collect",
+        name="DataManager Basis Collect",
+        schedule_type="interval",
+        schedule_expr="3600000",
+        command="data-basis-collect",
+        timezone_str="UTC",
+        payload={"kind": "data_manager_collect_basis", "timeout_seconds": 120},
+    )
+
+    # 22c. Implied volatility (Deribit DVOL BTC/ETH) — hourly regime stream
+    add_job(
+        job_id="forven-data-iv-collect",
+        name="DataManager Implied Vol Collect",
+        schedule_type="interval",
+        schedule_expr="3600000",
+        command="data-iv-collect",
+        timezone_str="UTC",
+        payload={"kind": "data_manager_collect_iv", "timeout_seconds": 120},
+    )
+
+    # 22d. Hyperliquid venue candles for the traded subset — hourly
+    # (venue-fidelity series: measures + stores what we actually execute on)
+    add_job(
+        job_id="forven-data-hl-venue-collect",
+        name="Hyperliquid Venue Candle Collect",
+        schedule_type="interval",
+        schedule_expr="3600000",
+        command="data-hl-venue-collect",
+        timezone_str="UTC",
+        payload={"kind": "hl_venue_collect", "timeout_seconds": 180},
     )
 
     # 23. Hypothesis verdict loop — every 5 min. Without this the active-pool

@@ -3340,6 +3340,10 @@ class BacktestSubmitBody(BaseModel):
     leverage: float | None = Field(default=None, gt=0, le=125)
     lifecycle_id: str | None = None
     preserve_result: bool = False
+    # Point-in-time pin (ISO-8601): reconstruct the data as it was known at
+    # this instant from the revision log. Gauntlet stages pass their
+    # candidate's creation time so every stage scores identical data.
+    as_of: str | None = Field(default=None, max_length=64)
 
 
 class OptimizationSubmitBody(BaseModel):
@@ -9834,6 +9838,7 @@ def _persist_completed_backtest_run(
     leverage: float | None = None,
     lifecycle_id: str | None = None,
     session_id: str | None = None,
+    as_of: str | None = None,
 ) -> dict[str, object]:
     metrics = run.get("metrics")
     if not isinstance(metrics, dict):
@@ -9913,6 +9918,16 @@ def _persist_completed_backtest_run(
         "job_id": job_id,
         "dropzone_session_id": (str(session_id).strip() or None) if session_id else None,
     }
+    # Verdict auditability (edge-data-expansion Run 2): record the identity of
+    # the data this result was scored on (checksum/rows/span/market/as_of).
+    # Drift — rebuilds, venue changes, restatements — becomes DETECTABLE by
+    # comparing fingerprints instead of remembered by operators.
+    try:
+        from forven.dataeng.quality_gate import dataset_fingerprint
+
+        config_payload["data_fingerprint"] = dataset_fingerprint(asset, timeframe, as_of=as_of)
+    except Exception:
+        pass
     compact_config = {k: v for k, v in config_payload.items() if v is not None}
     lifecycle_tag = str(lifecycle_id).strip() if lifecycle_id else strategy_id
 
@@ -10760,6 +10775,7 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
             slippage_bps=body.slippage_bps,
             initial_capital=body.initial_capital,
             execution_controls=manual_execution_controls or None,
+            as_of=(str(body.as_of).strip() or None) if body.as_of else None,
         )
     except HTTPException:
         raise
@@ -10843,7 +10859,16 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
         "leverage": leverage_value,
         "job_id": job_id,
         "preserve_result": bool(body.preserve_result),
+        "as_of": (str(body.as_of).strip() or None) if body.as_of else None,
     }
+    # Verdict auditability (edge-data-expansion Run 2): stamp the identity of
+    # the data this result was scored on so drift is detectable, not remembered.
+    try:
+        from forven.dataeng.quality_gate import dataset_fingerprint
+
+        config_payload["data_fingerprint"] = dataset_fingerprint(asset, timeframe, as_of=body.as_of)
+    except Exception:
+        pass
     compact_config = {k: v for k, v in config_payload.items() if v is not None}
     # Flag when this backtest's execution profile can't be reproduced live, so the
     # operator sees it on submit AND on every history row (persisted in config).
@@ -11721,6 +11746,7 @@ def post_backtesting_run(body: dict):
                             leverage=_bt_leverage,
                             lifecycle_id=body.get("lifecycle_id"),
                             session_id=body.get("session_id"),
+                            as_of=body.get("as_of"),
                         )
                         result.setdefault("job_id", str(persisted.get("job_id") or ""))
                         result.setdefault("result_id", str(persisted.get("result_id") or ""))

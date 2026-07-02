@@ -381,6 +381,32 @@ def _available_enrichment_specs(
             {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "liq_imbalance": 0.0},
             bucket_close_shift_seconds=3600,
         ),
+        # Run 3 crypto-native streams (strategy-path, bucket-close shifted; no
+        # fill — NaN before coverage, matching the legacy joins).
+        _EnrichmentSpec(
+            "basis",
+            data_manager.BASIS_DIR / fs_symbol / "1h.parquet",
+            ("basis",),
+            ("basis",),
+            {},
+            bucket_close_shift_seconds=3600,
+        ),
+        _EnrichmentSpec(
+            "iv",
+            data_manager.VOL_DIR / "dvol_btc_1h.parquet",
+            ("iv_btc",),
+            ("iv_btc",),
+            {},
+            bucket_close_shift_seconds=3600,
+        ),
+        _EnrichmentSpec(
+            "iv",
+            data_manager.VOL_DIR / "dvol_eth_1h.parquet",
+            ("iv_eth",),
+            ("iv_eth",),
+            {},
+            bucket_close_shift_seconds=3600,
+        ),
     ]
     excluded = exclude_streams or set()
     candidates = [spec for spec in candidates if spec.stream not in excluded]

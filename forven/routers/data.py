@@ -422,6 +422,18 @@ def cancel_universe_seed():
     return data_domain.post_cancel_universe_seed()
 
 
+@router.get("/api/data/depth-calibration/{symbol}")
+def get_depth_calibration(symbol: str):
+    """Stored empirical depth profile (BV bookDepth) for a symbol."""
+    return data_domain.get_depth_calibration(symbol)
+
+
+@router.post("/api/data/depth-calibration/{symbol}")
+def compute_depth_calibration(symbol: str, days: int = 30):
+    """Compute + persist the empirical depth profile from BV bookDepth archives."""
+    return data_domain.post_compute_depth_calibration(symbol, days=days)
+
+
 @router.get("/api/data/coverage")
 def get_coverage():
     return data_domain.get_coverage()

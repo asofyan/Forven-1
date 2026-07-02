@@ -152,6 +152,58 @@ def _submit_backtest(body, *, skip_auto_trash: bool = True) -> dict[str, Any]:
     return post_backtest_submit(body, skip_auto_trash=skip_auto_trash)
 
 
+def _workflow_as_of(workflow: dict[str, Any]) -> str | None:
+    """Point-in-time pin for this candidate's stage backtests.
+
+    When ``gauntlet_as_of_pin`` is enabled (default), every stage scores the
+    data as it was known at the workflow's creation — vendor restatements or
+    lake rebuilds landing MID-GAUNTLET can no longer make stage N and stage
+    N+1 judge different data for the same candidate."""
+    try:
+        from forven.dataeng.settings import load_data_engine_settings
+
+        if not getattr(load_data_engine_settings(), "gauntlet_as_of_pin", False):
+            return None
+    except Exception:
+        return None
+    created = str(workflow.get("created_at") or "").strip()
+    return created or None
+
+
+def _data_quality_block(symbol: str, timeframe: str, required_days: int) -> dict[str, Any] | None:
+    """Fail-closed data-quality precondition for scoring a verdict.
+
+    Returns the blocked_data payload when the series is unfit (gap inside the
+    eval window, incomplete, stale), or None when scoring may proceed. Uses
+    the same drain-exempt reason code as the coverage gate: quality failures
+    are self-healing (completeness-aware catch-up + keep-alive), so the step
+    retries until the data is repaired instead of failing the strategy."""
+    try:
+        import pandas as pd
+
+        from forven.dataeng.quality_gate import check_series_quality
+
+        now = pd.Timestamp.now(tz="UTC")
+        verdict = check_series_quality(
+            symbol,
+            timeframe,
+            window_start=now - pd.Timedelta(days=max(int(required_days), 1)),
+            window_end=now,
+        )
+    except Exception as exc:  # the gate itself must never break the pipeline
+        log.warning("data-quality gate errored for %s %s: %s", symbol, timeframe, exc)
+        return None
+    if verdict.ok:
+        return None
+    return {
+        "status": "blocked_data",
+        "message": f"data quality unfit for {symbol} {timeframe}: " + "; ".join(verdict.reasons),
+        "retryable": True,
+        "reason_code": "awaiting_data_backfill",
+        "quality": verdict.as_dict(),
+    }
+
+
 def _submit_optimization(body) -> dict[str, Any]:
     from forven.api_core import post_optimization_submit
 
@@ -303,6 +355,13 @@ def run_quick_screen(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
         if symbol != raw_symbol:
             _persist_strategy_symbol(str(row["id"]), symbol)
 
+        # Coverage says "enough history exists" — the quality gate additionally
+        # refuses to SCORE on a defective series (gap inside the eval window,
+        # incomplete, stale). Fail closed; self-healing repair retries the step.
+        quality_block = _data_quality_block(symbol, timeframe, required_days)
+        if quality_block is not None:
+            return quality_block
+
         response = _submit_backtest(
             BacktestSubmitBody(
                 strategy_id=row["id"],
@@ -311,6 +370,7 @@ def run_quick_screen(workflow: dict[str, Any], step: dict[str, Any]) -> dict[str
                 timeframe=timeframe,
                 params=params,
                 duration_days=required_days,
+                as_of=_workflow_as_of(workflow),
             ),
             skip_auto_trash=True,
         )
@@ -525,6 +585,7 @@ def run_timeframe_sweep(workflow: dict[str, Any], step: dict[str, Any]) -> dict[
                     timeframe=tf,
                     params=params,
                     duration_days=sweep_duration_days,
+                    as_of=_workflow_as_of(workflow),
                 ),
                 skip_auto_trash=True,
             )
@@ -898,6 +959,7 @@ def run_confirmation_backtest(workflow: dict[str, Any], step: dict[str, Any]) ->
                 timeframe=row.get("timeframe") or "1h",
                 params=params,
                 duration_days=stage_backtest_duration_days("confirmation"),
+                as_of=_workflow_as_of(workflow),
             ),
             skip_auto_trash=True,
         )

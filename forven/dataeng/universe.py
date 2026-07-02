@@ -273,9 +273,10 @@ def seed_research_universe(
         try:
             dm._backfill_metrics(symbol, bv_client.fs_to_bv(symbol), days_bound=metrics_days)
             dm._backfill_funding(symbol, bv_client.fs_to_bv(symbol))
+            dm._backfill_basis(symbol, bv_client.fs_to_bv(symbol))
         except Exception as exc:
             summary["errors"] += 1
-            log.warning("Universe metrics/funding seed failed for %s: %s", symbol, exc)
+            log.warning("Universe metrics/funding/basis seed failed for %s: %s", symbol, exc)
 
     log.info("Research universe seed: %s", summary)
     return summary

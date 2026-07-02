@@ -6525,6 +6525,9 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
             fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=False,
             trade_mode=trade_mode, execution_controls=ec, initial_capital=initial_capital,
             strategy_type=strategy_type,
+            # PAIR form (BTC/USDT), not the bare coin: the intrabar resolver
+            # loads the lake 1m series, which lives under the pair directory.
+            symbol=str(strat.get("symbol") or "").strip() or None, timeframe=timeframe,
         )
     except Exception as exc:
         log.warning("[%s] kernel paper: run_strategy_execution failed (%s); SKIP scan (no legacy)", strat_id, exc)

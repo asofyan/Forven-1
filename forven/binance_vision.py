@@ -368,6 +368,156 @@ class BinanceVisionClient:
         return added
 
     # ------------------------------------------------------------------
+    # Book depth — daily snapshots of resting depth within ±X% of mid
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _daily_bookdepth_url(bv_symbol: str, year: int, month: int, day: int) -> str:
+        ymd = f"{year}-{month:02d}-{day:02d}"
+        return f"{_BV_BASE}/daily/bookDepth/{bv_symbol}/{bv_symbol}-bookDepth-{ymd}.zip"
+
+    @staticmethod
+    def _parse_bookdepth_csv(zip_bytes: bytes) -> pd.DataFrame | None:
+        """Parse a daily bookDepth ZIP → rows of (timestamp, percentage, depth,
+        notional): resting liquidity within ±percentage% of mid, sampled
+        intraday. Defensive: unexpected layouts log and return None."""
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
+                if csv_name is None:
+                    return None
+                raw = _read_zip_member_capped(zf, csv_name)
+            df = pd.read_csv(io.BytesIO(raw))
+            required = {"timestamp", "percentage", "depth", "notional"}
+            if not required.issubset(set(df.columns)):
+                log.warning("BV bookDepth unexpected columns: %s", list(df.columns)[:8])
+                return None
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp"])
+            for col in ("percentage", "depth", "notional"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df.dropna(subset=["percentage", "notional"]).reset_index(drop=True)
+        except Exception as exc:
+            log.warning("BV bookDepth parse error: %s", exc)
+            return None
+
+    def sample_depth_calibration(self, fs_symbol: str, *, days: int = 30) -> dict | None:
+        """Empirical depth profile for a symbol from the last ``days`` of
+        bookDepth archives: per ±percentage level, the median/p25 resting
+        NOTIONAL. Feeds slippage/liquidity-floor models with measured venue
+        depth instead of assumptions. Returns None when no archives exist."""
+        bv_symbol = self.fs_to_bv(fs_symbol)
+        now = datetime.now(timezone.utc)
+        per_level: dict[float, list[float]] = {}
+        sampled_days = 0
+        for offset in range(1, max(2, int(days) + 1)):
+            day = now - timedelta(days=offset)
+            zip_bytes = self._fetch_zip_csv(self._daily_bookdepth_url(bv_symbol, day.year, day.month, day.day))
+            if zip_bytes is None:
+                continue
+            frame = self._parse_bookdepth_csv(zip_bytes)
+            if frame is None or frame.empty:
+                continue
+            sampled_days += 1
+            grouped = frame.groupby("percentage")["notional"].median()
+            for level, notional in grouped.items():
+                per_level.setdefault(float(level), []).append(float(notional))
+        if not per_level:
+            return None
+        levels = {}
+        for level, values in sorted(per_level.items()):
+            series = pd.Series(values)
+            levels[str(level)] = {
+                "median_notional": float(series.median()),
+                "p25_notional": float(series.quantile(0.25)),
+            }
+        return {
+            "symbol": fs_symbol,
+            "sampled_days": sampled_days,
+            "levels": levels,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # Premium index (perp basis) — same kline CSV shape as klines/
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _monthly_premium_url(bv_symbol: str, tf: str, year: int, month: int) -> str:
+        ym = f"{year}-{month:02d}"
+        return f"{_BV_BASE}/monthly/premiumIndexKlines/{bv_symbol}/{tf}/{bv_symbol}-{tf}-{ym}.zip"
+
+    @staticmethod
+    def _daily_premium_url(bv_symbol: str, tf: str, year: int, month: int, day: int) -> str:
+        ymd = f"{year}-{month:02d}-{day:02d}"
+        return f"{_BV_BASE}/daily/premiumIndexKlines/{bv_symbol}/{tf}/{bv_symbol}-{tf}-{ymd}.zip"
+
+    def backfill_premium_index(
+        self,
+        fs_symbol: str,
+        existing_oldest_ts: pd.Timestamp | None,
+        save_fn,
+        load_fn,
+        path,
+        timeframe: str = "1h",
+    ) -> int:
+        """Deep-backfill the premium index (perp basis) from BV archives.
+
+        The archives are kline-shaped (open/high/low/close of the premium
+        index); we keep the hourly CLOSE as the ``basis`` column, matching the
+        REST BasisCollector's schema.
+        """
+        bv_symbol = self.fs_to_bv(fs_symbol)
+        # premiumIndexKlines shares availability with klines; probe via a
+        # dedicated stream key so the cache doesn't collide.
+        cache_key = f"{bv_symbol}:premiumIndex:{timeframe}"
+        start = _bv_start_cache.get(cache_key, "MISS")
+        if start == "MISS":
+            start = None
+            now_probe = datetime.now(timezone.utc)
+            for year, month in self._month_range(_BV_START_YEAR, _BV_START_MONTH, now_probe.year, now_probe.month):
+                try:
+                    resp = httpx.get(self._monthly_premium_url(bv_symbol, timeframe, year, month), timeout=10, follow_redirects=True)
+                    if resp.status_code == 200:
+                        start = (year, month)
+                        break
+                except Exception:
+                    continue
+            _bv_start_cache[cache_key] = start
+        if start is None:
+            log.debug("BV: no premiumIndexKlines for %s (%s)", bv_symbol, timeframe)
+            return 0
+
+        now = datetime.now(timezone.utc)
+        rows_added = 0
+        last_complete = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+        for year, month in self._month_range(*start, *last_complete):
+            if existing_oldest_ts is not None:
+                month_end = datetime(year, month, 28, tzinfo=timezone.utc)
+                if existing_oldest_ts <= month_end:
+                    continue
+            zip_bytes = self._fetch_zip_csv(self._monthly_premium_url(bv_symbol, timeframe, year, month))
+            if zip_bytes is None:
+                continue
+            df = self._parse_ohlcv_csv(zip_bytes)
+            if df is None or df.empty:
+                continue
+            basis = df[["timestamp", "close"]].rename(columns={"close": "basis"})
+            rows_added += self._merge_and_save_stream(basis, path, "basis", fs_symbol, save_fn, load_fn)
+
+        for day in range(1, now.day):
+            zip_bytes = self._fetch_zip_csv(self._daily_premium_url(bv_symbol, timeframe, now.year, now.month, day))
+            if zip_bytes is None:
+                continue
+            df = self._parse_ohlcv_csv(zip_bytes)
+            if df is None or df.empty:
+                continue
+            basis = df[["timestamp", "close"]].rename(columns={"close": "basis"})
+            rows_added += self._merge_and_save_stream(basis, path, "basis", fs_symbol, save_fn, load_fn)
+
+        return rows_added
+
+    # ------------------------------------------------------------------
     # Start date probing
     # ------------------------------------------------------------------
 

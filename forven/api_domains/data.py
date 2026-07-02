@@ -2128,6 +2128,53 @@ def post_trigger_backfill(symbol: str | None = None) -> dict:
     return {"status": "started", "symbol": symbol}
 
 
+_DEPTH_CALIBRATION_KV_PREFIX = "data:depth_calibration:"
+
+
+def get_depth_calibration(symbol: str) -> dict:
+    """Stored empirical depth profile for a symbol (median/p25 resting notional
+    per ±% level from BV bookDepth archives), or 404 when never computed."""
+    from forven.data import symbol_to_fs
+    from forven.db import kv_get
+
+    fs_symbol = symbol_to_fs(symbol)
+    payload = kv_get(f"{_DEPTH_CALIBRATION_KV_PREFIX}{fs_symbol}", None)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=404, detail=f"no depth calibration for {fs_symbol}")
+    return payload
+
+
+def post_compute_depth_calibration(symbol: str, days: int = 30) -> dict:
+    """Compute + persist the empirical depth profile from BV bookDepth daily
+    archives (bounded window). Feeds liquidity-floor / slippage models with
+    MEASURED venue depth instead of assumptions."""
+    from forven.binance_vision import bv_client
+    from forven.data import symbol_to_fs
+    from forven.db import kv_set_best_effort
+
+    fs_symbol = symbol_to_fs(symbol)
+    bounded_days = max(1, min(int(days or 30), 90))
+    artifact = bv_client.sample_depth_calibration(fs_symbol, days=bounded_days)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail=f"no bookDepth archives for {fs_symbol}")
+    kv_set_best_effort(f"{_DEPTH_CALIBRATION_KV_PREFIX}{fs_symbol}", artifact)
+    _log_data_action_safe(
+        "depth_calibration",
+        f"Computed depth calibration for {fs_symbol} over {artifact.get('sampled_days')} days",
+        symbol=fs_symbol,
+    )
+    return artifact
+
+
+def _log_data_action_safe(action: str, message: str, **detail) -> None:
+    try:
+        from forven.data import _log_data_action
+
+        _log_data_action(action, message, **detail)
+    except Exception:
+        pass
+
+
 _universe_lock = threading.Lock()
 _universe_cancel = threading.Event()
 _universe_state: dict = {

@@ -7172,6 +7172,76 @@ def _force_isolated_exec(strategy_obj) -> bool:
     return bool(getattr(strategy_obj, "sandbox_only", False))
 
 
+def _intrabar_resolution_enabled() -> bool:
+    """Operator flag for 1m sub-bar arbitration of both-touched bars.
+    Default OFF: turning it on changes fill outcomes (fewer pessimistic
+    stop-first calls) and therefore requires a re-baseline."""
+    try:
+        from forven.api_core import get_settings
+
+        return bool(get_settings().get("kernel_intrabar_resolution", False))
+    except Exception:
+        return False
+
+
+def _build_intrabar_resolver(symbol: str, timeframe: str, index: "pd.Index"):
+    """Resolver(bar_ts, direction, stop, tp) -> "stop" | "tp" | None, built
+    from the stored 1m series covering the frame's window.
+
+    Walks the 1m sub-bars inside the parent bar in order; the first level
+    touched wins. A 1m bar touching BOTH levels stays ambiguous -> None
+    (pessimistic). Returns None (no resolver) when the 1m series is absent —
+    the kernel then behaves exactly as without the flag.
+    """
+    try:
+        from forven.data import _timeframe_to_ms
+        from forven.dataeng.hub import DataHub
+
+        if len(index) == 0:
+            return None
+        tf_ms = _timeframe_to_ms(timeframe)
+        start = pd.Timestamp(index[0])
+        end = pd.Timestamp(index[-1]) + pd.Timedelta(milliseconds=tf_ms)
+        m1 = DataHub().candles(symbol, "1m", start=start, end=end)
+        if m1 is None or m1.empty:
+            return None
+        ts_ms = (pd.to_datetime(m1["timestamp"], utc=True).astype("int64") // 1_000_000).to_numpy()
+        m1_high = m1["high"].astype(float).to_numpy()
+        m1_low = m1["low"].astype(float).to_numpy()
+    except Exception as exc:
+        log.debug("intrabar resolver unavailable for %s %s: %s", symbol, timeframe, exc)
+        return None
+
+    import numpy as _np
+
+    def _resolve(bar_ts, direction: str, stop: float, tp: float) -> str | None:
+        try:
+            bar_start = pd.Timestamp(bar_ts)
+            if bar_start.tzinfo is None:
+                bar_start = bar_start.tz_localize("UTC")
+            start_ms = int(bar_start.timestamp() * 1000)
+            end_ms = start_ms + tf_ms
+            lo = int(_np.searchsorted(ts_ms, start_ms, side="left"))
+            hi = int(_np.searchsorted(ts_ms, end_ms, side="left"))
+            if hi <= lo:
+                return None
+            is_long = direction == "long"
+            for i in range(lo, hi):
+                stop_hit = (m1_low[i] <= stop) if is_long else (m1_high[i] >= stop)
+                tp_hit = (m1_high[i] >= tp) if is_long else (m1_low[i] <= tp)
+                if stop_hit and tp_hit:
+                    return None  # ambiguous within one minute -> pessimistic
+                if stop_hit:
+                    return "stop"
+                if tp_hit:
+                    return "tp"
+            return None
+        except Exception:
+            return None
+
+    return _resolve
+
+
 def run_strategy_execution(
     df: "pd.DataFrame",
     strategy_obj,
@@ -7186,6 +7256,8 @@ def run_strategy_execution(
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
     strategy_type: str | None = None,
+    symbol: str | None = None,
+    timeframe: str | None = None,
 ) -> "_kernel.KernelResult | None":
     """The ONE signals→regime-mask→kernel pipeline, shared by the backtest's
     vectorized walk and the live/paper scanner so paper reproduces the backtest by
@@ -7284,10 +7356,17 @@ def run_strategy_execution(
         # Falls back to the default 1% fraction sizing when the strategy has none.
         ec = _normalize_execution_controls(execution_controls_from_params(params)) or _sizing.default_controls()
     drag = _kernel.round_trip_drag(fee_bps, slippage_bps, leverage)
+    # 1m sub-bar arbitration for both-touched bars (flagged, default OFF).
+    # Built HERE — the shared driver — so backtest, paper replay, and chart
+    # triggers all resolve identically for the same lake state (parity).
+    intrabar_resolver = None
+    if symbol and timeframe and str(timeframe) != "1m" and _intrabar_resolution_enabled():
+        intrabar_resolver = _build_intrabar_resolver(symbol, str(timeframe), d.index)
     return _kernel.simulate(
         d, signals, warmup, leverage,
         regimes=regime_series, round_trip_drag=drag, trade_mode=trade_mode,
         allowed_modes=_allowed_modes_for(trade_mode), ec=ec, initial_capital=initial_capital,
+        intrabar_resolver=intrabar_resolver,
     )
 
 
@@ -7757,6 +7836,8 @@ def backtest_strategy(
     initial_capital: float | None = None,
 
     execution_controls: dict | None = None,
+
+    as_of: str | None = None,
 
 ) -> dict:
 
@@ -8323,12 +8404,15 @@ def backtest_strategy(
         # load_backtest_candles loads ``warmup_bars`` before ``start_date`` so
         # indicators are valid from the first in-window bar. Without start/end it
         # falls back to the most-recent ``bars`` (legacy/autonomous behaviour).
+        # ``as_of`` pins point-in-time reconstruction (gauntlet candidates pin
+        # their creation time so every stage scores identical data).
         df = load_backtest_candles(
             asset=asset,
             bars=bars,
             timeframe=resolved_timeframe,
             start_date=start_date,
             end_date=end_date,
+            as_of=as_of,
         )
 
 
@@ -10845,6 +10929,7 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
             trade_mode=trade_mode, execution_controls=execution_controls,
             initial_capital=initial_capital, strategy_type=strategy_type,
+            symbol=asset, timeframe=resolved_timeframe,
         )
     except RuntimeError as exc:
         if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):

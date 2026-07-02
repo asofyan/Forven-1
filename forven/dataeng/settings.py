@@ -44,6 +44,10 @@ class DataEngineSettings(BaseModel):
     )
     stream_reconnect_initial_seconds: float = 1.0
     stream_reconnect_max_seconds: float = 60.0
+    # Per-candidate reproducibility: gauntlet stages pin as_of to their
+    # workflow's creation time so every stage scores identical data even when
+    # restatements/rebuilds land mid-gauntlet. (Run 2 of the edge-data plan.)
+    gauntlet_as_of_pin: bool = True
     point_in_time_mode: Literal["latest", "as_of_pin"] = "latest"
     # ISO-8601 pin consumed by backtests when point_in_time_mode == "as_of_pin":
     # reads reconstruct the values in force at this time from the revision log

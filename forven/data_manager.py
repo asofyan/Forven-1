@@ -63,6 +63,12 @@ FUNDING_DIR = _BASE_DIR / "funding"
 OI_DIR = _BASE_DIR / "oi"
 DERIVATIVES_DIR = _BASE_DIR / "derivatives"
 MACRO_DIR = _BASE_DIR / "macro"
+# Crypto-native, strategy-path-eligible streams (edge-data-expansion Run 3):
+# basis (per-symbol premium index) and implied volatility (market-wide DVOL).
+# NOT under macro/ — macro is research-only-gated; these are 24/7 series that
+# join the strategy path with the standard bucket-close causality shift.
+BASIS_DIR = _BASE_DIR / "basis"
+VOL_DIR = _BASE_DIR / "volatility"
 
 
 def assert_data_root_consistent() -> bool:
@@ -977,6 +983,118 @@ class TakerVolumeCollector(_RestCollector):
 
 
 # ---------------------------------------------------------------------------
+# BasisCollector — Binance USD-M premium index (perp basis vs index)
+# ---------------------------------------------------------------------------
+
+class BasisCollector:
+    """Collects the Binance USD-M premium index (1h klines) — the perp's basis
+    vs the underlying index, a funding predictor and crowding/regime signal.
+    Stored as the kline CLOSE per hour (dimensionless fraction, e.g. 0.0004)."""
+
+    _ENDPOINT = "https://fapi.binance.com/fapi/v1/premiumIndexKlines"
+
+    def collect(self, symbol: str) -> int:
+        from forven.data import symbol_to_fs
+        fs_symbol = symbol_to_fs(symbol)
+        path = BASIS_DIR / fs_symbol / "1h.parquet"
+        lock = _get_stream_lock(f"basis::{fs_symbol}")
+
+        with lock:
+            try:
+                existing = _load_stream_parquet(path)
+                last_ms = _last_timestamp(existing)
+                bare = fs_symbol.replace("-", "")
+                params: dict[str, Any] = {"symbol": bare, "interval": "1h", "limit": 500}
+                if last_ms is not None:
+                    params["startTime"] = last_ms + 1
+                resp = _http_session().get(self._ENDPOINT, params=params, timeout=30)
+                resp.raise_for_status()
+                rows = resp.json()
+                if not rows:
+                    return 0
+                new_df = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": pd.Timestamp(int(r[0]), unit="ms", tz="UTC"),
+                            "basis": float(r[4]),  # kline close of the premium index
+                        }
+                        for r in rows
+                        if isinstance(r, (list, tuple)) and len(r) >= 5
+                    ]
+                )
+                new_df, _ = _validate_stream_df(new_df, "basis", non_negative=[])
+                return _combine_and_save(existing, new_df, path, stream="basis", symbol=fs_symbol)
+            except Exception as exc:
+                log.warning("BasisCollector failed for %s: %s", symbol, exc)
+                raise
+
+
+# ---------------------------------------------------------------------------
+# ImpliedVolCollector — Deribit DVOL index (BTC/ETH), market-wide regime
+# ---------------------------------------------------------------------------
+
+class ImpliedVolCollector:
+    """Collects the Deribit DVOL implied-volatility index (crypto's VIX).
+
+    Market-wide (joined onto every symbol's frame as iv_btc/iv_eth), 24/7 and
+    crypto-native, so it is strategy-path eligible with the standard
+    bucket-close shift. Hourly resolution; the free public endpoint bounds
+    each request, so collection is incremental since the last stored row.
+    """
+
+    _ENDPOINT = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
+    _CURRENCIES = ("BTC", "ETH")
+    _RESOLUTION_SECONDS = 3600
+
+    def collect(self) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for currency in self._CURRENCIES:
+            summary[currency.lower()] = self._collect_currency(currency)
+        return summary
+
+    def _collect_currency(self, currency: str) -> int:
+        path = VOL_DIR / f"dvol_{currency.lower()}_1h.parquet"
+        lock = _get_stream_lock(f"dvol::{currency}")
+        with lock:
+            try:
+                existing = _load_stream_parquet(path)
+                last_ms = _last_timestamp(existing)
+                end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                # Cold start: seed ~2y of hourly IV; incremental otherwise.
+                start_ms = (last_ms + 1) if last_ms is not None else end_ms - 730 * 24 * 3_600_000
+                resp = _http_session().get(
+                    self._ENDPOINT,
+                    params={
+                        "currency": currency,
+                        "start_timestamp": start_ms,
+                        "end_timestamp": end_ms,
+                        "resolution": self._RESOLUTION_SECONDS,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = (resp.json().get("result") or {}).get("data") or []
+                if not data:
+                    return 0
+                col = f"iv_{currency.lower()}"
+                new_df = pd.DataFrame(
+                    [
+                        {
+                            "timestamp": pd.Timestamp(int(r[0]), unit="ms", tz="UTC"),
+                            col: float(r[4]),  # candle close of the vol index
+                        }
+                        for r in data
+                        if isinstance(r, (list, tuple)) and len(r) >= 5
+                    ]
+                )
+                new_df, _ = _validate_stream_df(new_df, f"dvol_{currency.lower()}", non_negative=[col])
+                return _combine_and_save(existing, new_df, path, stream="dvol", symbol=currency)
+            except Exception as exc:
+                log.warning("ImpliedVolCollector failed for %s: %s", currency, exc)
+                raise
+
+
+# ---------------------------------------------------------------------------
 # LiquidationCollector
 # ---------------------------------------------------------------------------
 
@@ -1254,6 +1372,8 @@ class DataManager:
         self._lsr = LongShortRatioCollector()
         self._taker = TakerVolumeCollector()
         self._liquidation = LiquidationCollector()
+        self._basis = BasisCollector()
+        self._iv = ImpliedVolCollector()
         self._fear_greed = FearGreedCollector()
         self._macro = MacroCollector()
         self._btc_dom = BtcDominanceCollector()
@@ -1674,6 +1794,44 @@ class DataManager:
             _record_collection("liquidations", None, 0, False)
             raise
 
+    def collect_basis(self) -> dict[str, Any]:
+        """Collect the premium-index basis series for active crypto symbols."""
+        try:
+            with self._cycle_cache():
+                symbols = self.get_active_symbols()
+                summary: dict[str, int] = {}
+                tally = _PerSymbolTally()
+                for symbol in symbols:
+                    summary[symbol] = tally.run(symbol, lambda s=symbol: self._basis.collect(s))
+                total = sum(summary.values())
+                log.info(
+                    "Basis collect: %d symbols, %d rows added, %d failed",
+                    len(symbols), total, tally.failed,
+                )
+                tally.record("basis", total)
+                return {"symbols": summary, "total_rows": total}
+        except Exception:
+            _record_collection("basis", None, 0, False)
+            raise
+
+    def collect_iv(self) -> dict[str, Any]:
+        """Collect the Deribit DVOL implied-volatility index (BTC/ETH)."""
+        try:
+            with self._cycle_cache():
+                tally = _PerSymbolTally()
+                summary: dict[str, int] = {}
+                for currency in ImpliedVolCollector._CURRENCIES:
+                    summary[currency.lower()] = tally.run(
+                        currency, lambda c=currency: self._iv._collect_currency(c)
+                    )
+                total = sum(summary.values())
+                log.info("DVOL collect: %d rows added, %d failed", total, tally.failed)
+                tally.record("dvol", total)
+                return {"currencies": summary, "total_rows": total}
+        except Exception:
+            _record_collection("dvol", None, 0, False)
+            raise
+
     def collect_fear_greed(self) -> dict[str, Any]:
         """Collect Fear & Greed Index (global)."""
         try:
@@ -1806,6 +1964,31 @@ class DataManager:
             out["metrics_error"] = str(exc)
         return out
 
+    def _backfill_basis(self, fs_sym: str, bv_symbol: str) -> dict:
+        """Deep-backfill the premium-index basis series from BV archives."""
+        out: dict = {}
+        try:
+            path = BASIS_DIR / fs_sym / "1h.parquet"
+            existing_df = _load_stream_parquet(path)
+            oldest = (
+                pd.to_datetime(existing_df["timestamp"].iloc[0], utc=True)
+                if existing_df is not None and not existing_df.empty
+                else None
+            )
+            added = bv_client.backfill_premium_index(
+                fs_sym, oldest,
+                save_fn=_save_stream_parquet,
+                load_fn=_load_stream_parquet,
+                path=path,
+            )
+            if added:
+                out["basis"] = added
+                log.info("BV backfill basis %s: +%d rows", fs_sym, added)
+        except Exception as exc:
+            log.warning("BV basis backfill failed for %s: %s", fs_sym, exc)
+            out["basis_error"] = str(exc)
+        return out
+
     def _backfill_oi(self, fs_sym: str, bv_symbol: str) -> dict:
         out: dict = {}
         timeframes_oi = self.get_active_timeframes(fs_sym) or {"1h", "4h"}
@@ -1881,6 +2064,8 @@ class DataManager:
                 summary[fs_sym].update(self._backfill_funding(fs_sym, bv_symbol))
             if "oi" in streams or "metrics" in streams:
                 summary[fs_sym].update(self._backfill_metrics(fs_sym, bv_symbol))
+            if "basis" in streams:
+                summary[fs_sym].update(self._backfill_basis(fs_sym, bv_symbol))
         return summary
 
     def _check_and_backfill(self) -> None:
@@ -1995,6 +2180,20 @@ class DataManager:
             except Exception as exc:
                 log.warning("Liquidation enrichment skipped for %s: %s", symbol, exc)
 
+        # Run 3 crypto-native streams: per-symbol basis + market-wide implied
+        # vol. Both are bar-aggregate series → bucket-close shifted.
+        if "basis" not in excluded:
+            try:
+                result = self._enrich_basis(result, symbol)
+            except Exception as exc:
+                log.warning("Basis enrichment skipped for %s: %s", symbol, exc)
+
+        if "iv" not in excluded:
+            try:
+                result = self._enrich_iv(result)
+            except Exception as exc:
+                log.warning("IV enrichment skipped: %s", exc)
+
         # RESEARCH-ONLY daily macro / sentiment. These carry same-day-close
         # lookahead and weekend gaps, so they are NEVER joined on the strategy/
         # backtest path — only when a research caller explicitly opts in.
@@ -2079,6 +2278,28 @@ class DataManager:
             fill={"long_liq_usd": 0.0, "short_liq_usd": 0.0, "liq_imbalance": 0.0},
             shift_to_bucket_close=True,
         )
+
+    def _enrich_basis(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        from forven.data import symbol_to_fs
+        return _merge_asof_parquet(
+            df,
+            BASIS_DIR / symbol_to_fs(symbol) / "1h.parquet",
+            cols=["basis"],
+            fill={},  # NaN before coverage — basis=0 is a real market state
+            shift_to_bucket_close=True,
+        )
+
+    def _enrich_iv(self, df: pd.DataFrame) -> pd.DataFrame:
+        result = df
+        for currency in ("btc", "eth"):
+            result = _merge_asof_parquet(
+                result,
+                VOL_DIR / f"dvol_{currency}_1h.parquet",
+                cols=[f"iv_{currency}"],
+                fill={},  # NaN before coverage — a fake IV level is a signal
+                shift_to_bucket_close=True,
+            )
+        return result
 
     def _enrich_fear_greed(self, df: pd.DataFrame) -> pd.DataFrame:
         return _merge_asof_parquet(

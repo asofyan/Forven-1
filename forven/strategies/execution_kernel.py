@@ -165,12 +165,22 @@ def simulate(
     allowed_modes: tuple[str, ...],
     ec: dict,
     initial_capital: float,
+    intrabar_resolver=None,
 ) -> KernelResult:
     """Walk the bars and produce closed trades + still-open positions (no force-close).
 
     Entries fill at the NEXT bar's open (no lookahead). Stops are evaluated intrabar
     against each subsequent bar's high/low; a position entered on bar *i* is first
     stop-checked on bar *i+1*. Per-trade ``size_fraction`` scales price PnL.
+
+    ``intrabar_resolver`` (optional): when a bar touches BOTH the stop and the
+    take-profit, the ordering is ambiguous from OHLC alone and the kernel
+    assumes stop-first (pessimistic). A resolver — built from the 1m sub-bar
+    path by the driver when ``kernel_intrabar_resolution`` is enabled — is
+    called as ``resolver(bar_ts, direction, stop_price, tp_price)`` and
+    returns ``"stop"`` / ``"tp"`` / ``None`` (None = stay pessimistic). It is
+    consulted ONLY in the both-touched case, so single-touch bars are
+    byte-identical with the resolver on or off.
     """
     opens = df["open"].astype(float).values
     highs = df["high"].astype(float).values
@@ -239,6 +249,25 @@ def simulate(
                     eff_stop = trail_level
                 else:
                     eff_stop = max(eff_stop, trail_level) if direction == "long" else min(eff_stop, trail_level)
+            tp = at.get("target_price")
+
+            # Both-touched arbitration: when THIS bar touches the stop AND the
+            # take-profit, OHLC alone can't order them — default is stop-first
+            # (pessimistic). With a sub-bar resolver, the ACTUAL 1m path
+            # decides which level traded first; None keeps the pessimistic
+            # default. Single-touch bars never reach the resolver.
+            if exit_price is None and intrabar_resolver is not None and eff_stop is not None and tp is not None:
+                stop_touched = (bar_low <= eff_stop) if direction == "long" else (bar_high >= eff_stop)
+                tp_touched = (bar_high >= tp) if direction == "long" else (bar_low <= tp)
+                if stop_touched and tp_touched:
+                    try:
+                        first = intrabar_resolver(df.index[idx], direction, float(eff_stop), float(tp))
+                    except Exception:
+                        first = None
+                    if first == "tp":
+                        exit_price, exit_reason = (tp, "take_profit")
+                    # "stop"/None fall through to the stop block below.
+
             if exit_price is None and eff_stop is not None:
                 if direction == "long" and bar_low <= eff_stop:
                     exit_price = min(fill_price, eff_stop)  # gap-through fills at open
@@ -247,7 +276,6 @@ def simulate(
                     exit_price = max(fill_price, eff_stop)
                     exit_reason = "trailing_stop" if (at.get("trail_pct") and (at.get("stop_price") is None or eff_stop < at["stop_price"])) else "stop_loss"
 
-            tp = at.get("target_price")
             if exit_price is None and tp is not None:
                 # Take-profit is a resting limit; model it conservatively as filling
                 # AT the target even on a gap-through (never crediting the more
