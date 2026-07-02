@@ -445,19 +445,7 @@ class OpenAIProvider(ToolCallProvider):
             self._openai_tools = _to_openai_tools(tools)
 
         # OpenAI uses system message in the messages array.
-        openai_messages: list[dict] = []
-        if system:
-            openai_messages.append({"role": "system", "content": system})
-        for msg in messages:
-            role = str(msg.get("role", "user"))
-            if role not in {"system", "user", "assistant", "tool"}:
-                role = "user"
-            coerced: dict = {"role": role, "content": _coerce_openai_text(msg.get("content", ""))}
-            if role == "tool" and msg.get("tool_call_id"):
-                coerced["tool_call_id"] = str(msg["tool_call_id"])
-            if role == "assistant" and msg.get("tool_calls"):
-                coerced["tool_calls"] = msg["tool_calls"]
-            openai_messages.append(coerced)
+        openai_messages = _build_openai_messages(system, messages)
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         headers.update(self._extra_headers())
@@ -669,19 +657,7 @@ class LMStudioProvider(ToolCallProvider):
         if self._openai_tools is None:
             self._openai_tools = _to_openai_tools(tools)
 
-        openai_messages: list[dict] = []
-        if system:
-            openai_messages.append({"role": "system", "content": system})
-        for msg in messages:
-            role = str(msg.get("role", "user"))
-            if role not in {"system", "user", "assistant", "tool"}:
-                role = "user"
-            coerced: dict = {"role": role, "content": _coerce_openai_text(msg.get("content", ""))}
-            if role == "tool" and msg.get("tool_call_id"):
-                coerced["tool_call_id"] = str(msg["tool_call_id"])
-            if role == "assistant" and msg.get("tool_calls"):
-                coerced["tool_calls"] = msg["tool_calls"]
-            openai_messages.append(coerced)
+        openai_messages = _build_openai_messages(system, messages)
 
         headers = {"Content-Type": "application/json"}
         cleaned_token = str(token or "").strip()
@@ -846,19 +822,7 @@ class ZAIProvider(ToolCallProvider):
         if self._openai_tools is None:
             self._openai_tools = _to_openai_tools(tools)
 
-        openai_messages: list[dict] = []
-        if system:
-            openai_messages.append({"role": "system", "content": system})
-        for msg in messages:
-            role = str(msg.get("role", "user"))
-            if role not in {"system", "user", "assistant", "tool"}:
-                role = "user"
-            coerced: dict = {"role": role, "content": _coerce_openai_text(msg.get("content", ""))}
-            if role == "tool" and msg.get("tool_call_id"):
-                coerced["tool_call_id"] = str(msg["tool_call_id"])
-            if role == "assistant" and msg.get("tool_calls"):
-                coerced["tool_calls"] = msg["tool_calls"]
-            openai_messages.append(coerced)
+        openai_messages = _build_openai_messages(system, messages)
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         body = {
@@ -1083,57 +1047,7 @@ class DeepSeekProvider(OpenAIProvider):
 
 
 # ---------------------------------------------------------------------------
-# Groq + Gemini (free-tier) — OpenAI-compatible
-# ---------------------------------------------------------------------------
-
-class GroqProvider(OpenAIProvider):
-    """Groq Chat API — OpenAI Chat Completions compatible.
-
-    Default base: ``https://api.groq.com/openai/v1``. Free tier with low
-    rate limits; tool-calling is supported on the larger models (e.g.
-    ``llama-3.3-70b-versatile``).
-    """
-
-    DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
-
-    @staticmethod
-    def _get_base_url() -> str:
-        profile = get_profile("groq") or {}
-        base_url = str(profile.get("base_url") or "").strip()
-        if not base_url:
-            base_url = GroqProvider.DEFAULT_BASE_URL
-        return base_url.rstrip("/")
-
-    @property
-    def ENDPOINT(self) -> str:  # type: ignore[override]
-        return f"{self._get_base_url()}/chat/completions"
-
-
-class GeminiProvider(OpenAIProvider):
-    """Google Gemini — via its OpenAI Chat Completions compatible endpoint.
-
-    Default base: ``https://generativelanguage.googleapis.com/v1beta/openai``.
-    Free tier with daily/per-minute limits; tool-calling is supported on the
-    Gemini 2.x models.
-    """
-
-    DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-
-    @staticmethod
-    def _get_base_url() -> str:
-        profile = get_profile("gemini") or {}
-        base_url = str(profile.get("base_url") or "").strip()
-        if not base_url:
-            base_url = GeminiProvider.DEFAULT_BASE_URL
-        return base_url.rstrip("/")
-
-    @property
-    def ENDPOINT(self) -> str:  # type: ignore[override]
-        return f"{self._get_base_url()}/chat/completions"
-
-
-# ---------------------------------------------------------------------------
-# Cerebras / Mistral / xAI (Grok) / Together — OpenAI-compatible
+# OpenAI-compatible gateways (Groq / Gemini / Cerebras / Mistral / xAI / ...)
 # ---------------------------------------------------------------------------
 
 class _OpenAICompatProvider(OpenAIProvider):
@@ -1155,6 +1069,30 @@ class _OpenAICompatProvider(OpenAIProvider):
     @property
     def ENDPOINT(self) -> str:  # type: ignore[override]
         return f"{self._get_base_url()}/chat/completions"
+
+
+class GroqProvider(_OpenAICompatProvider):
+    """Groq Chat API — OpenAI Chat Completions compatible.
+
+    Default base: ``https://api.groq.com/openai/v1``. Free tier with low
+    rate limits; tool-calling is supported on the larger models (e.g.
+    ``llama-3.3-70b-versatile``).
+    """
+
+    PROVIDER = "groq"
+    DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
+
+
+class GeminiProvider(_OpenAICompatProvider):
+    """Google Gemini — via its OpenAI Chat Completions compatible endpoint.
+
+    Default base: ``https://generativelanguage.googleapis.com/v1beta/openai``.
+    Free tier with daily/per-minute limits; tool-calling is supported on the
+    Gemini 2.x models.
+    """
+
+    PROVIDER = "gemini"
+    DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 
 class CerebrasProvider(_OpenAICompatProvider):
