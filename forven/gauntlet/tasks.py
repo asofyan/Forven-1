@@ -1437,9 +1437,47 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
 
     missing = status.get("missing_required") if isinstance(status.get("missing_required"), list) else []
     if missing:
+        # A required test can be "missing" for two very different reasons, and only
+        # one of them is a verdict about the strategy:
+        #   * MERIT: the test ran and recorded an explicit FAIL — failed_gate is correct.
+        #   * ABSENCE: the test errored, is stale (params or engine version), never
+        #     ran, or is still in flight. There is NO verdict; treating absence as
+        #     failed_gate archived strategies on evidence that does not exist (the
+        #     wrongly-archived cluster). Block retryably instead — the reason codes
+        #     are counter-exempt and in engine._NO_DRAIN_REASON_CODES, and the
+        #     un-promotable hygiene backstop still catches genuine deadlocks.
+        tests_map = status.get("tests") if isinstance(status.get("tests"), dict) else {}
+        merit_missing: list[str] = []
+        stale_engine_missing: list[str] = []
+        absent_missing: list[str] = []
+        for item in missing:
+            payload = tests_map.get(str(item)) if isinstance(tests_map.get(str(item)), dict) else {}
+            verdict = str(payload.get("verdict") or "").strip().upper()
+            if payload.get("stale_engine"):
+                stale_engine_missing.append(str(item))
+            elif verdict == "FAIL":
+                merit_missing.append(str(item))
+            else:
+                absent_missing.append(str(item))
+        if merit_missing:
+            return {
+                "status": "failed_gate",
+                "message": f"required robustness tests failed: {', '.join(merit_missing)}",
+                "gauntlet_status": status,
+            }
+        reason_code = (
+            "stale_engine_artifacts"
+            if stale_engine_missing and not absent_missing
+            else "artifacts_pending"
+        )
         return {
-            "status": "failed_gate",
-            "message": f"missing required robustness tests: {', '.join(str(item) for item in missing)}",
+            "status": "blocked_runtime",
+            "message": (
+                "required robustness tests have no current verdict "
+                f"(pending re-validation, not a merit failure): {', '.join(str(item) for item in missing)}"
+            ),
+            "retryable": True,
+            "reason_code": reason_code,
             "gauntlet_status": status,
         }
 
@@ -1503,10 +1541,11 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         transition.get("blocked_reason") or transition.get("reason") or transition.get("message") or ""
     ).lower()
     if (
-        reason_code in {"stale_validation", "artifacts_pending"}
+        reason_code in {"stale_validation", "artifacts_pending", "stale_engine_artifacts"}
         or "ordering violation" in _blocked_text
         or "re-run after optimization" in _blocked_text
         or "stale validation" in _blocked_text
+        or "engine version" in _blocked_text
     ):
         # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
         # ordering / freshness check fails when a validation (walk_forward) is older

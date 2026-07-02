@@ -46,11 +46,17 @@ _GATE_CONTENTION_BACKOFF_MINUTES = 10.0
 #     the latest optimization, i.e. it just needs to RE-RUN. This self-resolves once
 #     the validation re-runs; draining here archived a passing strategy mid-re-
 #     validation (the S03523 walk_forward-before-optimization case).
+#   * ``stale_engine_artifacts`` — the strategy's validation artifacts were
+#     produced by a previous BACKTEST_ENGINE_VERSION (engine_provenance). The
+#     engine-rebaseline sweep re-queues the validation suite automatically;
+#     draining here would archive a strategy for having been validated on
+#     since-fixed math — the exact wrongly-archived failure mode this closes.
 _NO_DRAIN_REASON_CODES = {
     "gate_contention",
     "awaiting_data_backfill",
     "stale_validation",
     "artifacts_pending",
+    "stale_engine_artifacts",
 }
 
 # --- Quality-aware visitation -------------------------------------------------
@@ -1043,6 +1049,215 @@ def cancel_param_locked_workflows(*, limit: int = 50) -> int:
     return cancelled
 
 
+# --- Engine-version re-baselining ---------------------------------------------------
+# Validation verdict result_types whose LATEST row decides whether a strategy's
+# evidence is current. Mirrors the IN-list of gauntlet/status._latest_robustness_results.
+_ENGINE_SWEEP_VERDICT_TYPES = (
+    "walk_forward",
+    "monte_carlo",
+    "param_jitter",
+    "parameter_jitter",
+    "cost_stress",
+    "regime_split",
+)
+# Bound on archived-strategy revivals per tick: a version bump can make MANY
+# archived verdicts stale at once, and each revival re-enters quick_screen and
+# re-runs the full gauntlet. Active-strategy re-validation shares the caller's
+# limit; revivals are paced separately and more slowly.
+_ENGINE_SWEEP_REVIVE_LIMIT = 5
+
+
+def _engine_rebaseline_marker_key(strategy_id: str) -> str:
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
+    return f"forven:engine_rebaseline:v{BACKTEST_ENGINE_VERSION}:{strategy_id}"
+
+
+def _latest_verdict_artifacts_stale(conn, strategy_id: str) -> bool:
+    """True when the strategy's LATEST artifact for any verdict type carries an
+    explicit engine-version stamp from a previous engine. Once the suite re-runs
+    on the current engine the latest rows are freshly stamped and this converges
+    to False — old stale rows deeper in history never re-trigger the sweep."""
+    from forven.engine_provenance import is_stale_engine_artifact
+
+    placeholders = ",".join("?" for _ in _ENGINE_SWEEP_VERDICT_TYPES)
+    rows = conn.execute(
+        f"""
+        SELECT LOWER(TRIM(COALESCE(result_type, ''))) AS rt, config_json
+        FROM backtest_results
+        WHERE strategy_id = ?
+          AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+          AND LOWER(TRIM(COALESCE(result_type, ''))) IN ({placeholders})
+        ORDER BY datetime(created_at) DESC
+        """,
+        (strategy_id, *_ENGINE_SWEEP_VERDICT_TYPES),
+    ).fetchall()
+    seen: set[str] = set()
+    for row in rows:
+        rt = str(row["rt"])
+        # param_jitter / parameter_jitter are aliases for the same test — they
+        # must share one "latest" slot or a fresh row under one spelling would
+        # not shadow a stale row under the other.
+        if rt == "parameter_jitter":
+            rt = "param_jitter"
+        if rt in seen:
+            continue
+        seen.add(rt)
+        if is_stale_engine_artifact(row["config_json"]):
+            return True
+    return False
+
+
+def _workflow_has_running_step(conn, workflow_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM gauntlet_steps WHERE workflow_id = ? AND status = 'running' LIMIT 1",
+        (workflow_id,),
+    ).fetchone()
+    return row is not None
+
+
+def requeue_stale_engine_artifacts(*, limit: int = 20, revive_limit: int = _ENGINE_SWEEP_REVIVE_LIMIT) -> dict[str, int]:
+    """Auto-flag artifacts produced by a previous BACKTEST_ENGINE_VERSION and
+    re-queue the affected strategies for validation.
+
+    A stats-affecting engine change bumps engine_provenance.BACKTEST_ENGINE_VERSION.
+    Every verdict stamped by the old engine describes math that no longer exists;
+    this sweep replaces the two manual chores that followed every engine fix:
+
+      * ACTIVE pre-paper strategies whose latest verdict artifacts are stamped
+        stale get their current-definition workflow reset to ``pending`` — the
+        whole chain (screen -> optimization -> confirmation -> robustness) re-runs
+        on the current engine (the re-baseline sweep);
+      * ARCHIVED strategies killed by a ``failed_gate`` verdict from the old
+        engine are revived to quick_screen and their workflow reset — the old
+        engine's kill is unproven on the current engine (the un-archive chore).
+
+    Anti-churn invariants:
+      * one action per strategy per engine version — a KV marker
+        (``forven:engine_rebaseline:v{N}:{sid}``) records it, so the reset/revive
+        can never loop;
+      * the staleness predicate reads the LATEST row per verdict type: once the
+        re-run lands (stamped with the current version), the predicate is False
+        for every future tick. This is why resetting a failed_gate workflow here
+        is safe while backfill_missing_quick_screen_workflows must never do it —
+        a re-failure on the CURRENT engine is fresh evidence and stays archived;
+      * unstamped (pre-provenance) artifacts never match — history from before
+        stamping shipped is grandfathered as current (the operator's last manual
+        re-baseline is its baseline);
+      * a workflow with a RUNNING step is skipped this tick (resetting mid-flight
+        would duplicate the in-flight backtest); it is retried once idle.
+    """
+    from forven.db import get_db, kv_get, kv_set
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+    from forven.gauntlet.store import WORKFLOW_DEFINITION_VERSION
+
+    summary = {"reset": 0, "revived": 0, "converged": 0}
+    placeholders = ",".join("?" for _ in _ENGINE_SWEEP_VERDICT_TYPES)
+    now = _now()
+
+    with get_db() as conn:
+        init_gauntlet_schema(conn)
+        # Prefilter: strategies in a sweep-eligible stage with ANY verdict row
+        # explicitly stamped by a different engine version. json_extract returns
+        # NULL for unstamped rows, so pre-provenance history never matches.
+        candidates = conn.execute(
+            f"""
+            SELECT DISTINCT s.id, LOWER(TRIM(COALESCE(s.stage, ''))) AS stage
+            FROM strategies s
+            JOIN backtest_results br ON br.strategy_id = s.id
+            WHERE LOWER(TRIM(COALESCE(s.stage, ''))) IN ('quick_screen', 'gauntlet', 'archived')
+              AND (br.deleted_at IS NULL OR TRIM(COALESCE(br.deleted_at, '')) = '')
+              AND LOWER(TRIM(COALESCE(br.result_type, ''))) IN ({placeholders})
+              AND json_valid(br.config_json)
+              AND json_extract(br.config_json, '$.engine_version') IS NOT NULL
+              AND CAST(json_extract(br.config_json, '$.engine_version') AS INTEGER) <> ?
+            ORDER BY s.id
+            """,
+            (*_ENGINE_SWEEP_VERDICT_TYPES, BACKTEST_ENGINE_VERSION),
+        ).fetchall()
+        candidate_rows = [(str(row["id"]), str(row["stage"])) for row in candidates]
+
+    for strategy_id, stage in candidate_rows:
+        if summary["reset"] >= max(int(limit), 1) and summary["revived"] >= max(int(revive_limit), 0):
+            break
+        marker_key = _engine_rebaseline_marker_key(strategy_id)
+        try:
+            if kv_get(marker_key) is not None:
+                continue  # already handled for this engine version
+        except Exception:
+            continue
+        try:
+            with get_db() as conn:
+                if not _latest_verdict_artifacts_stale(conn, strategy_id):
+                    # Latest evidence is already current-engine (manual re-run or a
+                    # completed sweep from a prior tick) — record convergence so the
+                    # prefilter's older stale rows stop re-surfacing this strategy.
+                    kv_set(marker_key, {"at": now, "action": "converged"})
+                    summary["converged"] += 1
+                    continue
+                workflow = conn.execute(
+                    """SELECT id, status FROM gauntlet_workflows
+                       WHERE strategy_id = ? AND definition_version = ?
+                       ORDER BY datetime(created_at) DESC LIMIT 1""",
+                    (strategy_id, WORKFLOW_DEFINITION_VERSION),
+                ).fetchone()
+                workflow_id = str(workflow["id"]) if workflow else None
+                if workflow_id and _workflow_has_running_step(conn, workflow_id):
+                    continue  # in flight — retry once idle, no marker
+
+            if stage == "archived":
+                if summary["revived"] >= max(int(revive_limit), 0):
+                    continue
+                if not workflow or str(workflow["status"] or "").strip().lower() != "failed_gate":
+                    # Not a gauntlet-demoted archive (operator/hygiene archive) —
+                    # leave it to the operator; mark so we don't rescan every tick.
+                    kv_set(marker_key, {"at": now, "action": "skipped_not_gauntlet_archive"})
+                    continue
+                from forven.brain import transition_stage
+
+                # archived -> quick_screen is the standard (ungated) revival
+                # transition; force is not needed and would be downgraded anyway
+                # for an actor outside _USER_ACTORS/_SYSTEM_FORCE_ACTORS.
+                transition_stage(
+                    strategy_id=strategy_id,
+                    target_stage="quick_screen",
+                    reason=(
+                        f"Engine re-baseline: archival verdict predates backtest engine "
+                        f"v{BACKTEST_ENGINE_VERSION} (stats-affecting change) — re-queued for validation"
+                    ),
+                    actor="engine_rebaseline",
+                    force=False,
+                )
+                with get_db() as conn:
+                    _reset_workflow_to_pending(
+                        conn, workflow_id, _now(),
+                        reason=f"engine re-baseline: artifacts predate engine v{BACKTEST_ENGINE_VERSION}",
+                    )
+                kv_set(marker_key, {"at": now, "action": "revived"})
+                summary["revived"] += 1
+            else:
+                if summary["reset"] >= max(int(limit), 1):
+                    continue
+                if not workflow_id:
+                    continue  # backfill_missing_quick_screen_workflows owns creation
+                with get_db() as conn:
+                    _reset_workflow_to_pending(
+                        conn, workflow_id, _now(),
+                        reason=f"engine re-baseline: artifacts predate engine v{BACKTEST_ENGINE_VERSION}",
+                    )
+                kv_set(marker_key, {"at": now, "action": "reset"})
+                summary["reset"] += 1
+        except Exception:
+            log.exception("Engine re-baseline: failed to re-queue strategy %s", strategy_id)
+
+    if summary["reset"] or summary["revived"]:
+        log.info(
+            "Engine re-baseline (v%d): %d workflow(s) reset, %d archived strategy(ies) revived, %d converged",
+            BACKTEST_ENGINE_VERSION, summary["reset"], summary["revived"], summary["converged"],
+        )
+    return summary
+
+
 def requeue_retryable_blocked_steps(*, limit: int = 50) -> int:
     """Re-queue retryable blocked steps so they are actually re-driven.
 
@@ -1172,7 +1387,18 @@ def drain_exhausted_blocked_steps(*, limit: int = 50) -> int:
             if not isinstance(payload, dict):
                 payload = {}
             payload["exhausted"] = True
-            payload.setdefault("message", "retries exhausted; drained to failed_gate")
+            # A drained transient block is a RUNTIME/DATA exhaustion, not a quality
+            # verdict — the strategy's edge was never judged. Stamp that on the
+            # payload so the archive record (via _failed_gate_reason) and any later
+            # triage can never mistake it for a merit failure.
+            payload["merit"] = False
+            payload.setdefault("reason_code", "retries_exhausted")
+            original_message = str(payload.get("message") or "").strip()
+            payload["message"] = (
+                "Retries exhausted on a transient block — NOT a merit verdict; "
+                "the strategy was never judged by the gate"
+                + (f" (last block: {original_message})" if original_message else "")
+            )
             payload["retryable"] = False
             conn.execute(
                 """
@@ -1251,6 +1477,16 @@ def tick_active_gauntlet_workflows(
     Per-workflow exceptions are caught and logged so a single bad
     workflow cannot block the rest of the queue.
     """
+    # Engine-version re-baseline FIRST: it may revive archived strategies and reset
+    # failed_gate workflows to pending, and must land before this tick's demote
+    # sweep runs (which only archives workflows still in failed_gate) — otherwise a
+    # just-revived strategy with its old failed_gate workflow would be instantly
+    # re-archived by the same tick.
+    try:
+        engine_rebaseline = requeue_stale_engine_artifacts(limit=max_workflows)
+    except Exception:
+        log.exception("Gauntlet tick: engine re-baseline sweep failed")
+        engine_rebaseline = {"reset": 0, "revived": 0, "converged": 0}
     backfilled = backfill_missing_quick_screen_workflows(limit=max_workflows)
     # Re-queue retryable blocked steps BEFORE demoting failed_gate strategies, so a
     # transiently-blocked (not failed) step is re-driven rather than mistaken for a
@@ -1269,6 +1505,7 @@ def tick_active_gauntlet_workflows(
     summary: dict[str, Any] = {
         "ok": True,
         "workflows_seen": len(workflow_ids),
+        "engine_rebaseline": engine_rebaseline,
         "backfilled": backfilled,
         "requeued_blocked": requeued,
         "drained_exhausted": drained,

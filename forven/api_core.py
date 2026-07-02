@@ -6066,8 +6066,10 @@ def _persist_backtest_result_row(
     if not normalized_strategy_id:
         raise ValueError("strategy_id is required")
 
+    from forven.engine_provenance import stamp_engine_version
+
     metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
-    config_json = json.dumps(config or {}, separators=(",", ":"), default=str)
+    config_json = json.dumps(stamp_engine_version(config), separators=(",", ":"), default=str)
     created_value = str(created_at or _now()).strip() or _now()
     start_value = str(start_date or "").strip() or None
     end_value = str(end_date or "").strip() or None
@@ -6137,8 +6139,10 @@ def _persist_backtest_result_row(
 
 def _update_optimization_result_row(*, result_id: str, metrics: dict, config: dict) -> None:
     """Update an existing backtest_results row with final optimization data."""
+    from forven.engine_provenance import stamp_engine_version
+
     metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
-    config_json = json.dumps(config or {}, separators=(",", ":"), default=str)
+    config_json = json.dumps(stamp_engine_version(config), separators=(",", ":"), default=str)
     with get_db() as conn:
         conn.execute(
             "UPDATE backtest_results SET metrics_json = ?, config_json = ? WHERE result_id = ?",

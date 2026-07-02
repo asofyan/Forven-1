@@ -1078,6 +1078,53 @@ def _check_validation_freshness(strategy_id: str, required_types: list[str] | No
     return True, "All validation tests are fresh"
 
 
+def _check_engine_artifact_freshness(strategy_id: str, required_types: list[str] | None = None) -> tuple[bool, str]:
+    """Verify the latest validation artifacts were produced by the CURRENT engine.
+
+    A stats-affecting engine change bumps BACKTEST_ENGINE_VERSION; artifacts
+    stamped with an older version describe an engine that no longer exists and
+    must never be compared against fresh numbers. The gauntlet sweep
+    (engine.requeue_stale_engine_artifacts) re-queues the validation suite, so
+    this check self-resolves — its reason code (stale_engine_artifacts) is
+    counter-exempt and never drains to failed_gate. Unstamped (pre-provenance)
+    artifacts are grandfathered as current (see forven/engine_provenance.py).
+    """
+    from forven.engine_provenance import (
+        BACKTEST_ENGINE_VERSION,
+        artifact_engine_version,
+        is_stale_engine_artifact,
+    )
+
+    required = {
+        _canonicalize_gauntlet_verdict_test(rt)
+        for rt in (required_types or [])
+        if str(rt or "").strip()
+    }
+    validation_types = sorted(required) if required else list(_GAUNTLET_VALIDATION_TYPES)
+    stale: list[str] = []
+    with get_db() as conn:
+        for vt in validation_types:
+            row = conn.execute(
+                """SELECT config_json FROM backtest_results
+                   WHERE strategy_id = ?
+                     AND LOWER(TRIM(COALESCE(result_type, 'backtest'))) = ?
+                     AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
+                   ORDER BY datetime(created_at) DESC LIMIT 1""",
+                (strategy_id, vt),
+            ).fetchone()
+            if row and is_stale_engine_artifact(row["config_json"]):
+                stamped = artifact_engine_version(row["config_json"])
+                stale.append(f"{vt} (engine v{stamped})")
+
+    if stale:
+        return (
+            False,
+            f"Validation artifacts predate the current engine version "
+            f"(v{BACKTEST_ENGINE_VERSION}) and are queued for re-validation: {', '.join(stale)}",
+        )
+    return True, "All validation artifacts match the current engine version"
+
+
 def _check_artifact_rows_exist(strategy_id: str, required_types: list[str]) -> tuple[bool, str]:
     """Verify each required validation has a persisted, passing verdict payload."""
     required = {_canonicalize_gauntlet_verdict_test(rt) for rt in required_types if str(rt or "").strip()}
@@ -1730,6 +1777,8 @@ def _validation_row_to_verdict_payload(result_type: str, metrics: dict, config: 
 
 
 def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> tuple[dict[str, object], str | None]:
+    from forven.engine_provenance import is_stale_engine_artifact
+
     payloads: dict[str, object] = {}
     fallback_payloads: dict[str, object] = {}
 
@@ -1742,6 +1791,10 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
                 fallback_payloads.setdefault(normalized_name, payload)
 
     verdict_blob = _parse_json_blob(row["verdict"], {}) if row and row["verdict"] else {}
+    # A cached strategy verdict blob stamped by a DIFFERENT engine version is
+    # stale evidence in its entirety — never let it backfill test payloads.
+    if is_stale_engine_artifact(verdict_blob):
+        verdict_blob = {}
     stored_tests = verdict_blob.get("tests") if isinstance(verdict_blob, dict) else {}
     if isinstance(stored_tests, dict):
         for test_name, payload in stored_tests.items():
@@ -1764,9 +1817,10 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             (strategy_id,),
         ).fetchall()
 
+    stale_engine_types: set[str] = set()
     for result_row in rows:
         normalized_type = _canonicalize_gauntlet_verdict_test(result_row["result_type"])
-        if normalized_type in payloads:
+        if normalized_type in payloads or normalized_type in stale_engine_types:
             continue
         metrics_blob = _parse_json_blob(result_row["metrics_json"], {})
         config_blob = _parse_json_blob(result_row["config_json"], {})
@@ -1774,6 +1828,16 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
             metrics_blob = {}
         if not isinstance(config_blob, dict):
             config_blob = {}
+        # A verdict produced by a DIFFERENT engine version must never be compared
+        # against fresh numbers. It CLAIMS its test type (so an even-older row or
+        # the cached fallback blob cannot sneak in as the verdict) but contributes
+        # no payload: the test reads as MISSING evidence, the gate blocks with the
+        # counter-exempt stale_engine_artifacts code, and the gauntlet sweep
+        # re-queues the run. Unstamped legacy rows are grandfathered (see
+        # forven/engine_provenance.py).
+        if is_stale_engine_artifact(config_blob):
+            stale_engine_types.add(normalized_type)
+            continue
         status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
         if status in {"pending", "queued", "running", "started", "submitted"}:
             continue
@@ -1808,6 +1872,8 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
         payloads[normalized_type] = payload
 
     for test_name, payload in fallback_payloads.items():
+        if test_name in stale_engine_types:
+            continue  # type is claimed by a stale-engine artifact — no backfill
         existing = payloads.get(test_name)
         if not isinstance(existing, dict) or not isinstance(payload, dict):
             payloads.setdefault(test_name, payload)
@@ -2234,6 +2300,13 @@ def _extract_reason_code(reason_text: str) -> str:
     # before the quality-failure matches so they get their own (counter-exempt) codes.
     if "persisted optimization or walk-forward run" in text:
         return "artifacts_pending"
+    # Engine-version staleness: the artifacts were produced by a DIFFERENT
+    # backtest engine (stats-affecting change bumped BACKTEST_ENGINE_VERSION).
+    # They are awaiting automatic re-validation — absence of current evidence,
+    # not evidence of a bad edge. Matched before stale_validation so the more
+    # specific code wins.
+    if "engine version" in text or "stale-engine" in text:
+        return "stale_engine_artifacts"
     if "stale validation tests" in text or "ordering violation" in text:
         return "stale_validation"
     if "zero trades" in text or "produces no signals" in text:
@@ -2304,8 +2377,15 @@ def _load_metrics_snapshot_for_rejection(strategy_id: str) -> dict | None:
 
 def _log_gate_rejection_record(strategy_id: str, gate: str, reason_text: str, config: dict):
     """P0-2/P3-1: Log structured gate rejection with failure taxonomy fields."""
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+
     reason_code = _extract_reason_code(reason_text)
     metrics_snapshot = _load_metrics_snapshot_for_rejection(strategy_id)
+    # Provenance: which engine produced the numbers this rejection judged. Lets
+    # triage distinguish "rejected by the current engine" from "rejected on
+    # since-fixed math" without archaeology.
+    metrics_snapshot = dict(metrics_snapshot or {})
+    metrics_snapshot["engine_version"] = BACKTEST_ENGINE_VERSION
     gate_config = config.get(gate, {})
     resolved_thresholds = {k: v for k, v in gate_config.items() if isinstance(v, (int, float, str, bool))}
 
@@ -2366,6 +2446,9 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     "no_metrics_error",
     "artifacts_pending",
     "stale_validation",
+    # Artifacts from a previous BACKTEST_ENGINE_VERSION awaiting automatic
+    # re-validation (engine_provenance) — says nothing about edge quality.
+    "stale_engine_artifacts",
     "missing_evidence",
     # Paper warm-up: not enough forward days/trades accumulated yet (L-21).
     "insufficient_paper_evidence",
@@ -3422,6 +3505,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     freshness_ok, freshness_msg = _check_validation_freshness(strategy_id, list(required_tests) if required_tests else None)
     if not freshness_ok:
         return False, freshness_msg
+    engine_ok, engine_msg = _check_engine_artifact_freshness(strategy_id, list(required_tests) if required_tests else None)
+    if not engine_ok:
+        return False, engine_msg
 
     metrics = _load_metrics_blob(row)
     if not metrics:

@@ -164,10 +164,12 @@ def create_or_get_workflow(
     settings_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from forven.db import get_db
+    from forven.engine_provenance import stamp_engine_version
 
     clean_strategy_id = str(strategy_id or "").strip()
     if not clean_strategy_id:
         raise ValueError("strategy_id is required")
+    settings_snapshot = stamp_engine_version(settings_snapshot)
 
     with get_db() as conn:
         init_gauntlet_schema(conn)
@@ -322,7 +324,9 @@ def add_artifact(
     payload: dict[str, Any] | None = None,
 ) -> None:
     from forven.db import get_db
+    from forven.engine_provenance import stamp_engine_version
 
+    payload = stamp_engine_version(payload)
     with get_db() as conn:
         init_gauntlet_schema(conn)
         conn.execute(
