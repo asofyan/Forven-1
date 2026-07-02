@@ -366,7 +366,9 @@ def test_enrich_no_files_returns_original(tmp_path):
     with patch("forven.data_manager.FUNDING_DIR", tmp_path / "funding"), \
          patch("forven.data_manager.OI_DIR", tmp_path / "oi"), \
          patch("forven.data_manager.DERIVATIVES_DIR", tmp_path / "derivatives"), \
-         patch("forven.data_manager.MACRO_DIR", tmp_path / "macro"):
+         patch("forven.data_manager.MACRO_DIR", tmp_path / "macro"), \
+         patch("forven.data_manager.BASIS_DIR", tmp_path / "basis"), \
+         patch("forven.data_manager.VOL_DIR", tmp_path / "volatility"):
         result = dm.enrich(df, "BTC-USDT", "1h")
 
     assert list(result.columns) == list(df.columns)
