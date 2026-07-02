@@ -533,6 +533,10 @@ _PORTFOLIO_BUDGET_DEFAULTS = {
     "live_max_total_open_risk_pct": 5.0,
     "live_max_asset_exposure_pct": 150.0,
     "live_max_group_exposure_pct": 200.0,
+    # CORR-1: cap on the MEASURED correlation-weighted (effective) exposure —
+    # catches what the static group cap can't: drifting correlations, cross-
+    # group pairs, and direction offsets (see forven.portfolio_correlation).
+    "live_max_effective_exposure_pct": 200.0,
     "live_hard_max_per_trade_risk_pct": 2.0,
     "live_hard_max_order_notional_pct": 100.0,
     "live_max_book_notional_pct": 100.0,
@@ -778,9 +782,28 @@ def check_live_portfolio_budget(
             f"equity (${max_group_usd:,.0f})"
         )
 
+    # CORR-1: measured-correlation effective exposure. The static group check
+    # above only sees its fixed buckets; this one weights every open position by
+    # its ROLLING return correlation to the candidate (shorts offset, cross-group
+    # correlation counts). The check itself never raises — an internal fault
+    # refuses the open (fail closed), consistent with every gate above.
+    try:
+        from forven.portfolio_correlation import check_effective_correlated_exposure
+
+        corr_ok, corr_reason = check_effective_correlated_exposure(
+            asset_u, direction, add_notional, exposure["positions"], eq, settings,
+        )
+    except Exception as exc:
+        log.error("Correlation budget check failed: %s", exc, exc_info=True)
+        corr_ok, corr_reason = False, (
+            "correlation budget: check errored — refusing the live open (fail closed)"
+        )
+    if not corr_ok:
+        return False, corr_reason
+
     return True, (
         f"portfolio budget OK: risk ${new_total_risk:,.0f}/${max_risk_usd:,.0f}, "
-        f"'{group}' net ${abs(new_group_net):,.0f}/${max_group_usd:,.0f}"
+        f"'{group}' net ${abs(new_group_net):,.0f}/${max_group_usd:,.0f}; {corr_reason}"
     )
 
 
@@ -980,7 +1003,24 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         "per_book": per_book,
         "positions": exposure["positions"],
         "groups": {g: list(assets) for g, assets in CORRELATION_GROUPS.items()},
+        # CORR-1: measured pairwise correlations across held assets, so the
+        # operator sees WHY the effective-exposure gate priced two positions as
+        # one bet. None = unmeasurable pair (falls back conservative at the gate).
+        "held_pair_correlations": _held_pair_correlations_safe(exposure["positions"], settings),
+        "effective_exposure_limit_usd": (
+            round(limits_pct["live_max_effective_exposure_pct"] / 100.0 * eq, 2) if eq else None
+        ),
     }
+
+
+def _held_pair_correlations_safe(positions: list[dict], settings: dict) -> dict:
+    try:
+        from forven.portfolio_correlation import held_pair_correlations
+
+        return held_pair_correlations(positions, settings)
+    except Exception:
+        log.debug("held-pair correlation snapshot failed", exc_info=True)
+        return {}
 
 
 def can_open(

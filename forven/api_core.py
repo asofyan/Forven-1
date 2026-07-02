@@ -2600,9 +2600,19 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             ("live_hard_max_order_notional_pct", 100.0),
             # BOOK-BUDGET-1: per-wallet gross-notional cap (forven.exchange.risk).
             ("live_max_book_notional_pct", 100.0),
+            # CORR-1: measured-correlation effective-exposure gate
+            # (forven.portfolio_correlation via check_live_portfolio_budget).
+            ("live_max_effective_exposure_pct", 200.0),
+            ("live_correlation_window_bars", 720.0),
+            ("live_correlation_missing_default", 1.0),
         ):
             if _pb_key in payload:
                 updates[_pb_key] = _coerce_float(payload.get(_pb_key), _coerce_float(updates.get(_pb_key), _pb_default))
+        if "live_correlation_budget_enabled" in payload:
+            updates["live_correlation_budget_enabled"] = _coerce_bool(
+                payload.get("live_correlation_budget_enabled"),
+                bool(updates.get("live_correlation_budget_enabled", True)),
+            )
         # EQ-BASIS-1: whether the master wallet counts toward the live equity
         # basis when direction books are enabled (forven.daemon).
         if "live_equity_include_master" in payload:
