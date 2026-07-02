@@ -29,8 +29,15 @@ MIN_COMPLETENESS = 0.98
 # distorts indicators/exits far more than scattered missing bars.
 MAX_GAP_BARS = 12
 # Freshness: when the window ends "now", the last stored bar may lag by at
-# most this many bars (collection cadence + one closing bar).
+# most max(MAX_STALENESS_BARS bars, FRESHNESS_FLOOR_HOURS). The absolute floor
+# matters for FAST timeframes: collection cadences (15-min keep-alive rotation
+# for traded symbols, 30-min catch-up for the research catalog) mean a 1m
+# series is legitimately tens of minutes behind — a bars-only limit would
+# demand 3-minute freshness no collector provides and permanently block every
+# 1m series. For an eval window of weeks, a tail lagging under the floor is
+# immaterial to the verdict.
 MAX_STALENESS_BARS = 3
+FRESHNESS_FLOOR_HOURS = 2.0
 
 
 @dataclass
@@ -151,12 +158,17 @@ def check_series_quality(
 
         # Freshness only matters when the window ends around "now".
         if end >= now - pd.Timedelta(milliseconds=tf_ms):
-            staleness_bars = (now - last_ts).total_seconds() * 1000 / tf_ms
-            verdict.details["staleness_bars"] = round(staleness_bars, 2)
-            if staleness_bars > float(max_staleness_bars) + 1:  # +1: the closing bar itself
+            staleness_hours = (now - last_ts).total_seconds() / 3600.0
+            allowed_hours = max(
+                (float(max_staleness_bars) + 1) * tf_ms / 3_600_000.0,  # +1: the closing bar itself
+                FRESHNESS_FLOOR_HOURS,
+            )
+            verdict.details["staleness_hours"] = round(staleness_hours, 2)
+            verdict.details["allowed_staleness_hours"] = round(allowed_hours, 2)
+            if staleness_hours > allowed_hours:
                 verdict.ok = False
                 verdict.reasons.append(
-                    f"freshness: last bar {staleness_bars:.1f} bars old (limit {int(max_staleness_bars)})"
+                    f"freshness: last bar {staleness_hours:.1f}h old (limit {allowed_hours:.1f}h)"
                 )
 
         return verdict

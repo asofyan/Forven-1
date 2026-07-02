@@ -102,6 +102,37 @@ class TestQualityGate:
         verdict = check_series_quality("ZZZ-USDT", TF)
         assert not verdict.ok
 
+    def test_fast_timeframe_freshness_uses_absolute_floor(self, lake):
+        """A 1m series ~30 min behind is the NORMAL steady state under the
+        collection cadences (15-min keep-alive rotation / 30-min catch-up) —
+        the bars-only limit would demand 3-minute freshness and permanently
+        block every 1m series (the AAVE/USDT 'GATE BLOCKED: 29.1 bars old'
+        report). Within the 2h floor passes; genuinely stale still fails."""
+        from forven.dataeng.quality_gate import check_series_quality
+
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        def _minute_bars(end_minutes_ago: int, count: int) -> pd.DataFrame:
+            start = now - timedelta(minutes=end_minutes_ago + count)
+            return pd.DataFrame(
+                [
+                    {
+                        "timestamp": start + timedelta(minutes=i),
+                        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1.0,
+                    }
+                    for i in range(count)
+                ]
+            )
+
+        data_mod.save_parquet(_minute_bars(end_minutes_ago=30, count=300), SYMBOL, "1m")
+        fresh_enough = check_series_quality(SYMBOL, "1m")
+        assert fresh_enough.ok, fresh_enough.reasons
+
+        data_mod.save_parquet(_minute_bars(end_minutes_ago=300, count=300), SYMBOL, "1m")
+        genuinely_stale = check_series_quality(SYMBOL, "1m")
+        assert not genuinely_stale.ok
+        assert any(r.startswith("freshness") for r in genuinely_stale.reasons)
+
 
 class TestFingerprints:
     def test_fingerprint_fields_and_drift(self, lake):
