@@ -2783,6 +2783,25 @@ def reconcile_exchange_positions(
                 db_by_asset.setdefault(asset, []).append({"id": adopted["trade_id"], "asset": asset})
                 continue
 
+            # Testnet execution harness: a scheduled end-to-end check owns a tiny
+            # position on this asset for a bounded window (kv marker with TTL) — it is
+            # EXPECTED, not an orphan. Suppressing here prevents the reconciler from
+            # arming an emergency stop the harness doesn't track and from raising a
+            # divergence over its own daily proof run. Honored on TESTNET only — a
+            # mainnet reconcile never skips anything for the harness.
+            if testnet:
+                try:
+                    from forven.testnet_harness import harness_position_expected
+                    if harness_position_expected(asset):
+                        log.info(
+                            "RECONCILIATION (expected): testnet harness owns %s for its "
+                            "lifecycle check — skipped",
+                            asset,
+                        )
+                        continue
+                except Exception:
+                    log.debug("testnet-harness reconcile marker check failed", exc_info=True)
+
             # LIVE-EXCHANGE-RECONCILE-1: a real exchange position with no matching SQLite
             # trade that appears DURING a run (an open whose DB insert crashed, a
             # partial-fill survivor, a manual position) must NOT sit naked until the next

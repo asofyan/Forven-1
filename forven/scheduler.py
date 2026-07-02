@@ -1705,7 +1705,7 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                 log.info("orphan_type_scan: no orphan strategies found")
             return "ok", None
 
-        # Slippage monitor — audit signal vs fill quality and store to ChromaDB
+        # Slippage monitor — audit signal vs fill quality
         if kind == "slippage_monitor":
             from forven.monitoring import run_slippage_monitor
             await _run_sync_job(
@@ -1743,6 +1743,23 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             except Exception as e:
                 log.error("Recalibration job failed: %s", e)
                 return "error", str(e)
+
+        # Testnet end-to-end execution harness — proves the full LIVE order
+        # lifecycle (open -> stop mirror -> trailing tighten -> close) against
+        # HL testnet, exchange-truth asserted per leg. Skips cleanly off-testnet.
+        if kind == "testnet_execution_harness":
+            from forven.testnet_harness import run_testnet_execution_harness
+            result = await _run_sync_job(
+                run_testnet_execution_harness,
+                asset=payload.get("asset"),
+                notional_usd=payload.get("notional_usd"),
+            )
+            status = str(result.get("status")) if isinstance(result, dict) else "unknown"
+            if status == "failed":
+                log.error("Testnet execution harness FAILED — see kv forven:testnet_harness:last_run")
+                return "error", "testnet execution harness failed"
+            log.info("Testnet execution harness: %s", status)
+            return "ok", None
 
         # Ghost container scan — detect strategies with missing/broken containers
         if kind == "ghost_container_scan":
@@ -3091,6 +3108,21 @@ def seed_forven_jobs():
         command="orphan-type-scan",
         timezone_str="UTC",
         payload={"kind": "orphan_type_scan", "auto_demote": False},
+    )
+
+    # 4e. Testnet Execution Harness — daily end-to-end proof of the LIVE order
+    # lifecycle against Hyperliquid testnet (open -> stop mirror -> trailing
+    # tighten -> close -> no residuals, exchange truth asserted per leg).
+    # Skips cleanly when the configured network is not testnet, sim is active,
+    # or the kill switch is on. Report: kv forven:testnet_harness:last_run.
+    add_job(
+        job_id="forven-testnet-harness",
+        name="Testnet Execution Harness",
+        schedule_type="cron",
+        schedule_expr="30 5 * * *",  # daily 05:30, after DB maintenance
+        command="testnet-harness",
+        timezone_str="America/Halifax",
+        payload={"kind": "testnet_execution_harness"},
     )
 
     # 5. Regime + Market Pot refresh — every 4 hours
