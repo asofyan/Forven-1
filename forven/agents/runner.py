@@ -1588,8 +1588,10 @@ async def _run_agent_task_inner(
             from forven.reporter import broadcast_agent_task
             loop = asyncio.get_event_loop()
             if loop.is_running():
+                # Attribute the crash to the agent that actually failed (this
+                # used to broadcast every crash as risk-manager).
                 loop.create_task(broadcast_agent_task(
-                    "risk-manager", "🔴 CRITICAL: Task Execution Failed",
+                    agent_id, "🔴 CRITICAL: Task Execution Failed",
                     f"Agent {agent_id} crashed while processing task '{task.get('title', 'Untitled')}'.\n\nError snippet:\n```\n{error_summary[:500]}\n```"
                 ))
         except Exception:

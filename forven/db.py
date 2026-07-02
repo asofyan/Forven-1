@@ -19,6 +19,14 @@ from forven.config import (
     WORKSPACE_DIR,
     ensure_dirs,
 )
+from forven.roster import (
+    RETIRED_OWNER_SUCCESSORS as _RETIRED_OWNER_SUCCESSORS,
+    STAGE_OWNER_GUARD as _STAGE_TO_OWNER_FOR_LOCK,
+    STAGE_TO_AGENT as _STAGE_TO_AGENT,
+    VALID_APPROVAL_OWNERS as _VALID_APPROVAL_OWNERS,
+    normalize_agent_id as _normalize_agent_id_for_lock,
+    normalize_stage_key as _normalize_stage_for_lock,
+)
 
 SCHEMA_VERSION = 28
 DEFAULT_ID_WIDTH = 5
@@ -201,28 +209,12 @@ _PHANTOM_RECOVERY_INLINE_ELIGIBLE_STAGES = frozenset(
 )
 
 
-_VALID_APPROVAL_OWNERS = {
-    "quant-researcher",
-    "strategy-developer",
-    "risk-manager",
-    "simulation-agent",
-    "execution-trader",
-    "ceo",
-    "brain",
-    "system",
-}
-
-_LEGACY_APPROVAL_OWNER_ALIASES = {
-    "backtest-engineer": "simulation-agent",
-    "system": "brain",
-}
-
-
 def _normalize_approval_owner(value: str | None) -> str | None:
     normalized = str(value or "").strip().lower()
     if not normalized:
         return None
-    normalized = _LEGACY_APPROVAL_OWNER_ALIASES.get(normalized, normalized)
+    # Retired owners (incl. execution-trader) carry forward to their successor.
+    normalized = _RETIRED_OWNER_SUCCESSORS.get(normalized, normalized)
     return normalized if normalized in _VALID_APPROVAL_OWNERS else None
 
 
@@ -4695,17 +4687,7 @@ def create_strategy_container(
         type_=type_,
         strategy_id=final_strategy_id,
     )
-    owner_by_stage = {
-        "quick_screen": "simulation-agent",
-        "research_only": "strategy-developer",
-        "gauntlet": "simulation-agent",
-        "paper": "risk-manager",
-        # execution-trader retired — live oversight owned by risk-manager.
-        "live_graduated": "risk-manager",
-        "archived": None,
-        "rejected": None,
-    }
-    owner = owner_by_stage.get(normalized_stage)
+    owner = _STAGE_TO_AGENT.get(normalized_stage)
     now = _now()
     normalized_hypothesis_id = str(hypothesis_id or "").strip() or None
     normalized_origin_task_id = str(origin_task_id or "").strip() or None
@@ -5005,41 +4987,8 @@ def _extract_strategy_id(task_input: object) -> str | None:
     return normalized or None
 
 
-def _normalize_agent_id_for_lock(agent_id: str | None) -> str:
-    normalized = str(agent_id or "").strip().lower()
-    if normalized == "backtest-engineer":
-        return "simulation-agent"
-    if normalized == "system":
-        return "brain"
-    return normalized
-
-
-_STAGE_TO_OWNER_FOR_LOCK = {
-    "quick_screen": "simulation-agent",
-    "gauntlet": "simulation-agent",
-    "paper": "risk-manager",
-    # execution-trader retired — live oversight owned by risk-manager.
-    "live_graduated": "risk-manager",
-}
-
-
-def _normalize_stage_for_lock(value: str | None) -> str:
-    normalized = str(value or "").strip().lower()
-    aliases = {
-        "researching": "quick_screen",
-        "developing": "quick_screen",
-        "backtesting": "gauntlet",
-        "paper_trading": "paper",
-        "papertrading": "paper",
-        "paper-trading": "paper",
-        "review": "live_graduated",
-        "ceoreview": "live_graduated",
-        "ceo-review": "live_graduated",
-        "ceo_review": "live_graduated",
-        "deployed": "live_graduated",
-        "retired": "archived",
-    }
-    return aliases.get(normalized, normalized)
+# _normalize_agent_id_for_lock, _STAGE_TO_OWNER_FOR_LOCK and
+# _normalize_stage_for_lock are imported from forven.roster (canonical).
 
 
 def _claim_ownership_for_task(conn: sqlite3.Connection, agent_id: str, task: sqlite3.Row) -> tuple[str | None, str | None]:
