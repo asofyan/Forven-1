@@ -47,6 +47,7 @@
 	import { ORDERED_TIMEFRAME_VALUES } from '$lib/config/timeframes';
 	import { workspaceContext, selectedDataset as selectedDatasetStore } from '$lib/stores';
 	import { forvenLivePrices } from '$lib/stores/forvenWebSocket';
+	import { applyTickToBars } from '$lib/utils/liveBars';
 	import { setPageContext } from '$lib/stores/pageContext';
 	import { createPoller, type Poller } from '$lib/utils/polling';
 
@@ -610,16 +611,13 @@
 
 	function applyLivePriceToChart(nextPrice: number): void {
 		if (!selectedSession || selectedSession.mode === 'replay' || chartBars.length === 0) return;
-		const lastBar = chartBars[chartBars.length - 1];
-		if (!lastBar || Math.abs(lastBar.close - nextPrice) < 1e-9) return;
-		const nextBars = [...chartBars];
-		nextBars[nextBars.length - 1] = {
-			...lastBar,
-			close: nextPrice,
-			high: Math.max(lastBar.high, nextPrice),
-			low: Math.min(lastBar.low, nextPrice),
-		};
-		chartBars = nextBars;
+		// Exchange-style live candles: each WS tick paints the FORMING bar and ROLLS a
+		// new candle at the timeframe boundary — previously ticks kept mutating the old
+		// last bar until the 15s bundle poll delivered the new one.
+		const nextBars = applyTickToBars(chartBars, nextPrice, Date.now(), activeVisualChartTimeframe);
+		if (nextBars !== chartBars) {
+			chartBars = nextBars;
+		}
 	}
 
 	function applyRealtimePriceSnapshot(priceMap: Record<string, number>): void {
@@ -1567,6 +1565,14 @@
 		if (selectedSession?.id !== sessionId) return;
 
 		chartBars = [...(bundle.bars ?? [])];
+		// The bundle's bars are closed-bar data up to ~15s stale — immediately re-apply
+		// the freshest WS tick so the reload never clobbers the forming live candle.
+		if (selectedSession && selectedSession.mode !== 'replay' && chartBars.length > 0) {
+			const livePrice = resolveLivePriceForSymbol(selectedSession.symbol, latestLivePrices);
+			if (livePrice !== null) {
+				chartBars = applyTickToBars(chartBars, livePrice, Date.now(), chartTimeframe);
+			}
+		}
 		applyLatestRealtimeSnapshot();
 		loadingBars = false;
 
