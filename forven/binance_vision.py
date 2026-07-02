@@ -134,7 +134,11 @@ class BinanceVisionClient:
     def _parse_ohlcv_csv(zip_bytes: bytes) -> pd.DataFrame | None:
         """Parse Binance klines ZIP → DataFrame with OHLCV schema.
 
-        CSV has a header row: open_time, open, high, low, close, volume, ...
+        Archives from ~2022 onwards carry a header row (open_time, open, high,
+        low, close, volume, ...); OLDER archives are HEADERLESS with the same
+        fixed column order. Assuming a header silently skipped every pre-2022
+        month ("Usecols do not match columns"), truncating deep history —
+        sniff the first line and parse either layout.
         """
         try:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -142,11 +146,26 @@ class BinanceVisionClient:
                 if csv_name is None:
                     return None
                 raw = _read_zip_member_capped(zf, csv_name)
-            df = pd.read_csv(
-                io.BytesIO(raw),
-                usecols=["open_time", "open", "high", "low", "close", "volume"],
-                dtype={"open": float, "high": float, "low": float, "close": float, "volume": float},
-            )
+            first_line = raw.split(b"\n", 1)[0]
+            if first_line.startswith(b"open_time"):
+                df = pd.read_csv(
+                    io.BytesIO(raw),
+                    usecols=["open_time", "open", "high", "low", "close", "volume"],
+                    dtype={"open": float, "high": float, "low": float, "close": float, "volume": float},
+                )
+            else:
+                # Headerless legacy layout — fixed Binance kline column order.
+                df = pd.read_csv(
+                    io.BytesIO(raw),
+                    header=None,
+                    names=[
+                        "open_time", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_volume", "count",
+                        "taker_buy_volume", "taker_buy_quote_volume", "ignore",
+                    ],
+                    usecols=["open_time", "open", "high", "low", "close", "volume"],
+                    dtype={"open": float, "high": float, "low": float, "close": float, "volume": float},
+                )
             df = df.rename(columns={"open_time": "timestamp"})
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             return df.sort_values("timestamp").reset_index(drop=True)
@@ -166,11 +185,23 @@ class BinanceVisionClient:
                 if csv_name is None:
                     return None
                 raw = _read_zip_member_capped(zf, csv_name)
-            df = pd.read_csv(
-                io.BytesIO(raw),
-                usecols=["calc_time", "last_funding_rate"],
-                dtype={"last_funding_rate": float},
-            )
+            first_line = raw.split(b"\n", 1)[0]
+            if first_line.startswith(b"calc_time"):
+                df = pd.read_csv(
+                    io.BytesIO(raw),
+                    usecols=["calc_time", "last_funding_rate"],
+                    dtype={"last_funding_rate": float},
+                )
+            else:
+                # Headerless legacy layout — calc_time, funding_interval_hours,
+                # last_funding_rate (same sniff rationale as _parse_ohlcv_csv).
+                df = pd.read_csv(
+                    io.BytesIO(raw),
+                    header=None,
+                    names=["calc_time", "funding_interval_hours", "last_funding_rate"],
+                    usecols=["calc_time", "last_funding_rate"],
+                    dtype={"last_funding_rate": float},
+                )
             df = df.rename(columns={"calc_time": "timestamp", "last_funding_rate": "funding_rate"})
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             return df.sort_values("timestamp").reset_index(drop=True)
