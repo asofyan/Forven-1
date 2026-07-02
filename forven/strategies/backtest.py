@@ -297,6 +297,7 @@ def _isolated_backtest_worker(
     include_funding: bool = True,
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
+    asset: str | None = None,
 ) -> dict:
     """Run IS/OOS signal walks in an isolated child process.
 
@@ -340,6 +341,7 @@ def _isolated_backtest_worker(
             fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
             trade_mode=trade_mode,
             execution_controls=execution_controls, initial_capital=initial_capital,
+            asset=asset, resolved_timeframe=resolved_timeframe,
         )
     except Exception as e:
         return {"error": f"Indicator execution failed during in-sample: {e}"}
@@ -361,6 +363,7 @@ def _isolated_backtest_worker(
                 fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
+                asset=asset, resolved_timeframe=resolved_timeframe,
             ),
             oos_start_timestamp,
         )
@@ -404,6 +407,7 @@ def _isolated_walk_forward_worker(
     include_funding: bool = True,
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
+    asset: str | None = None,
 ) -> dict:
     """Run walk-forward splits in an isolated child process.
 
@@ -452,6 +456,7 @@ def _isolated_walk_forward_worker(
                 fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
+                asset=asset, resolved_timeframe=resolved_timeframe,
             )
             if include_funding:
                 is_trades, _ = _apply_funding_to_trades(
@@ -476,6 +481,7 @@ def _isolated_walk_forward_worker(
                     fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                     trade_mode=trade_mode,
                     execution_controls=execution_controls, initial_capital=initial_capital,
+                    asset=asset, resolved_timeframe=resolved_timeframe,
                 ),
                 oos_boundary,
             )
@@ -8547,6 +8553,7 @@ def backtest_strategy(
                 resolved_include_funding,
                 execution_controls,
                 resolved_initial_capital,
+                asset,
             )
             try:
                 worker_result = future.result(timeout=backtest_timeout)
@@ -8588,6 +8595,7 @@ def backtest_strategy(
                             resolved_include_funding,
                             execution_controls,
                             resolved_initial_capital,
+                            asset,
                         )
                         worker_result = future.result(timeout=backtest_timeout)
                 except Exception as retry_e:
@@ -8614,6 +8622,7 @@ def backtest_strategy(
             resolved_include_funding,
             execution_controls,
             resolved_initial_capital,
+            asset,
         )
 
     if "error" in worker_result:
@@ -9077,7 +9086,7 @@ def backtest_strategy(
 
 
 
-    # Auto-store in ChromaDB for future recall (fire-and-forget)
+    # Feed the quant-skills learning loop (fire-and-forget)
 
 
     if run_id:
@@ -9086,7 +9095,7 @@ def backtest_strategy(
         try:
 
 
-            from forven.vectordb import store_backtest_result
+            from forven.quant_skills_extractor import record_backtest_for_learning
 
 
             from forven.strategies.fitness import compute_fitness_score
@@ -9137,7 +9146,7 @@ def backtest_strategy(
 
 
 
-            store_backtest_result(
+            record_backtest_for_learning(
 
 
                 strategy_id=strategy_id,
@@ -9180,7 +9189,7 @@ def backtest_strategy(
 
 
             log.warning(
-                "ChromaDB store failed for strategy=%s run_id=%s: %s",
+                "Quant-learning record failed for strategy=%s run_id=%s: %s",
                 strategy_id,
                 run_id,
                 e,
@@ -10647,6 +10656,7 @@ def walk_forward(
                 resolved_include_funding,
                 normalized_ec,
                 float(initial_capital),
+                asset,
             )
             try:
                 worker_result = future.result(timeout=walk_forward_timeout)
@@ -10683,6 +10693,7 @@ def walk_forward(
             resolved_include_funding,
             normalized_ec,
             float(initial_capital),
+            asset,
         )
 
     if "error" in worker_result:
@@ -10905,7 +10916,11 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
 
                      execution_controls: dict | None = None,
 
-                     initial_capital: float = 10000.0) -> list[dict]:
+                     initial_capital: float = 10000.0,
+
+                     asset: str | None = None,
+
+                     resolved_timeframe: str | None = None) -> list[dict]:
 
 
     """Run signal checker across a dataframe window and collect trades.
@@ -11073,6 +11088,8 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             trade_mode="long_only",
             execution_controls=execution_controls,
             initial_capital=initial_capital,
+            asset=asset,
+            resolved_timeframe=resolved_timeframe,
         )
         short_trades = _run_signal_walk(
             checker, df, params, warmup, leverage,
@@ -11084,6 +11101,8 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             trade_mode="short_only",
             execution_controls=execution_controls,
             initial_capital=initial_capital,
+            asset=asset,
+            resolved_timeframe=resolved_timeframe,
         )
         merged = sorted(long_trades + short_trades, key=lambda t: t.get("entry_bar", 0))
         for t in merged:
@@ -11453,6 +11472,7 @@ def preview_strategy_signals(
             strategy_obj=strategy_obj, strategy_type=family_type,
             fee_bps=0.0, slippage_bps=0.0, regime_gate=False,
             trade_mode=trade_mode or "long_only",
+            asset=asset, resolved_timeframe=timeframe or "1h",
         )
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"Signal generation failed: {exc}")
