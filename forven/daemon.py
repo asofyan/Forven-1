@@ -147,6 +147,12 @@ CANDLE_CACHE_BARS = 360
 # the shared account breaker since _run_tick is not itself interval-gated).
 LIQ_CHECK_INTERVAL_SECONDS = 60
 _LAST_LIQ_CHECK = [0.0]
+# Resting-order mark watcher: minimum seconds between armed stop/TP checks (WS
+# ticks can arrive many times per second; level checks don't need sub-second
+# granularity) and the bounded time for a check + any resulting DB closes.
+MARK_WATCH_MIN_INTERVAL_SECONDS = 1.0
+MARK_WATCH_TIMEOUT_SECONDS = 15.0
+_LAST_MARK_WATCH = [0.0]
 # KS-1: while the kill-switch is persisted-active, re-flatten any residual
 # position on this cadence (a missed/partial/failed first flatten, a restart
 # between state-persist and flatten, or a close timeout) instead of relying on
@@ -1550,6 +1556,15 @@ async def _run_risk_cycle() -> dict:
     return snapshot
 
 
+def _run_mark_watcher(prices: dict[str, float]) -> list[str]:
+    """Thread-side mark-watcher pass. Lazy import: forven.mark_watcher pulls the
+    scanner module (heavy) — pay that once on the first armed check, not at
+    daemon startup."""
+    from forven.mark_watcher import check_mark_exits
+
+    return check_mark_exits(prices)
+
+
 async def _run_tick(state: dict, prices: dict[str, float], source: str, last_reconcile: list[float]) -> None:
     """One daemon tick: publish prices FIRST (fresh), then enforce risk, reconcile periodically."""
     now = time.time()
@@ -1572,6 +1587,26 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
     state["last_prices"] = dict(snapshot.get("prices") or prices)
     state["last_price_source"] = source
     state["last_tick_ts"] = now
+
+    # Resting-order mark watcher: fill paper stop/TP the moment the level trades,
+    # like a real exchange trigger order (the scanner's closed-bar monitors are the
+    # catch-up backstop). Runs BEFORE the slow risk cycle so a touched level fills
+    # within ~a tick of the touch, interval-gated to ~1s.
+    if now - _LAST_MARK_WATCH[0] >= MARK_WATCH_MIN_INTERVAL_SECONDS:
+        _LAST_MARK_WATCH[0] = now
+        try:
+            mark_actions = await _to_thread_with_timeout(
+                "daemon.mark_watcher",
+                MARK_WATCH_TIMEOUT_SECONDS,
+                _run_mark_watcher,
+                prices,
+            )
+            if mark_actions:
+                log.info("Mark watcher: %s", "; ".join(mark_actions))
+                state["last_mark_watch_actions"] = list(mark_actions)
+                state["last_mark_watch_at"] = _iso_now()
+        except Exception as e:
+            log.warning("Mark watcher tick failed: %s", e)
 
     risk_snapshot = await _run_risk_cycle()
 

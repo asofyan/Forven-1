@@ -5732,12 +5732,35 @@ def _late_trade_funding_pct(
         return 0.0
 
 
+def _price_exit_bar_close_stamp(exit_time_value, timeframe: str) -> str | None:
+    """Bar-CLOSE stamp for an intrabar PRICE exit (stop/TP/trailing).
+
+    The kernel's exit_time is the breach bar's index LABEL — its OPEN time. A price
+    level is touched mid-bar, so stamping the label backdates the close to before the
+    touch was even possible (E0010: TP touched ~10:45Z, stamped 10:00Z). The earliest
+    moment the engine can know an intrabar breach from closed candles is the bar's
+    CLOSE — label + bar duration. None when the label won't parse (caller keeps the
+    raw label rather than dropping the stamp)."""
+    dt = _parse_iso_ts(exit_time_value)
+    if dt is None:
+        return None
+    try:
+        from forven.strategies.backtest import _hours_per_bar
+
+        hours = float(_hours_per_bar(str(timeframe or "1h")))
+    except Exception:
+        hours = 1.0
+    from datetime import timedelta
+
+    return (dt + timedelta(hours=hours)).isoformat()
+
+
 def _kernel_close_recorded(
     strat_id: str, strat: dict, row: dict, trade: dict, direction: str,
     *, closed_at_override: str | None = None,
     current_price: float | None = None, current_time: str | None = None,
     funding_df: "pd.DataFrame | None" = None, timeframe: str | None = None,
-    pending: bool = False,
+    pending: bool = False, mark_fill: bool = False,
 ) -> str | None:
     trade_id = str(row.get("id"))
     sd = parse_trade_signal_data(row.get("signal_data"))
@@ -5745,7 +5768,9 @@ def _kernel_close_recorded(
     exit_price = float(trade.get("exit_price") or 0.0)
     # Backtest-EXPECTED exit (the kernel's own fill), captured BEFORE the fill-now
     # override below so exit_slippage_bps measures expected-vs-actual, not fill-vs-fill.
-    kernel_exit_price = exit_price
+    # A mark-watcher close may carry a separate expected level (expected_exit_price)
+    # when its actual fill diverged from the armed level.
+    kernel_exit_price = _coerce_positive_float(trade.get("expected_exit_price")) or exit_price
     pnl_pct_net = float(trade.get("pnl_pct") or 0.0)  # kernel net, equity-fraction
     equity_at_entry = _coerce_positive_float(sd.get("kernel_equity_at_entry")) or _PAPER_SANDBOX_INITIAL_CAPITAL
     pnl_usd = round(float(equity_at_entry) * pnl_pct_net, 4)
@@ -5767,19 +5792,30 @@ def _kernel_close_recorded(
     _update_trade_fill(
         trade_id=trade_id, fill_price=exit_price, fill_kind="exit",
         signal_price=kernel_exit_price if kernel_exit_price > 0 else exit_price,
-        mark_price=exit_price,
+        # A mark-fill close fills at the LEVEL while the venue mark is the tick that
+        # touched it — record the real mark so the lag/slippage split stays honest.
+        mark_price=float(current_price) if (mark_fill and current_price) else exit_price,
     )
-    # closed_at = the kernel's actual EXIT-bar time (the trade really closed on the bar the
-    # kernel exited on, not the scan moment). close_trade_record stamps it directly.
+    # closed_at = when the trade really closed. For a SIGNAL/time-stop exit the kernel's
+    # exit_time (bar label) IS the fill moment (market-on-open fills at the label). For a
+    # PRICE exit (stop/TP/trailing) the breach is INTRABAR — the label backdates it to the
+    # bar OPEN, before the level was even touched — so stamp the bar CLOSE instead.
     # closed_at_override clamps it (used when a fill-now exit lands at/before the fill time)
     # so the trade is never negative-duration while still realizing the kernel exit PRICE.
     _exit_time = trade.get("exit_time")
     _closed_at = str(_exit_time).replace(" ", "T") if _exit_time else None
-    if fresh_exit and current_time:
+    if _closed_at and not mark_fill and exit_reason in _KERNEL_PRICE_EXIT_REASONS:
+        _resolved_tf = timeframe or str(
+            strat.get("timeframe") or (strat.get("params") or {}).get("timeframe") or "1h"
+        ).strip().lower() or "1h"
+        _closed_at = _price_exit_bar_close_stamp(_exit_time, _resolved_tf) or _closed_at
+    if (fresh_exit or mark_fill) and current_time:
+        # mark_fill: the daemon's tick watcher saw the level touched NOW — the stamp is
+        # the touch moment itself, exactly like a real resting order's fill time.
         _closed_at = str(current_time).replace(" ", "T")
     if closed_at_override:
         _closed_at = str(closed_at_override).replace(" ", "T")
-    if late or pending:
+    if late or pending or mark_fill:
         # FILL-NOW entry: the recorded entry is the current-mark fill price, NOT the kernel's
         # historical entry — so the kernel's historical-entry pnl_pct does NOT describe this
         # position (a PENDING close likewise has no kernel pnl at all — the kernel hasn't
@@ -5818,17 +5854,25 @@ def _kernel_close_recorded(
             # price resolution), so PnL is unchanged and the skew columns survive.
             trade_id, signal_exit_price=kernel_exit_price if kernel_exit_price > 0 else exit_price,
             exit_price=exit_price,
-            close_reason=exit_reason, close_price_source="kernel", closed_at=_closed_at,
+            close_reason=exit_reason,
+            close_price_source="mark_watcher" if mark_fill else "kernel",
+            closed_at=_closed_at,
             extra_signal_data={
-                "kernel_exit_time": trade.get("exit_time"), "kernel_managed": True,
-                "close_fill_now": fresh_exit, "funding_cost_pct": _funding_pct,
+                "kernel_exit_time": trade.get("exit_time"), "kernel_managed": bool(sd.get("kernel_managed", True)),
+                "close_fill_now": fresh_exit, "close_mark_fill": mark_fill,
+                "funding_cost_pct": _funding_pct,
             },
             pnl_override={
                 "pnl_pct": round(_pnl_eq, 8), "net_pnl_pct": round(_pnl_eq, 8),
                 "pnl_usd": _pnl_usd_eq, "equity_fraction": True,
             },
         )
-        _tag = "fill-now" if fresh_exit else "fill-now entry, historical exit"
+        if mark_fill:
+            _tag = "mark-fill"
+        elif fresh_exit:
+            _tag = "fill-now"
+        else:
+            _tag = "fill-now entry, historical exit"
         return f"KERNEL-CLOSE ({_tag}) {strat.get('asset')} {direction} @ {exit_price:.6g} pnl={_pnl_eq * 100:.2f}% ({exit_reason})"
     # Faithful kernel trade: write the kernel's NET equity-fraction values (the kernel
     # pnl_pct is net-of-drag, size-scaled equity impact — close_trade_record's own pnl is a
@@ -5946,6 +5990,11 @@ def _kernel_refresh_paper_trade(action) -> str | None:
     if str(sd.get("stop_loss_source") or "").strip().lower() != "manual":
         updates["stop_loss"] = pos.get("stop_price")
         updates["stop_loss_price"] = pos.get("stop_price")
+        # The kernel's EFFECTIVE protective level (fixed stop ∨ ratcheted trailing) —
+        # persisted so the daemon's mark watcher can arm it like a real resting stop
+        # order. The trailing ratchet previously lived only inside scan-time replay
+        # (enforced but unpersisted); None clears a stale level when the trail is gone.
+        updates["effective_stop_price"] = _kernel_effective_stop(pos, action.direction)
     if str(sd.get("take_profit_source") or "").strip().lower() != "manual":
         updates["take_profit"] = pos.get("target_price")
         updates["take_profit_price"] = pos.get("target_price")
@@ -6237,8 +6286,9 @@ def _kernel_handle_late_entry_exits(
             continue
 
         # Route through the SAME late-close path the reconciler uses (entry-based PnL from
-        # the hop-in price, kernel exit-bar timestamp), passing the re-anchored breach as a
-        # synthetic kernel trade. pnl_pct is ignored for late closes (recomputed from entry).
+        # the hop-in price, breach-bar CLOSE timestamp — an intrabar breach is only knowable
+        # at bar close), passing the re-anchored breach as a synthetic kernel trade.
+        # pnl_pct is ignored for late closes (recomputed from entry).
         synthetic = {
             "exit_price": float(exit_price),
             "pnl_pct": 0.0,
@@ -7352,134 +7402,179 @@ def _force_high_activity_signals(signal_rows: list[dict]) -> list[dict]:
     return forced_rows
 
 
+# Bounded worker pool for KERNEL-PAPER execution: each strategy's kernel replay +
+# local (DB-only) fills are independent of every other strategy's (unique-open index
+# is per strategy/asset/direction; each get_db() call opens its own connection;
+# close_trade_record is only-if-open atomic). Live/legacy items are NEVER pooled —
+# they share the exchange account and the portfolio-budget check, which must observe
+# each prior open before admitting the next.
+_EXEC_POOL_WORKERS = 8
+
+
 def _apply_execution_actions(signal_rows: list[dict], diagnostics_out: dict[str, dict] | None = None) -> list[str]:
-    """Apply execution logic for a previously evaluated signal matrix."""
+    """Apply execution logic for a previously evaluated signal matrix.
+
+    Kernel-PAPER strategies execute on a bounded thread pool (their work is local and
+    per-strategy independent); everything else (live kernel, legacy engines) keeps the
+    original sequential semantics on this thread, running CONCURRENTLY with the pool so
+    a fresh entry lands seconds after its scan instead of behind the whole sweep."""
     all_actions: list[str] = []
     account_equity = _get_account_equity()
 
+    paper_kernel_enabled = _paper_kernel_execution_enabled()
+    pooled: list[dict] = []
+    serial: list[dict] = []
     for item in signal_rows:
-        strat_id = str(item.get("strategy_id") or "")
-        if not strat_id:
-            continue
-        try:
-            strat = item["strategy"]
-            signal = item["signal"]
-            actions = None
-            kernel_mode: str | None = None  # 'paper' | 'live'
-            # Parity path: strategies with vectorized signals are managed by the shared
-            # backtest kernel (paper trades == backtest trades; live takes the SAME
-            # decisions with real fills).
-            if _paper_kernel_execution_enabled() and _is_kernel_paper_strategy(strat):
-                kernel_mode = "paper"
-                actions = manage_positions_via_kernel(
-                    strat_id, strat, account_equity=account_equity, execution_type="paper", diagnostics=diagnostics_out,
-                )
-            elif _live_kernel_execution_enabled() and _is_live_kernel_stage(strat):
-                kernel_mode = "live"
-                actions = manage_positions_via_kernel(
-                    strat_id, strat, account_equity=account_equity, execution_type="live", diagnostics=diagnostics_out,
-                )
+        strat = item.get("strategy") or {}
+        if str(item.get("strategy_id") or "") and paper_kernel_enabled and _is_kernel_paper_strategy(strat):
+            pooled.append(item)
+        else:
+            serial.append(item)
 
-            if actions is KERNEL_IMPURE_REFUSED:
-                # KCOPY-3: the purity guard refused this strategy as non-deterministic/
-                # stateful. It is untrustworthy on ANY engine — never downgrade it to the
-                # legacy per-bar engine (paper OR live), regardless of the legacy-fallback
-                # flag. Quarantine: skip. (manage_positions_via_kernel already logged +
-                # set the diagnostic; _signals_from_per_bar emits the one-shot log_activity
-                # so the operator sees it once.)
-                continue
-            if actions is KERNEL_SKIP_SCAN:
-                # Transient kernel failure — skip this strategy this scan. Do NOT fall
-                # through to the legacy engine, whose entry timing / exit model / PnL
-                # convention diverge from the backtest (would silently break parity).
-                continue
-            if actions is None:
-                # actions is None means: kernel not attempted (disabled / not a kernel
-                # stage) OR the strategy is genuinely non-vectorizable.
-                if kernel_mode == "paper":
-                    if not _paper_legacy_fallback_enabled():
-                        # Strict fail-closed (operator opted OUT of the fallback): a
-                        # strategy that cannot run the kernel cannot reproduce its
-                        # backtest, so flag non-parity and don't trade it.
-                        if diagnostics_out is not None:
-                            diagnostics_out[strat_id] = {
-                                "strategy_id": strat_id,
-                                "execution_decision": "non_vectorizable_no_parity",
-                                "reason": "strategy exposes no vectorized generate_signals; "
-                                          "not traded (paper_legacy_fallback_enabled is off)",
-                                "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
-                            }
-                        log.warning(
-                            "[%s] paper: non-vectorizable strategy has no parity engine; skipping "
-                            "(paper_legacy_fallback_enabled is off)",
-                            strat_id,
-                        )
-                        continue
-                    # Fallback ON (default): trade it on the legacy per-bar engine rather
-                    # than letting it silently never trade — but FLAG it loudly so the
-                    # operator knows it is NOT on the backtest-parity path (and must not be
-                    # promoted to live on these numbers).
-                    if diagnostics_out is not None:
-                        diagnostics_out[strat_id] = {
-                            "strategy_id": strat_id,
-                            "execution_decision": "non_vectorizable_legacy",
-                            "reason": "no vectorized generate_signals; traded on the legacy per-bar "
-                                      "engine (NOT kernel/backtest parity)",
-                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
-                        }
-                    log.warning(
-                        "[%s] paper: non-vectorizable strategy has no parity engine; trading on the "
-                        "legacy per-bar engine (NOT backtest parity)",
-                        strat_id,
-                    )
-                    try:
-                        log_activity(
-                            "warning", "scanner",
-                            f"NON-PARITY: {strat_id} has no vectorized signals; traded on the legacy "
-                            "per-bar engine (not kernel/backtest parity)",
-                        )
-                    except Exception:
-                        pass
-                if kernel_mode == "live":
-                    # LIVE, non-vectorizable: the kernel can't reproduce it, but a REAL
-                    # open position must stay strategy-managed (entry AND exit) — going
-                    # dark would leave it protected only by resting exchange SL/TP. Fall
-                    # through to the legacy live engine (pre-kernel behaviour) and surface
-                    # the loss of backtest parity to the operator.
-                    if diagnostics_out is not None:
-                        diagnostics_out[strat_id] = {
-                            "strategy_id": strat_id,
-                            "execution_decision": "live_non_vectorizable_legacy",
-                            "reason": "no vectorized generate_signals; managed on the legacy live "
-                                      "engine (NOT kernel/backtest parity)",
-                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
-                        }
-                    log.warning(
-                        "[%s] live: non-vectorizable strategy has no parity kernel; managing on the "
-                        "legacy live engine (not backtest parity)",
-                        strat_id,
-                    )
-                    try:
-                        log_activity(
-                            "warning", "scanner",
-                            f"LIVE-NON-PARITY: {strat_id} has no vectorized signals; managed on the "
-                            "legacy live engine (not kernel/backtest parity)",
-                        )
-                    except Exception:
-                        pass
-                actions = manage_positions(
-                    strat_id,
-                    strat,
-                    signal,
-                    account_equity=account_equity,
-                    diagnostics=diagnostics_out,
-                )
-            all_actions.extend(actions)
-        except Exception as e:
-            log.error("[%s] ERROR while applying execution actions: %s", strat_id, e, exc_info=True)
-            continue
+    if pooled:
+        with ThreadPoolExecutor(max_workers=min(_EXEC_POOL_WORKERS, len(pooled))) as pool:
+            futures = [
+                pool.submit(_apply_execution_action_item, item, account_equity, diagnostics_out)
+                for item in pooled
+            ]
+            for item in serial:
+                all_actions.extend(_apply_execution_action_item(item, account_equity, diagnostics_out))
+            for future in futures:
+                try:
+                    all_actions.extend(future.result() or [])
+                except Exception as e:  # the item fn catches; this is a pool-level fault
+                    log.error("Execution pool task failed: %s", e, exc_info=True)
+    else:
+        for item in serial:
+            all_actions.extend(_apply_execution_action_item(item, account_equity, diagnostics_out))
 
     return all_actions
+
+
+def _apply_execution_action_item(
+    item: dict, account_equity: float, diagnostics_out: dict[str, dict] | None
+) -> list[str]:
+    """Execution dispatch for ONE evaluated strategy row. Never raises."""
+    strat_id = str(item.get("strategy_id") or "")
+    if not strat_id:
+        return []
+    try:
+        strat = item["strategy"]
+        signal = item["signal"]
+        actions = None
+        kernel_mode: str | None = None  # 'paper' | 'live'
+        # Parity path: strategies with vectorized signals are managed by the shared
+        # backtest kernel (paper trades == backtest trades; live takes the SAME
+        # decisions with real fills).
+        if _paper_kernel_execution_enabled() and _is_kernel_paper_strategy(strat):
+            kernel_mode = "paper"
+            actions = manage_positions_via_kernel(
+                strat_id, strat, account_equity=account_equity, execution_type="paper", diagnostics=diagnostics_out,
+            )
+        elif _live_kernel_execution_enabled() and _is_live_kernel_stage(strat):
+            kernel_mode = "live"
+            actions = manage_positions_via_kernel(
+                strat_id, strat, account_equity=account_equity, execution_type="live", diagnostics=diagnostics_out,
+            )
+
+        if actions is KERNEL_IMPURE_REFUSED:
+            # KCOPY-3: the purity guard refused this strategy as non-deterministic/
+            # stateful. It is untrustworthy on ANY engine — never downgrade it to the
+            # legacy per-bar engine (paper OR live), regardless of the legacy-fallback
+            # flag. Quarantine: skip. (manage_positions_via_kernel already logged +
+            # set the diagnostic; _signals_from_per_bar emits the one-shot log_activity
+            # so the operator sees it once.)
+            return []
+        if actions is KERNEL_SKIP_SCAN:
+            # Transient kernel failure — skip this strategy this scan. Do NOT fall
+            # through to the legacy engine, whose entry timing / exit model / PnL
+            # convention diverge from the backtest (would silently break parity).
+            return []
+        if actions is None:
+            # actions is None means: kernel not attempted (disabled / not a kernel
+            # stage) OR the strategy is genuinely non-vectorizable.
+            if kernel_mode == "paper":
+                if not _paper_legacy_fallback_enabled():
+                    # Strict fail-closed (operator opted OUT of the fallback): a
+                    # strategy that cannot run the kernel cannot reproduce its
+                    # backtest, so flag non-parity and don't trade it.
+                    if diagnostics_out is not None:
+                        diagnostics_out[strat_id] = {
+                            "strategy_id": strat_id,
+                            "execution_decision": "non_vectorizable_no_parity",
+                            "reason": "strategy exposes no vectorized generate_signals; "
+                                      "not traded (paper_legacy_fallback_enabled is off)",
+                            "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                        }
+                    log.warning(
+                        "[%s] paper: non-vectorizable strategy has no parity engine; skipping "
+                        "(paper_legacy_fallback_enabled is off)",
+                        strat_id,
+                    )
+                    return []
+                # Fallback ON (default): trade it on the legacy per-bar engine rather
+                # than letting it silently never trade — but FLAG it loudly so the
+                # operator knows it is NOT on the backtest-parity path (and must not be
+                # promoted to live on these numbers).
+                if diagnostics_out is not None:
+                    diagnostics_out[strat_id] = {
+                        "strategy_id": strat_id,
+                        "execution_decision": "non_vectorizable_legacy",
+                        "reason": "no vectorized generate_signals; traded on the legacy per-bar "
+                                  "engine (NOT kernel/backtest parity)",
+                        "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                    }
+                log.warning(
+                    "[%s] paper: non-vectorizable strategy has no parity engine; trading on the "
+                    "legacy per-bar engine (NOT backtest parity)",
+                    strat_id,
+                )
+                try:
+                    log_activity(
+                        "warning", "scanner",
+                        f"NON-PARITY: {strat_id} has no vectorized signals; traded on the legacy "
+                        "per-bar engine (not kernel/backtest parity)",
+                    )
+                except Exception:
+                    pass
+            if kernel_mode == "live":
+                # LIVE, non-vectorizable: the kernel can't reproduce it, but a REAL
+                # open position must stay strategy-managed (entry AND exit) — going
+                # dark would leave it protected only by resting exchange SL/TP. Fall
+                # through to the legacy live engine (pre-kernel behaviour) and surface
+                # the loss of backtest parity to the operator.
+                if diagnostics_out is not None:
+                    diagnostics_out[strat_id] = {
+                        "strategy_id": strat_id,
+                        "execution_decision": "live_non_vectorizable_legacy",
+                        "reason": "no vectorized generate_signals; managed on the legacy live "
+                                  "engine (NOT kernel/backtest parity)",
+                        "runtime_type": str(strat.get("runtime_type") or strat.get("type") or ""),
+                    }
+                log.warning(
+                    "[%s] live: non-vectorizable strategy has no parity kernel; managing on the "
+                    "legacy live engine (not backtest parity)",
+                    strat_id,
+                )
+                try:
+                    log_activity(
+                        "warning", "scanner",
+                        f"LIVE-NON-PARITY: {strat_id} has no vectorized signals; managed on the "
+                        "legacy live engine (not kernel/backtest parity)",
+                    )
+                except Exception:
+                    pass
+            actions = manage_positions(
+                strat_id,
+                strat,
+                signal,
+                account_equity=account_equity,
+                diagnostics=diagnostics_out,
+            )
+        return list(actions or [])
+    except Exception as e:
+        log.error("[%s] ERROR while applying execution actions: %s", strat_id, e, exc_info=True)
+        return []
 
 
 def _scan_trade_summary() -> tuple[int, int, float]:
@@ -7608,6 +7703,19 @@ def run_scan(*, execute_positions: bool = True) -> dict:
         _RUN_SCAN_EXEC_LOCK.release()
 
 
+def _open_position_strategy_ids() -> set[str]:
+    """Strategy ids holding any OPEN trade — the scan's priority exit lane."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT COALESCE(strategy_id, strategy) AS sid FROM trades WHERE status = 'OPEN'"
+            ).fetchall()
+        return {str(r["sid"]) for r in rows if r["sid"]}
+    except Exception as exc:
+        log.debug("open-position priority lane: id load failed: %s", exc)
+        return set()
+
+
 def _run_scan_impl(*, execute_positions: bool = True) -> dict:
     """Inner scan body. Call ``run_scan`` (the single-flight wrapper) instead."""
     init_db()
@@ -7709,14 +7817,43 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
     except Exception as e:
         log.debug("Regime detection skipped: %s", e)
 
-    all_signals, signal_rows = _evaluate_signal_matrix(
-        active_strategies,
+    # PRIORITY EXIT LANE: strategies holding OPEN positions are evaluated AND executed
+    # FIRST, so a bar-close exit (pending signal close, kernel stop/TP replay) fills
+    # seconds after the bar closes instead of after the full matrix sweep (E0010's
+    # 8:00-bar exit only executed at 8:04, behind every no-position strategy). Disabled
+    # in high-activity test mode, whose forced signals rewrite the matrix pre-execution.
+    execution_diagnostics: dict[str, dict] = {}
+    priority_actions: list[str] = []
+    priority_signals: dict[str, dict] = {}
+    priority_rows: list[dict] = []
+    priority_ids: set[str] = set()
+    if execution_allowed and not paper_test_high_activity:
+        priority_ids = _open_position_strategy_ids() & set(active_strategies)
+    if priority_ids:
+        log.info("Priority exit lane: %d strategies with open positions", len(priority_ids))
+        priority_signals, priority_rows = _evaluate_signal_matrix(
+            {k: v for k, v in active_strategies.items() if k in priority_ids},
+            registry_active,
+            live_prices_for_scan,
+            asset_regimes,
+            relaxed_trade_filters=relaxed_trade_filters,
+            use_live_price_for_signal_price=use_live_price_for_signal_price,
+        )
+        priority_actions = _apply_execution_actions(priority_rows, execution_diagnostics)
+
+    rest_strategies = active_strategies
+    if priority_ids:
+        rest_strategies = {k: v for k, v in active_strategies.items() if k not in priority_ids}
+    rest_signals, rest_rows = _evaluate_signal_matrix(
+        rest_strategies,
         registry_active,
         live_prices_for_scan,
         asset_regimes,
         relaxed_trade_filters=relaxed_trade_filters,
         use_live_price_for_signal_price=use_live_price_for_signal_price,
     )
+    all_signals = {**priority_signals, **rest_signals}
+    signal_rows = priority_rows + rest_rows
 
     if paper_test_high_activity:
         signal_rows = _force_high_activity_signals(signal_rows)
@@ -7725,6 +7862,7 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
             for item in signal_rows
             if str(item.get("strategy_id") or "").strip()
         }
+        rest_rows = signal_rows  # priority lane is disabled in this mode
 
     scan_ts = get_now().isoformat()
     loader_diagnostics = dict(_LAST_STRATEGY_LOAD_DIAGNOSTICS)
@@ -7735,10 +7873,9 @@ def _run_scan_impl(*, execute_positions: bool = True) -> dict:
         execution_allowed=execution_allowed,
     )
 
-    all_actions: list[str] = []
-    execution_diagnostics: dict[str, dict] = {}
+    all_actions: list[str] = list(priority_actions)
     if execution_allowed:
-        all_actions = _apply_execution_actions(signal_rows, execution_diagnostics)
+        all_actions.extend(_apply_execution_actions(rest_rows, execution_diagnostics))
         scan_diagnostics.update(execution_diagnostics)
     elif requested_execution:
         log.info("Execution scan degraded to signal-only by policy; scanner_execution_enabled=false.")
