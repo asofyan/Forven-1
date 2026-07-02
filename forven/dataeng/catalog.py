@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -53,14 +56,42 @@ class CoverageRow:
     row_count: int
 
 
+# DuckDB is SINGLE-WRITER per database file, and every Catalog method opens a
+# fresh connection — two concurrent operations (a UI /universe read racing the
+# catch-up's registry refresh, or the seed thread) collide with "file is being
+# used by another process", killing whichever came second. One process-wide
+# lock serializes in-process access; a short retry absorbs the rare
+# cross-process race (scripts touching the catalog while the backend runs).
+_catalog_io_lock = threading.Lock()
+_CATALOG_OPEN_RETRIES = 4
+_CATALOG_RETRY_SLEEP_SECONDS = 0.3
+
+
 class Catalog:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_catalog_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def connect(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self.path))
+    @contextmanager
+    def connect(self):
+        with _catalog_io_lock:
+            last_exc: Exception | None = None
+            for attempt in range(_CATALOG_OPEN_RETRIES):
+                try:
+                    con = duckdb.connect(str(self.path))
+                    break
+                except Exception as exc:  # duckdb.IOException on file lock
+                    last_exc = exc
+                    if "being used by another process" not in str(exc) and "Could not set lock" not in str(exc):
+                        raise
+                    time.sleep(_CATALOG_RETRY_SLEEP_SECONDS * (attempt + 1))
+            else:
+                raise last_exc  # type: ignore[misc]
+            try:
+                yield con
+            finally:
+                con.close()
 
     def _initialize(self) -> None:
         with self.connect() as con:

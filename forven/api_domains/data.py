@@ -1385,12 +1385,15 @@ def execute_data_engine_catchup(
         log.warning("Data Engine catch-up: universe coverage ensure skipped: %s", exc)
 
     # Keep the symbol registry current (new listings, delistings) on the same
-    # cadence — one markets+tickers call per 30-min run. Best-effort: the
-    # drain must never fail on a registry hiccup.
+    # cadence — one markets+tickers call per 30-min run. Best-effort, and
+    # gated on the same network switch as auto-backfill so the test suite
+    # never hits the venue (load_markets + fetch_tickers hang/slow tests).
     try:
+        from forven.dataeng.coverage import _autobackfill_enabled
         from forven.dataeng.universe import refresh_symbol_registry
 
-        refresh_symbol_registry()
+        if _autobackfill_enabled():
+            refresh_symbol_registry()
     except Exception as exc:  # noqa: BLE001
         log.warning("Data Engine catch-up: symbol registry refresh skipped: %s", exc)
 

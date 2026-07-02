@@ -235,7 +235,12 @@ def seed_research_universe(
         return {"enabled": False}
     metrics_days = int(cfg.get("metrics_days", 365))
 
-    refresh_symbol_registry(catalog)
+    # A transient registry-refresh failure (venue hiccup, catalog contention)
+    # must not kill the whole seed — plan from the existing registry instead.
+    try:
+        refresh_symbol_registry(catalog)
+    except Exception as exc:
+        log.warning("Universe seed: registry refresh failed (planning from existing registry): %s", exc)
     plan = plan_research_universe(catalog)
     summary: dict[str, Any] = {"planned": len(plan), "series_seeded": 0, "series_current": 0, "errors": 0}
     dm = get_data_manager()
