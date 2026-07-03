@@ -176,12 +176,24 @@ CHAT_ACT_TOOL_NAMES: frozenset[str] = CHAT_ASK_TOOL_NAMES | frozenset({
 # ---------------------------------------------------------------------------
 
 # Read-only grounding tools auto-offered even in read-only chat (allow_actions
-# False). NOTHING here writes/creates/registers/mutates.
+# False). NOTHING here writes/creates/registers/mutates. (open_app_page only
+# navigates the operator's own browser — no server-side state changes.)
 CHAT_AUTO_READONLY_TOOL_NAMES: frozenset[str] = CHAT_ASK_TOOL_NAMES | frozenset({
     "get_portfolio_status",
     "get_pipeline_status",
     "get_market_regime",
     "get_strategy_detail",
+    "get_app_guide",
+    "open_app_page",
+    "list_strategies",
+    "get_gate_report",
+    "get_recent_trades",
+    "get_settings_overview",
+    "get_ops_overview",
+    "list_hypotheses",
+    "list_bots",
+    "list_routines",
+    "list_agent_tasks",
 })
 
 # Auto-executed WRITE tools — only offered when allow_actions is True. They

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { fly } from 'svelte/transition';
+	import { goto } from '$app/navigation';
 	import {
 		createOrGetAssistantThread,
 		listAssistantMessages,
@@ -52,17 +53,43 @@
 	function buildSuggestions(kind: string): string[] {
 		switch (kind) {
 			case 'strategy_detail':
-				return ['How is this strategy doing?', 'Backtest this strategy', 'How could I improve it?'];
+				return ['How is this strategy doing?', 'Why is it stuck at this stage?', 'How could I improve it?'];
 			case 'paper_trading':
-				return ['How is the paper book doing?', 'Any open positions?', "What's the market regime?"];
+				return ['How is the paper book doing?', 'Any open positions?', 'How do I set a stop-loss manually?'];
 			case 'lab':
-				return ['Create a BTC mean-reversion strategy', "What's in the pipeline?", 'Top strategies right now'];
+				return ['Create a BTC mean-reversion strategy', "What's in the pipeline?", 'How does a strategy reach paper?'];
 			case 'data_engine':
-				return ['What datasets do we have?', 'Any data gaps?'];
+				return ['What datasets do we have?', 'Any data gaps?', 'How do I add a new data feed?'];
 			case 'pipeline':
 				return ["What's in the pipeline?", 'Anything waiting on me?'];
+			case 'risk':
+				return ["How's the portfolio?", 'Explain the kill-switch rules', 'What does emergency halt do?'];
+			case 'bot_factory':
+				return ['How do bots differ from strategies?', 'Walk me through taking a bot live', 'How are my bots doing?'];
+			case 'approvals':
+				return ['What approvals are pending?', 'What do the approval modes mean?'];
+			case 'agents':
+				return ['What does each agent do?', 'How do I change your model?', 'Any agent tasks running?'];
+			case 'routines':
+				return ['Help me set up a routine', 'What routines are scheduled?'];
+			case 'settings':
+				return ['Explain the gate presets', 'Walk me through going live safely', 'What does each section control?'];
+			case 'hypotheses':
+				return ['What is a crucible?', 'Turn my idea into a strategy', 'Any promising ideas right now?'];
+			case 'brain':
+				return ['What has the Brain decided lately?', 'How does the Brain work?'];
+			case 'integrations':
+				return ['How do I connect Claude to Forven?', 'What are agent tool servers?'];
+			case 'diagnostics':
+				return ['Is everything healthy?', 'Anything waiting on me?'];
+			case 'strategy_creator':
+				return ['How does the Strategy Creator work?', 'What happens after Send to Forge?'];
+			case 'backtest':
+				return ['How do I read these results?', 'Backtest one of my strategies'];
+			case 'tasks':
+				return ['Any agent tasks running?', "What's this task doing?"];
 			default:
-				return ["How's the portfolio?", "What's in the pipeline?", 'Create a BTC 15m mean-reversion strategy'];
+				return ["How's the portfolio?", 'What can I do on this page?', 'What needs my attention?'];
 		}
 	}
 
@@ -173,6 +200,14 @@
 				actionStatus: 'pending',
 				ts: new Date().toISOString(),
 			});
+		} else if (ev.type === 'navigate') {
+			// Backend validated the route against the app map; still require an
+			// internal path before navigating.
+			if (ev.route && ev.route.startsWith('/') && !ev.route.startsWith('//')) {
+				liveAssistantIdx = null;
+				pushMsg({ kind: 'tool', content: `→ Opened ${ev.route}`, toolName: 'navigate', ts: new Date().toISOString() });
+				void goto(ev.route);
+			}
 		} else if (ev.type === 'error') {
 			liveAssistantIdx = null;
 			pushMsg({ kind: 'error', content: ev.message, ts: new Date().toISOString() });
