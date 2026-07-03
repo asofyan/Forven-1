@@ -8382,6 +8382,28 @@ def backtest_strategy(
         log.warning("Data preflight warning for %s: %s", strategy_id, data_preflight)
 
 
+    # Pre-flight: enrichment-feed availability. Blocks the run (rather than
+    # silently zero-filling) when a strategy depends on a data feed that is
+    # unavailable and not auto-downloadable; auto-fetches fetchable feeds first.
+    try:
+        from forven.strategies.data_availability import evaluate_data_availability
+
+        _avail = evaluate_data_availability(
+            original_strategy_type, asset, resolved_timeframe, strategy_id=strategy_id
+        )
+    except Exception as _avail_exc:  # defensive: never let the guard brick a backtest
+        log.warning("data-availability precheck raised (skipping): %s", _avail_exc)
+        _avail = None
+    if _avail is not None and _avail.blocked:
+        log.warning("Data availability BLOCK for %s: %s", strategy_id, _avail.error)
+        return {
+            "error": _avail.error,
+            "trades": [],
+            "metrics": {},
+            "data_availability": _avail.to_dict(),
+        }
+
+
 
 
 
