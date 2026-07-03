@@ -25,7 +25,6 @@
 		type ForvenAuthProviderOAuthStartResponse,
 	} from '$lib/api';
 	import { openExternal } from '$lib/external-open';
-	import OpenCodeGoReferralNote from '$lib/components/OpenCodeGoReferralNote.svelte';
 	import { msToMinutes, minutesToMs, formatIntervalMs } from '$lib/utils/schedule';
 
 	export let settings: Record<string, unknown> = {};
@@ -779,9 +778,6 @@
 										{/if}
 									{/if}
 								</div>
-								{#if key === 'opencode-go'}
-									<OpenCodeGoReferralNote />
-								{/if}
 							{/if}
 
 							{#if provider.configured}

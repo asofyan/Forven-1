@@ -23,7 +23,6 @@
 	} from '$lib/api';
 	import { onDestroy } from 'svelte';
 	import { openExternal } from '$lib/external-open';
-	import OpenCodeGoReferralNote from '$lib/components/OpenCodeGoReferralNote.svelte';
 	import { agentsConfig, isProviderConnected } from '../agentsConfigStore';
 
 	$: providers = $agentsConfig.providers;
@@ -45,8 +44,6 @@
 	/**
 	 * Where to sign up / get an API key per provider. Rendered as a plain "get a
 	 * key" link beside the token input so connecting a new provider is self-serve.
-	 * OpenCode GO is intentionally NOT here — it's a referral link, so it renders
-	 * via <OpenCodeGoReferralNote> which labels it as such.
 	 */
 	const PROVIDER_SIGNUP_URLS: Record<string, string> = {
 		'opencode-zen': 'https://opencode.ai/auth'
@@ -540,9 +537,7 @@
 									{/if}
 								{/if}
 							</div>
-							{#if key === 'opencode-go'}
-								<OpenCodeGoReferralNote />
-							{:else if PROVIDER_SIGNUP_URLS[key]}
+							{#if PROVIDER_SIGNUP_URLS[key]}
 								<p class="text-xs text-[#666]">
 									Need access? <a
 										href={PROVIDER_SIGNUP_URLS[key]}
