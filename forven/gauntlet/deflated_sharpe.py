@@ -15,6 +15,14 @@ default off) so its behaviour can be watched before it blocks anything.
 
 Note: returns scale cancels in the Sharpe / skew / kurtosis, so per-trade pnl in
 ratio or percent units gives the same DSR — no unit normalisation needed.
+
+Swarm-level selection (issue #17): the optimizer trial count only corrects for
+parameter search WITHIN one strategy. The agent swarm also tries many sibling
+hypotheses per idea-cluster (family x asset) and only survivors reach the
+gauntlet, so a survivor's effective trial count is per-strategy trials x cluster
+attempts. compute_strategy_dsr() therefore multiplies n_trials by (1 + disproven
+same-cluster hypotheses, reusing the graveyard clustering in forven.hypotheses)
+when the strategy's origin hypothesis is known.
 """
 
 from __future__ import annotations
@@ -120,6 +128,75 @@ def deflated_sharpe_ratio(
     }
 
 
+def _extract_trade_returns(trades: list) -> list[float]:
+    """Per-trade returns in field-preference order (see comment in the loop)."""
+    returns: list[float] = []
+    for tr in trades:
+        if not isinstance(tr, dict):
+            continue
+        # Prefer the scale-invariant per-trade RETURN fields. ``pnl`` is compounded
+        # dollars off a growing equity base — a TIME-VARYING scale that distorts
+        # sr_hat/skew/kurt (and thus the DSR + its SR0 benchmark). ``return_pct``
+        # (= ratio*100, present on every normalized trade) is a constant scale of the
+        # true ratio, so it yields the intended scale-invariant DSR; demote ``pnl``
+        # to a last resort.
+        r = tr.get("net_pnl_pct")
+        if r is None:
+            r = tr.get("pnl_pct")
+        if r is None:
+            r = tr.get("return_pct")
+        if r is None:
+            r = tr.get("pnl")
+        if r is None:
+            continue
+        try:
+            rv = float(r)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(rv):
+            returns.append(rv)
+    return returns
+
+
+def per_trade_sharpe(trades: list, *, min_trades: int = 5) -> float | None:
+    """Per-trade Sharpe (population mean/std of per-trade returns) for ONE trial.
+
+    Same definition as ``sr_hat`` in deflated_sharpe_ratio, so a variance computed
+    ACROSS trials from these values lives on the same scale as the observed Sharpe
+    (the whole point: it feeds ``trial_sharpe_var``). Returns None below
+    ``min_trades`` — an SR estimate from a handful of trades is estimation noise,
+    not trial dispersion — and on zero variance.
+    """
+    rs = _extract_trade_returns(trades if isinstance(trades, list) else [])
+    if len(rs) < max(int(min_trades), 2):
+        return None
+    mean_r = sum(rs) / len(rs)
+    var_r = sum((r - mean_r) ** 2 for r in rs) / len(rs)
+    if var_r <= 1e-24:
+        return None
+    return mean_r / math.sqrt(var_r)
+
+
+def _latest_trial_sharpe_var(opt_metrics: dict | None, opt_config: dict | None) -> float | None:
+    """Persisted cross-trial Sharpe variance from the latest optimization, if usable.
+
+    Requires >= 5 contributing trials — a dispersion estimated from fewer is too
+    noisy, and an under-estimate would INFLATE the DSR; the conservative
+    estimator proxy stays the fallback.
+    """
+    for blob in (opt_metrics, opt_config):
+        if not isinstance(blob, dict) or blob.get("trial_sharpe_var") is None:
+            continue
+        try:
+            var = float(blob.get("trial_sharpe_var"))
+            count = int(blob.get("trial_sharpe_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(var) and var > 0 and count >= 5:
+            return var
+    return None
+
+
 def _latest_n_trials(opt_metrics: dict | None, opt_config: dict | None, default_trials: int) -> int:
     for blob in (opt_metrics, opt_config):
         if isinstance(blob, dict) and blob.get("n_trials") is not None:
@@ -132,11 +209,51 @@ def _latest_n_trials(opt_metrics: dict | None, opt_config: dict | None, default_
     return max(int(default_trials), 1)
 
 
+def _swarm_cluster_attempts(strategy_id: str, lookback_days: int) -> int:
+    """Disproven same-cluster (family x asset) hypothesis siblings of the strategy's
+    origin hypothesis — the swarm-level selection pressure behind this survivor.
+    Returns 0 (no adjustment) when the strategy has no hypothesis link (manual /
+    imported strategies) and on ANY error: the swarm factor is advisory and must
+    never take down the base DSR."""
+    try:
+        from forven.db import get_db
+        from forven.hypotheses import disproven_cluster_count, get_hypothesis
+
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT hypothesis_id, origin_crucible_id FROM strategies WHERE id = ?",
+                (str(strategy_id),),
+            ).fetchone()
+        if not row:
+            return 0
+        hyp_id = row["hypothesis_id"] or row["origin_crucible_id"]
+        if not hyp_id:
+            return 0
+        hyp = get_hypothesis(str(hyp_id))
+        if not hyp:
+            return 0
+        return max(
+            0,
+            int(
+                disproven_cluster_count(
+                    title=hyp.get("title"),
+                    market_thesis=hyp.get("market_thesis"),
+                    mechanism=hyp.get("mechanism"),
+                    target_assets=hyp.get("target_assets") or [],
+                    lookback_days=max(0, int(lookback_days)),
+                )
+            ),
+        )
+    except Exception:
+        return 0
+
+
 def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None) -> dict | None:
     """Best-effort DSR for a strategy's latest backtest. Returns None on any issue.
 
     Pulls per-trade returns from the latest backtest result and the trial count
-    from the latest optimization result (falling back to the configured default).
+    from the latest optimization result (falling back to the configured default),
+    then scales the trial count by the swarm-level cluster attempts (issue #17).
     Never raises — DSR is advisory, not on the critical path.
     """
     try:
@@ -144,13 +261,16 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
 
         from forven.db import get_db
 
+        try:
+            from forven.policy import load_pipeline_config
+
+            rob = load_pipeline_config().get("robustness_thresholds", {}) or {}
+        except Exception:
+            rob = {}
         if default_trials is None:
             try:
-                from forven.policy import load_pipeline_config
-
-                rob = load_pipeline_config().get("robustness_thresholds", {}) or {}
                 default_trials = int(rob.get("deflated_sharpe_default_trials", 50) or 50)
-            except Exception:
+            except (TypeError, ValueError):
                 default_trials = 50
 
         with get_db() as conn:
@@ -180,44 +300,39 @@ def compute_strategy_dsr(strategy_id: str, *, default_trials: int | None = None)
         if not isinstance(trades, list) or not trades:
             return None
 
-        returns: list[float] = []
-        for tr in trades:
-            if not isinstance(tr, dict):
-                continue
-            # Prefer the scale-invariant per-trade RETURN fields. ``pnl`` is compounded
-            # dollars off a growing equity base — a TIME-VARYING scale that distorts
-            # sr_hat/skew/kurt (and thus the DSR + its SR0 benchmark). ``return_pct``
-            # (= ratio*100, present on every normalized trade) is a constant scale of the
-            # true ratio, so it yields the intended scale-invariant DSR; demote ``pnl``
-            # to a last resort.
-            r = tr.get("net_pnl_pct")
-            if r is None:
-                r = tr.get("pnl_pct")
-            if r is None:
-                r = tr.get("return_pct")
-            if r is None:
-                r = tr.get("pnl")
-            if r is None:
-                continue
-            try:
-                rv = float(r)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(rv):
-                returns.append(rv)
-
+        returns = _extract_trade_returns(trades)
         if len(returns) < 2:
             return None
 
         opt_metrics = json.loads(opt["metrics_json"]) if opt and opt["metrics_json"] else None
         opt_config = json.loads(opt["config_json"]) if opt and opt["config_json"] else None
-        n_trials = _latest_n_trials(
+        n_trials_base = _latest_n_trials(
             opt_metrics if isinstance(opt_metrics, dict) else None,
             opt_config if isinstance(opt_config, dict) else None,
             default_trials,
         )
-        result = deflated_sharpe_ratio(returns, n_trials)
-        result["trials_source"] = "optimization_result" if opt else "default"
+
+        # Effective trials = optimizer trials x cluster attempts (the survivor
+        # itself + disproven same-cluster siblings). 0 siblings -> unchanged.
+        swarm_attempts = 0
+        if bool(rob.get("dsr_swarm_trials_enabled", True)):
+            try:
+                lookback = int(rob.get("dsr_swarm_lookback_days", 90))
+            except (TypeError, ValueError):
+                lookback = 90
+            swarm_attempts = _swarm_cluster_attempts(strategy_id, lookback)
+
+        n_trials = n_trials_base * (1 + swarm_attempts)
+        trial_var = _latest_trial_sharpe_var(
+            opt_metrics if isinstance(opt_metrics, dict) else None,
+            opt_config if isinstance(opt_config, dict) else None,
+        )
+        result = deflated_sharpe_ratio(returns, n_trials, trial_var)
+        result["trials_source"] = ("optimization_result" if opt else "default") + (
+            "+swarm" if swarm_attempts > 0 else ""
+        )
+        result["n_trials_base"] = int(n_trials_base)
+        result["swarm_cluster_attempts"] = int(swarm_attempts)
         return result
     except Exception:
         return None

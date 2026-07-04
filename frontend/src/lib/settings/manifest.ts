@@ -1150,6 +1150,33 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
       'Deflated Sharpe Ratio floor (a probability in 0-1; ~0.95 = conventional significance). Enforced only when the Deflated Sharpe gate is enabled.',
     usedBy: ['forven.policy'],
   },
+  {
+    id: 'pipeline.robustness_thresholds.dsr_swarm_trials_enabled',
+    label: 'DSR swarm-trials factor',
+    default: true,
+    type: 'toggle',
+    area: 'lab',
+    subsection: 'lab-pipeline-robustness-gauntlet',
+    backendSection: 'pipeline',
+    backendPath: 'robustness_thresholds.dsr_swarm_trials_enabled',
+    description:
+      'Fold swarm-level selection bias into the Deflated Sharpe trial count: the agent swarm tries many hypothesis variants per idea-cluster (family x asset) and only survivors reach the gauntlet, so the DSR trial count is multiplied by (1 + disproven same-cluster hypotheses). OFF = correct for per-strategy optimizer trials only.',
+    usedBy: ['forven.gauntlet.deflated_sharpe'],
+  },
+  {
+    id: 'pipeline.robustness_thresholds.dsr_swarm_lookback_days',
+    label: 'DSR swarm lookback',
+    unit: 'days',
+    default: 90,
+    type: 'number',
+    area: 'lab',
+    subsection: 'lab-pipeline-robustness-gauntlet',
+    backendSection: 'pipeline',
+    backendPath: 'robustness_thresholds.dsr_swarm_lookback_days',
+    description:
+      'Window for counting disproven same-cluster hypotheses in the DSR swarm-trials factor. 0 = unbounded (count the full graveyard).',
+    usedBy: ['forven.gauntlet.deflated_sharpe'],
+  },
   // Parameter-jitter compute bounds (the heaviest robustness step: N full-window
   // backtests). These keep the sweep under the step timeout so it can't wedge the
   // gauntlet at param_jitter.

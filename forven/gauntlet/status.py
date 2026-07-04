@@ -249,6 +249,16 @@ def get_strategy_gauntlet_status(strategy_id: str) -> dict[str, Any]:
     composite = strategy_metrics.get("composite_robustness_score")
     if composite is None:
         composite = strategy_metrics.get("robustness_score") or strategy_metrics.get("robustness") or strategy_metrics.get("gauntlet_score")
+    # Scale-blend guard: legacy writers stored these keys as 0-1 fractions (every
+    # pre-v3 `robustness` value in prod is <= 1.0) while this payload's contract —
+    # and the floor it is compared against — is 0-100. Mirror the frontend history
+    # readers' convention (abs(v) <= 1 -> x100) so a legacy 0.726 surfaces as 72.6
+    # instead of rendering as "0.7 / 100" and false-failing the floor.
+    try:
+        if composite is not None and abs(float(composite)) <= 1.0:
+            composite = round(float(composite) * 100.0, 1)
+    except (TypeError, ValueError):
+        pass
 
     min_robustness = gauntlet_cfg.get("min_robustness_score")
     try:

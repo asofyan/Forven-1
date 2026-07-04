@@ -716,6 +716,24 @@ export interface GauntletTestEntry {
 	stale?: boolean | null;
 }
 
+// Deflated Sharpe payload embedded in the gauntlet status response. n_trials is
+// the EFFECTIVE trial count: optimizer trials (n_trials_base) x swarm attempts
+// (1 + swarm_cluster_attempts disproven same-cluster hypotheses, issue #17).
+export interface DeflatedSharpeInfo {
+	dsr: number | null;
+	sr_hat?: number;
+	sr0_benchmark?: number;
+	n_obs?: number;
+	n_trials?: number;
+	n_trials_base?: number;
+	swarm_cluster_attempts?: number;
+	skew?: number;
+	kurtosis?: number;
+	trial_var_source?: string;
+	trials_source?: string;
+	reason?: string;
+}
+
 export interface GauntletStatus {
 	ok: boolean;
 	strategy_id: string;
@@ -726,6 +744,7 @@ export interface GauntletStatus {
 	status: string | null;
 	composite_robustness_score: number | null;
 	min_robustness_score?: number | null;
+	deflated_sharpe?: DeflatedSharpeInfo | null;
 	tests: Record<GauntletTestKey, GauntletTestEntry | null>;
 	tests_completed: number;
 	tests_passed: number;

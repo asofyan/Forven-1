@@ -2,6 +2,7 @@
 	import { createEventDispatcher, onDestroy, onMount } from 'svelte';
 	import {
 		getGauntletStatus,
+		type DeflatedSharpeInfo,
 		type GauntletStatus,
 		type GauntletTestEntry,
 		type GauntletTestKey,
@@ -154,6 +155,38 @@
 		return 'border-red-900 bg-red-500/10 text-red-400';
 	}
 
+	function dsrTone(dsr: number): string {
+		// Informational thresholds (the reject gate is opt-in): ~0.95 is the
+		// conventional significance bar for the Deflated Sharpe probability.
+		if (dsr >= 0.95) return 'border-emerald-900 bg-emerald-500/10 text-emerald-400';
+		if (dsr >= 0.8) return 'border-yellow-900 bg-yellow-500/10 text-yellow-400';
+		return 'border-red-900 bg-red-500/10 text-red-400';
+	}
+
+	function dsrTrialsLine(info: DeflatedSharpeInfo): string {
+		if (info.n_trials == null) return '';
+		const swarm = info.swarm_cluster_attempts ?? 0;
+		if (swarm > 0 && info.n_trials_base != null) {
+			return `${info.n_trials} trials · ${info.n_trials_base} opt × ${swarm + 1} swarm`;
+		}
+		return `${info.n_trials} trials`;
+	}
+
+	function dsrTitle(info: DeflatedSharpeInfo): string {
+		const swarm = info.swarm_cluster_attempts ?? 0;
+		const base =
+			'Deflated Sharpe Ratio: probability the edge is real after correcting for selection bias ' +
+			`across ${info.n_trials ?? '?'} effective trials (~0.95 = conventional significance).`;
+		if (swarm > 0) {
+			return (
+				base +
+				` Trial count includes swarm-level selection: ${info.n_trials_base ?? '?'} optimizer trials x ` +
+				`${swarm + 1} attempts in this idea-cluster (${swarm} sibling hypotheses already disproven).`
+			);
+		}
+		return base;
+	}
+
 	function pillTone(entry: GauntletTestEntry | null | undefined): string {
 		const s = (entry?.status ?? 'not_started').toLowerCase();
 		const v = (entry?.verdict ?? '').toUpperCase();
@@ -258,6 +291,18 @@
 					/ 100{status.min_robustness_score != null ? ` · floor ${status.min_robustness_score}` : ''}
 				</div>
 			</div>
+			{#if status.deflated_sharpe?.dsr != null}
+				{@const dsrInfo = status.deflated_sharpe}
+				<div
+					data-testid="gauntlet-dsr"
+					class={`border px-3 py-2 ${dsrTone(Number(dsrInfo.dsr))}`}
+					title={dsrTitle(dsrInfo)}
+				>
+					<div class="text-[9px] font-bold uppercase tracking-widest opacity-80">Deflated Sharpe</div>
+					<div class="text-lg font-bold leading-tight">{Number(dsrInfo.dsr).toFixed(2)}</div>
+					<div class="text-[9px] uppercase tracking-wider opacity-70">{dsrTrialsLine(dsrInfo)}</div>
+				</div>
+			{/if}
 			<div class="flex flex-col gap-0.5 text-[11px]">
 				<div class="text-[#888]">
 					<span class="text-white font-medium">{displayTestsPassed}</span> / {status.tests_total} passed

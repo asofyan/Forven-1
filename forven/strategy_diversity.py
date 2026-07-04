@@ -51,6 +51,27 @@ FAMILY_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("cross_asset", ("cross_asset", "cross-asset", "dominance", "relative_value", "relative value", "rotation")),
 )
 
+def _pattern_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a family pattern with token boundaries at its alphanumeric edges.
+
+    Bare substring matching classified any text containing "pe-rsi-stence",
+    "reve-rsi-on" or "dive-rsi-fied" as the rsi family (checked FIRST, so it
+    swallowed other families' hypotheses — 80% of the rsi graveyard was such
+    false positives). Normalization maps punctuation to "_", so "_", space, "-"
+    and "%" all count as separators: "rsi_period"/"RSI(14)" still match, while
+    "persistence" no longer does. Edge-only anchoring keeps prefix patterns like
+    "bb_" matching "bb_width".
+    """
+    prefix = r"(?<![a-z0-9])" if re.match(r"[a-z0-9]", pattern) else ""
+    suffix = r"(?![a-z0-9])" if re.search(r"[a-z0-9]$", pattern) else ""
+    return re.compile(prefix + re.escape(pattern) + suffix)
+
+
+_FAMILY_PATTERN_REGEXES: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = tuple(
+    (family, tuple(_pattern_regex(p) for p in patterns)) for family, patterns in FAMILY_PATTERNS
+)
+
+
 def _normalize_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -69,8 +90,8 @@ def _flatten_payload(value: Any) -> str:
 def infer_strategy_family(*values: Any) -> str:
     text = " ".join(_flatten_payload(value) for value in values)
     normalized = re.sub(r"[^a-z0-9_% -]+", "_", text.lower())
-    for family, patterns in FAMILY_PATTERNS:
-        if any(pattern in normalized for pattern in patterns):
+    for family, regexes in _FAMILY_PATTERN_REGEXES:
+        if any(rx.search(normalized) for rx in regexes):
             return family
     return "other"
 

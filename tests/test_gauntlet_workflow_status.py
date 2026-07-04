@@ -188,3 +188,26 @@ def test_gauntlet_status_payload_is_strict_json_with_poisoned_step(forven_db):
     # The strict encoder (FastAPI uses allow_nan=False) must accept the payload.
     json.dumps(payload, allow_nan=False)
     assert payload["ok"] is True
+
+
+def test_gauntlet_status_rescales_legacy_fraction_composite(forven_db):
+    # Legacy strategies carry `metrics.robustness` as a 0-1 fraction; the status
+    # payload contract (and the min_robustness_score floor) is 0-100. A 0.726 must
+    # surface as 72.6 — not render as "0.7 / 100" and false-fail the floor.
+    strategy_id = _create_strategy()
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET metrics = ? WHERE id = ?",
+            (json.dumps({"robustness": 0.726}), strategy_id),
+        )
+    status = get_strategy_gauntlet_status(strategy_id)
+    assert status["composite_robustness_score"] == 72.6
+
+    # Modern 0-100 values pass through untouched.
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE strategies SET metrics = ? WHERE id = ?",
+            (json.dumps({"composite_robustness_score": 64.0}), strategy_id),
+        )
+    status = get_strategy_gauntlet_status(strategy_id)
+    assert status["composite_robustness_score"] == 64.0

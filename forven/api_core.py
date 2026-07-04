@@ -11241,8 +11241,26 @@ def post_optimization_submit(body: OptimizationSubmitBody):
             metrics_for_storage["status"] = "succeeded"
             if isinstance(best_params, dict):
                 metrics_for_storage["best_params"] = best_params
-            if body.n_trials is not None:
+            # Persist the ACTUAL selection breadth (combos evaluated, stamped by the
+            # optimizer) — the caller's requested budget is only a fallback. This is
+            # what the Deflated Sharpe reads as n_trials; storing the request
+            # understates the deflation when the grid ran wider than asked.
+            try:
+                actual_trials = int(opt_result.get("n_trials") or 0)
+            except (TypeError, ValueError):
+                actual_trials = 0
+            if actual_trials > 0:
+                metrics_for_storage["n_trials"] = actual_trials
+            elif body.n_trials is not None:
                 metrics_for_storage.setdefault("n_trials", int(body.n_trials))
+            # Cross-trial Sharpe dispersion: lets the DSR use the real trial
+            # variance instead of its conservative estimator proxy.
+            if opt_result.get("trial_sharpe_var") is not None:
+                try:
+                    metrics_for_storage["trial_sharpe_var"] = float(opt_result["trial_sharpe_var"])
+                    metrics_for_storage["trial_sharpe_count"] = int(opt_result.get("trial_sharpe_count") or 0)
+                except (TypeError, ValueError):
+                    pass
             if body_objective is not None:
                 metrics_for_storage.setdefault("objective", body_objective)
             if opt_result.get("wfa_verdict") is not None:
