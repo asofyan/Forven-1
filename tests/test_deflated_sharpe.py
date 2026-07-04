@@ -102,3 +102,240 @@ def test_compute_strategy_dsr_best_effort(forven_db):
     from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
 
     assert compute_strategy_dsr("does-not-exist") is None
+
+
+# --- swarm-level trials factor (issue #17) -----------------------------------
+
+def _seed_hypothesis(hid: str, title: str, *, status: str, assets: list[str]):
+    import json
+
+    from forven.db import get_db
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO hypotheses "
+            "(id,title,market_thesis,mechanism,target_assets,target_timeframes,lane,"
+            " source_type,status,manager_state,novelty_score,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (hid, title, title, title, json.dumps(assets), json.dumps(["4h"]),
+             "momentum", "agent", status, "active", 0.5),
+        )
+
+
+def _seed_strategy(sid: str, *, hypothesis_id: str | None = None, origin_crucible_id: str | None = None):
+    from forven.db import get_db
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, hypothesis_id, origin_crucible_id) VALUES (?,?,?,?)",
+            (sid, sid, hypothesis_id, origin_crucible_id),
+        )
+
+
+def _seed_ema_cluster(survivor_id: str, disproven: int):
+    _seed_hypothesis(survivor_id, "SOL EMA Cross Trend", status="proven", assets=["SOL"])
+    for i in range(disproven):
+        _seed_hypothesis(f"HD{i}", f"SOL EMA Variant {i}", status="disproven", assets=["SOL"])
+
+
+def test_swarm_cluster_attempts_counts_disproven_siblings(forven_db):
+    from forven.gauntlet.deflated_sharpe import _swarm_cluster_attempts
+
+    _seed_ema_cluster("HS", disproven=2)
+    _seed_hypothesis("HX1", "BTC EMA Cross", status="disproven", assets=["BTC"])    # diff asset
+    _seed_hypothesis("HX2", "SOL RSI Momentum", status="disproven", assets=["SOL"])  # diff family
+    _seed_strategy("S1", hypothesis_id="HS")
+
+    assert _swarm_cluster_attempts("S1", 0) == 2
+
+
+def test_swarm_cluster_attempts_origin_crucible_fallback(forven_db):
+    from forven.gauntlet.deflated_sharpe import _swarm_cluster_attempts
+
+    _seed_ema_cluster("HS", disproven=1)
+    _seed_strategy("S1", origin_crucible_id="HS")  # linked via crucible, not hypothesis_id
+
+    assert _swarm_cluster_attempts("S1", 0) == 1
+
+
+def test_swarm_cluster_attempts_fail_open(forven_db):
+    from forven.gauntlet.deflated_sharpe import _swarm_cluster_attempts
+
+    _seed_strategy("S-nolink")
+    assert _swarm_cluster_attempts("S-nolink", 0) == 0  # no hypothesis link -> no penalty
+    assert _swarm_cluster_attempts("missing", 0) == 0   # unknown strategy -> no penalty
+
+
+def test_swarm_cluster_attempts_respects_lookback_window(forven_db):
+    from forven.db import get_db
+    from forven.gauntlet.deflated_sharpe import _swarm_cluster_attempts
+
+    _seed_ema_cluster("HS", disproven=1)
+    _seed_strategy("S1", hypothesis_id="HS")
+    with get_db() as conn:
+        conn.execute("UPDATE hypotheses SET updated_at = '2020-01-01T00:00:00+00:00' WHERE id = 'HD0'")
+
+    assert _swarm_cluster_attempts("S1", 30) == 0  # disproven outside the window
+    assert _swarm_cluster_attempts("S1", 0) == 1   # 0 = unbounded
+
+
+def _seed_backtest_rows(sid: str, opt_trials: int):
+    import json
+
+    from forven.db import get_db
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO backtest_results (result_id, strategy_id, result_type, metrics_json) VALUES (?,?,?,?)",
+            (f"bt-{sid}", sid, "backtest", "{}"),
+        )
+        conn.execute(
+            "INSERT INTO backtest_results (result_id, strategy_id, result_type, metrics_json) VALUES (?,?,?,?)",
+            (f"opt-{sid}", sid, "optimization", json.dumps({"n_trials": opt_trials})),
+        )
+
+
+def test_compute_strategy_dsr_applies_swarm_factor(forven_db, monkeypatch):
+    from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
+
+    _seed_ema_cluster("HS", disproven=3)
+    _seed_strategy("S-swarm", hypothesis_id="HS")
+    _seed_strategy("S-solo")  # same returns/trials, no hypothesis link
+    _seed_backtest_rows("S-swarm", opt_trials=10)
+    _seed_backtest_rows("S-solo", opt_trials=10)
+
+    trades = [{"net_pnl_pct": r} for r in _STRONG]
+    monkeypatch.setattr(
+        "forven.api_core.get_backtest_result",
+        lambda result_id, remote_skip=True: {"trades": trades},
+    )
+
+    swarm = compute_strategy_dsr("S-swarm")
+    solo = compute_strategy_dsr("S-solo")
+
+    assert solo["n_trials"] == 10 and solo["swarm_cluster_attempts"] == 0
+    assert solo["trials_source"] == "optimization_result"
+    assert swarm["n_trials_base"] == 10
+    assert swarm["swarm_cluster_attempts"] == 3
+    assert swarm["n_trials"] == 40  # 10 optimizer x (1 survivor + 3 disproven siblings)
+    assert swarm["trials_source"] == "optimization_result+swarm"
+    assert swarm["dsr"] <= solo["dsr"]  # more effective trials -> more deflation
+
+
+def test_compute_strategy_dsr_swarm_knob_off(forven_db, monkeypatch):
+    from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
+
+    _seed_ema_cluster("HS", disproven=3)
+    _seed_strategy("S-swarm", hypothesis_id="HS")
+    _seed_backtest_rows("S-swarm", opt_trials=10)
+
+    trades = [{"net_pnl_pct": r} for r in _STRONG]
+    monkeypatch.setattr(
+        "forven.api_core.get_backtest_result",
+        lambda result_id, remote_skip=True: {"trades": trades},
+    )
+    monkeypatch.setattr(
+        "forven.policy.load_pipeline_config",
+        lambda: {"robustness_thresholds": {"dsr_swarm_trials_enabled": False}},
+    )
+
+    out = compute_strategy_dsr("S-swarm")
+    assert out["n_trials"] == 10
+    assert out["swarm_cluster_attempts"] == 0
+    assert out["trials_source"] == "optimization_result"
+
+
+def test_swarm_defaults_present():
+    from forven.policy import DEFAULT_PIPELINE_CONFIG
+
+    rob = DEFAULT_PIPELINE_CONFIG["robustness_thresholds"]
+    assert rob["dsr_swarm_trials_enabled"] is True
+    assert int(rob["dsr_swarm_lookback_days"]) >= 0
+
+
+# --- real cross-trial variance (replaces the conservative proxy) --------------
+
+def test_per_trade_sharpe_matches_sr_hat_definition():
+    from forven.gauntlet.deflated_sharpe import per_trade_sharpe
+
+    rs = [1.0, -0.5, 2.0, 0.5, -1.0, 1.5]
+    mean = sum(rs) / len(rs)
+    sd = math.sqrt(sum((r - mean) ** 2 for r in rs) / len(rs))  # population, like sr_hat
+    got = per_trade_sharpe([{"pnl_pct": r} for r in rs])
+    assert math.isclose(got, mean / sd, rel_tol=1e-9)
+
+    assert per_trade_sharpe([{"pnl_pct": r} for r in rs[:4]]) is None  # < min_trades
+    assert per_trade_sharpe([{"pnl_pct": 1.0}] * 10) is None           # zero variance
+    assert per_trade_sharpe([]) is None
+
+
+def test_optimizer_stamps_cross_trial_variance():
+    from forven.strategies.optimizer import _stamp_trial_sharpe_stats
+
+    results = [{"trade_sharpe": s} for s in (0.10, 0.14, 0.08, 0.12, 0.11)]
+    results.append({"trade_sharpe": None})       # degenerate trial: excluded, not fatal
+    _stamp_trial_sharpe_stats(results)
+    assert results[0]["trial_sharpe_count"] == 5
+    assert results[0]["trial_sharpe_var"] > 0
+    assert results[-1]["trial_sharpe_var"] == results[0]["trial_sharpe_var"]  # stamped on all
+
+    sparse = [{"trade_sharpe": 0.1}, {"trade_sharpe": 0.2}]
+    _stamp_trial_sharpe_stats(sparse)
+    assert "trial_sharpe_var" not in sparse[0]   # < 5 contributing trials -> no stamp
+
+
+def _seed_opt_row(sid: str, metrics: dict):
+    import json
+
+    from forven.db import get_db
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO backtest_results (result_id, strategy_id, result_type, metrics_json) VALUES (?,?,?,?)",
+            (f"bt-{sid}", sid, "backtest", "{}"),
+        )
+        conn.execute(
+            "INSERT INTO backtest_results (result_id, strategy_id, result_type, metrics_json) VALUES (?,?,?,?)",
+            (f"opt-{sid}", sid, "optimization", json.dumps(metrics)),
+        )
+
+
+def test_compute_strategy_dsr_uses_persisted_trial_variance(forven_db, monkeypatch):
+    from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
+
+    _seed_strategy("S-var")
+    _seed_strategy("S-proxy")
+    # Real neighboring-param trials are tightly clustered -> tiny true variance.
+    _seed_opt_row("S-var", {"n_trials": 50, "trial_sharpe_var": 1e-4, "trial_sharpe_count": 20})
+    _seed_opt_row("S-proxy", {"n_trials": 50})
+
+    trades = [{"net_pnl_pct": r} for r in _STRONG]
+    monkeypatch.setattr(
+        "forven.api_core.get_backtest_result",
+        lambda result_id, remote_skip=True: {"trades": trades},
+    )
+
+    real = compute_strategy_dsr("S-var")
+    proxy = compute_strategy_dsr("S-proxy")
+
+    assert real["trial_var_source"] == "trials"
+    assert proxy["trial_var_source"] == "estimator_proxy"
+    # Tight true dispersion -> lower expected-max benchmark -> DSR can only improve.
+    assert real["sr0_benchmark"] < proxy["sr0_benchmark"]
+    assert real["dsr"] >= proxy["dsr"]
+
+
+def test_trial_variance_ignored_when_too_few_trials(forven_db, monkeypatch):
+    from forven.gauntlet.deflated_sharpe import compute_strategy_dsr
+
+    _seed_strategy("S-thin")
+    _seed_opt_row("S-thin", {"n_trials": 50, "trial_sharpe_var": 1e-4, "trial_sharpe_count": 3})
+
+    trades = [{"net_pnl_pct": r} for r in _STRONG]
+    monkeypatch.setattr(
+        "forven.api_core.get_backtest_result",
+        lambda result_id, remote_skip=True: {"trades": trades},
+    )
+
+    out = compute_strategy_dsr("S-thin")
+    assert out["trial_var_source"] == "estimator_proxy"  # too few trials -> keep the proxy

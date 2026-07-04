@@ -525,6 +525,8 @@ def grid_search(
             metrics = bt.get("metrics", {})
             fitness = score_strategy(metrics)
             objective_score = _objective_value(metrics, normalized_objective)
+            from forven.gauntlet.deflated_sharpe import per_trade_sharpe
+
             return {
                 "params": param_overrides,
                 "full_params": params,
@@ -535,6 +537,11 @@ def grid_search(
                 "objective": normalized_objective,
                 "objective_value": objective_score,
                 "trades": metrics.get("total_trades", 0),
+                # This trial's per-trade Sharpe estimate — the raw material for the
+                # cross-trial dispersion the Deflated Sharpe Ratio needs (see
+                # _stamp_trial_sharpe_stats). Computed here because the trade list
+                # is discarded with the backtest payload.
+                "trade_sharpe": per_trade_sharpe(bt.get("trades") or []),
             }
         except Exception as e:
             log.debug("Grid search combo %d failed: %s", i, e)
@@ -607,8 +614,39 @@ def grid_search(
     for r in results:
         if isinstance(r, dict):
             r["trials_evaluated"] = len(combos)
+    _stamp_trial_sharpe_stats(results)
 
     return results[:TOP_N]
+
+
+def _stamp_trial_sharpe_stats(results: list) -> None:
+    """Cross-trial per-trade-Sharpe dispersion for the Deflated Sharpe Ratio.
+
+    The DSR's expected-max-Sharpe benchmark wants the variance of the Sharpe
+    estimates ACROSS the optimizer's trials; when absent it falls back to a
+    conservative single-strategy estimator proxy that overstates dispersion on
+    small trade samples (real neighboring-param trials are highly correlated, so
+    their true spread is far narrower). Must run over ALL valid trials BEFORE the
+    top-N truncation; stamped on every surviving result so the winner carries it
+    to persistence. Needs >= 5 contributing trials for a meaningful spread.
+    """
+    sharpes = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        s = r.get("trade_sharpe")
+        if isinstance(s, (int, float)) and math.isfinite(float(s)):
+            sharpes.append(float(s))
+    if len(sharpes) < 5:
+        return
+    mean_s = sum(sharpes) / len(sharpes)
+    var_s = sum((s - mean_s) ** 2 for s in sharpes) / len(sharpes)
+    if var_s <= 0:
+        return
+    for r in results:
+        if isinstance(r, dict):
+            r["trial_sharpe_var"] = var_s
+            r["trial_sharpe_count"] = len(sharpes)
 
 
 def optimize_strategy(
@@ -813,6 +851,10 @@ def optimize_strategy(
         # The genuine selection breadth = combos actually evaluated (for the DSR
         # deflation), falling back to the caller's requested budget.
         "n_trials": int(best.get("trials_evaluated") or 0) or n_trials,
+        # Cross-trial Sharpe dispersion (None when < 5 trials contributed) — lets
+        # the DSR use the real trial variance instead of its conservative proxy.
+        "trial_sharpe_var": best.get("trial_sharpe_var"),
+        "trial_sharpe_count": best.get("trial_sharpe_count"),
         "top_results": grid_results[:3],
     }
 

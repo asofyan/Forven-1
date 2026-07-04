@@ -182,6 +182,15 @@ DEFAULT_PIPELINE_CONFIG = {
         "deflated_sharpe_gate_enabled": False,
         "min_deflated_sharpe": 0.90,
         "deflated_sharpe_default_trials": 50,
+        # Swarm-level selection bias (issue #17): the swarm tries many sibling
+        # hypotheses per idea-cluster (family x asset) and only survivors reach
+        # the gauntlet, so the per-strategy optimizer trial count understates the
+        # true selection pressure. When enabled, DSR n_trials is multiplied by
+        # (1 + disproven same-cluster hypotheses within the lookback window;
+        # 0 = unbounded). Safe to leave on: it only changes the computed DSR —
+        # the reject gate above stays opt-in.
+        "dsr_swarm_trials_enabled": True,
+        "dsr_swarm_lookback_days": 90,
     },
     "paper_trading": {
         "min_paper_days": 14,
@@ -3786,10 +3795,18 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
         if dsr_val is not None:
             min_dsr = float(rob_thresholds.get("min_deflated_sharpe", 0.90))
             if float(dsr_val) < min_dsr:
+                swarm_n = int(dsr_info.get("swarm_cluster_attempts") or 0)
+                if swarm_n > 0:
+                    trials_note = (
+                        f"~{dsr_info.get('n_trials')} effective trials "
+                        f"({dsr_info.get('n_trials_base')} optimizer x "
+                        f"{swarm_n + 1} swarm attempts in this idea-cluster)"
+                    )
+                else:
+                    trials_note = f"{dsr_info.get('n_trials')} trials"
                 return False, (
                     f"DSR REJECT: Deflated Sharpe {float(dsr_val):.2f} below {min_dsr:.2f} "
-                    f"target (likely an optimizer selection artifact across "
-                    f"{dsr_info.get('n_trials')} trials)"
+                    f"target (likely a selection artifact across {trials_note})"
                 )
 
     # S00552: Profit Factor enforcement at gauntlet (in addition to quick_screen).

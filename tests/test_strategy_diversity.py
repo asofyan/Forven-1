@@ -80,3 +80,25 @@ def test_filter_recall_records_limits_one_family_dominance():
     assert rsi_count < 8
     assert any("macd" in record["document"] for record in filtered)
     assert any("donchian" in record["document"] for record in filtered)
+
+
+def test_family_matching_requires_token_boundaries():
+    # Bare substring matching classified "pe-rsi-stence" / "reve-rsi-on" /
+    # "dive-rsi-fied" texts as the rsi family (checked first, so it swallowed
+    # other families' rows — observed live: 80% of the disproven rsi graveyard
+    # never mentioned RSI). Family tokens must sit on their own boundaries.
+    from forven.strategy_diversity import infer_strategy_family
+
+    assert infer_strategy_family("Taker-Flow Persistence Breakout") != "rsi"
+    assert infer_strategy_family("Diversified Momentum Basket") == "other"
+    assert infer_strategy_family("OI Divergence Reversal Signal") != "rsi"
+
+    # Real mentions still classify, across the separator alphabet ("_", space,
+    # "-", "%" — normalization maps punctuation to "_").
+    assert infer_strategy_family("RSI(14) Pullback") == "rsi"
+    assert infer_strategy_family("rsi_period: 14") == "rsi"
+    assert infer_strategy_family("Connors RSI2 Dip Buyer") == "rsi"
+    assert infer_strategy_family("bb_width squeeze regime") == "bollinger"
+    assert infer_strategy_family("BTC-EMA_CROSS-S00001") == "ema"
+    assert infer_strategy_family("Williams %R oversold bounce") == "williams_r"
+    assert infer_strategy_family("taker flow imbalance joint predictor") == "volume"
