@@ -34,6 +34,7 @@ from forven.exchange.risk import (
     sync_from_trades,
 )
 from forven.strategies import sizing as _sizing
+from forven.strategies.execution_kernel import cost_breakdown_usd as _kernel_cost_breakdown_usd
 from forven.market_cache import (
     load_price_snapshot,
     load_candle_snapshot,
@@ -5652,6 +5653,10 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         _coerce_positive_float((p.get("execution_profile") or {}).get("risk_per_trade"))
         or min(float(size_fraction), 1.0)
     )
+    # Entry-leg fee at open (fee_bps on the entry notional) so the position shows its
+    # fee immediately, like an exchange fill. The close overwrites both legs with the
+    # close-time breakdown; this stamp is display-only (the drag is charged at close).
+    _fee_bps_open = max(_scanner_float_setting("backtest_fee_bps", 4.5), 0.0)
     signal_data = {
         "kernel_managed": True,
         # Match key is ALWAYS the kernel's historical entry_time, even for a late hop-in,
@@ -5660,6 +5665,8 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         "kernel_entry_bar": int(pos.get("entry_bar") or 0),
         "kernel_size_fraction": round(float(size_fraction), 8),
         "kernel_equity_at_entry": round(float(sizing_equity), 4),
+        "fee_bps": _fee_bps_open,
+        "entry_fee_usd": round((_fee_bps_open / 10000.0) * float(sizing_equity) * float(leverage) * float(size_fraction), 6),
         "kernel_regime": pos.get("regime"),
         "price": entry_price,
         "direction": direction,
@@ -5880,6 +5887,13 @@ def _kernel_close_recorded(
                 "kernel_exit_time": trade.get("exit_time"), "kernel_managed": bool(sd.get("kernel_managed", True)),
                 "close_fill_now": fresh_exit, "close_mark_fill": mark_fill,
                 "funding_cost_pct": _funding_pct,
+                # Itemize the costs the net _pnl_eq already charged (drag + funding)
+                # so reporting can show paper fees/slippage/funding, not a bare net.
+                **_kernel_cost_breakdown_usd(
+                    equity_at_entry=equity_at_entry, leverage=_lev, size_fraction=_size_frac,
+                    fee_bps=_fee_bps, slippage_bps=_slip_bps,
+                    funding_gain_pct=_funding_pct, net_pnl_usd=_pnl_usd_eq,
+                ),
             },
             pnl_override={
                 "pnl_pct": round(_pnl_eq, 8), "net_pnl_pct": round(_pnl_eq, 8),
@@ -5899,10 +5913,32 @@ def _kernel_close_recorded(
     # pnl_override so close_trade_record writes status=CLOSED + pnl/pnl_pct/net_pnl_pct/
     # pnl_usd + closed_at + the pnl_is_equity_fraction flag in ONE atomic transaction (no
     # separate override UPDATE that a crash could tear, leaving a wrong-scale unflagged row).
+    # Itemize the drag/funding the kernel already netted out of pnl_pct: the same
+    # backtest_* settings drove this scan's simulate() call, size_fraction_raw is the
+    # exact fraction the price/funding legs used, and funding_cost_pct is the kernel's
+    # gain-positive funding term (_apply_funding_to_trades).
+    _fee_bps_f = max(_scanner_float_setting("backtest_fee_bps", 4.5), 0.0)
+    _slip_bps_f = max(_scanner_float_setting("backtest_slippage_bps", 2.0), 0.0)
+    _size_frac_f = (
+        _coerce_positive_float(trade.get("size_fraction_raw"))
+        or _coerce_positive_float(trade.get("size_fraction"))
+        or _coerce_positive_float(sd.get("kernel_size_fraction"))
+        or 1.0
+    )
     close_trade_record(
         trade_id, signal_exit_price=exit_price, exit_price=exit_price,
         close_reason=exit_reason, close_price_source="kernel", closed_at=_closed_at,
-        extra_signal_data={"kernel_exit_time": trade.get("exit_time"), "kernel_managed": True},
+        extra_signal_data={
+            "kernel_exit_time": trade.get("exit_time"), "kernel_managed": True,
+            **_kernel_cost_breakdown_usd(
+                equity_at_entry=equity_at_entry,
+                leverage=float(row.get("leverage") or 1.0),
+                size_fraction=_size_frac_f,
+                fee_bps=_fee_bps_f, slippage_bps=_slip_bps_f,
+                funding_gain_pct=float(trade.get("funding_cost_pct") or 0.0),
+                net_pnl_usd=pnl_usd,
+            ),
+        },
         pnl_override={
             "pnl_pct": round(pnl_pct_net, 8), "net_pnl_pct": round(pnl_pct_net, 8),
             "pnl_usd": pnl_usd, "equity_fraction": True,
