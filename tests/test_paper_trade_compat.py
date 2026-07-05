@@ -92,6 +92,71 @@ def test_build_compat_paper_trade_surfaces_real_close_costs():
     assert trade["pnl"] == 0.8738
 
 
+def test_build_compat_paper_trade_prefers_persisted_kernel_cost_breakdown():
+    # Kernel paper closes persist exact dollar costs (execution_kernel.cost_breakdown_usd)
+    # with a NET pnl_usd; the payload must surface them verbatim — not re-subtract costs
+    # from the already-net pnl, and not zero the fee fields.
+    trade = paper_domain._build_compat_paper_trade(
+        {
+            "id": "E0020",
+            "direction": "long",
+            "entry_price": 60173.01,
+            "exit_price": 62771.6,
+            "size": 0.108149,
+            "leverage": 2.0,
+            "opened_at": "2026-07-01T15:00:00+00:00",
+            "closed_at": "2026-07-05T11:01:18+00:00",
+            "pnl_usd": 266.6548,
+            "pnl_pct": 0.02666548,
+            "net_pnl_pct": 0.02666548,
+            "fees_pct": None,
+            "signal_data": {
+                "kernel_managed": True,
+                "fee_bps": 4.5,
+                "entry_fee_usd": 2.9,
+                "exit_fee_usd": 2.9,
+                "total_fees_usd": 5.8,
+                "slippage_usd": 2.58,
+                "funding_usd": 1.2,
+                "gross_pnl_usd": 276.2348,
+            },
+        },
+        strategy_name="Kernel Strategy",
+        symbol="BTC/USDT",
+    )
+
+    assert trade["gross_pnl"] == 276.2348
+    assert trade["net_pnl"] == 266.6548  # pnl is already net — no double subtraction
+    assert trade["fees_paid"] == 5.8
+    assert trade["entry_fee_bps"] == 4.5
+    assert trade["exit_fee_bps"] == 4.5
+    assert trade["entry_fee_usd"] == 2.9
+    assert trade["exit_fee_usd"] == 2.9
+    assert trade["slippage_usd"] == 2.58
+    assert trade["funding_pnl"] == -1.2
+
+
+def test_cost_breakdown_usd_reconstructs_gross_exactly():
+    from forven.strategies.execution_kernel import cost_breakdown_usd, round_trip_drag
+
+    equity, lev, size_frac, fee_bps, slip_bps = 10000.0, 2.0, 0.5, 4.5, 2.0
+    funding_gain = -0.001  # paid 0.1% of equity in funding
+    gross_return = 0.04  # price return * sign * lev, pre-drag
+    net_pct = (gross_return - round_trip_drag(fee_bps, slip_bps, lev)) * size_frac + funding_gain
+    net_usd = equity * net_pct
+
+    b = cost_breakdown_usd(
+        equity_at_entry=equity, leverage=lev, size_fraction=size_frac,
+        fee_bps=fee_bps, slippage_bps=slip_bps,
+        funding_gain_pct=funding_gain, net_pnl_usd=net_usd,
+    )
+
+    # Net + itemized costs must sum exactly back to the pure price gross.
+    assert abs(b["gross_pnl_usd"] - equity * gross_return * size_frac) < 1e-6
+    assert abs(b["total_fees_usd"] - (b["entry_fee_usd"] + b["exit_fee_usd"])) < 1e-9
+    assert abs(b["funding_usd"] - 10.0) < 1e-9  # cost-positive convention
+
+
 def test_build_compat_paper_trade_surfaces_incomplete_close_metadata():
     trade = paper_domain._build_compat_paper_trade(
         {

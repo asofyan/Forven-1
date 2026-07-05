@@ -335,7 +335,15 @@
 		return toTradeFill(row).key ?? index;
 	}
 
-	function legFee(feeBps: number | null | undefined, price: number | null | undefined, size: number): number | null {
+	// Prefer the exact per-leg dollars persisted at close (kernel paper trades itemize
+	// the drag they actually charged); fall back to bps x leg notional (live trades).
+	function legFee(
+		explicitUsd: number | null | undefined,
+		feeBps: number | null | undefined,
+		price: number | null | undefined,
+		size: number
+	): number | null {
+		if (typeof explicitUsd === 'number' && Number.isFinite(explicitUsd) && explicitUsd > 0) return explicitUsd;
 		if (typeof feeBps !== 'number' || feeBps <= 0) return null;
 		if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0 || size <= 0) return null;
 		return (feeBps / 10000) * price * size;
@@ -345,9 +353,9 @@
 		const fills: TradeFillRow[] = [];
 		for (const trade of trades) {
 			const size = Number(trade.size) || 0;
-			const entryFee = legFee(trade.entry_fee_bps, trade.entry_price, size);
+			const entryFee = legFee(trade.entry_fee_usd, trade.entry_fee_bps, trade.entry_price, size);
 			if (trade.exit_time) {
-				const exitFee = legFee(trade.exit_fee_bps, trade.exit_price, size);
+				const exitFee = legFee(trade.exit_fee_usd, trade.exit_fee_bps, trade.exit_price, size);
 				const gross = typeof trade.gross_pnl === 'number' ? trade.gross_pnl : trade.pnl;
 				fills.push({
 					key: `${trade.id}:close`,
@@ -3662,6 +3670,12 @@
 														<span class="text-gray-500">Fees:</span>
 														<span class="text-red-400">{formatDollarPnl((trade.fees_paid ?? 0) * -1)}</span>
 													</div>
+													{#if typeof trade.slippage_usd === 'number' && trade.slippage_usd > 0}
+														<div class="flex justify-between gap-4 mb-1">
+															<span class="text-gray-500">Slippage:</span>
+															<span class="text-red-400">{formatDollarPnl(trade.slippage_usd * -1)}</span>
+														</div>
+													{/if}
 													<div class="flex justify-between gap-4 mb-1">
 														<span class="text-gray-500">Funding:</span>
 														<span class="{getPnlTone(trade.funding_pnl)}">{formatDollarPnl(trade.funding_pnl)}</span>
