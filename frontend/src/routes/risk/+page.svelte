@@ -10,6 +10,7 @@
 	import { rebaselineEquityAnchors, setLiveNotionalCeiling, triggerEmergencyHalt } from '$lib/api/forven';
 	import ErrorBanner from '$lib/components/ErrorBanner.svelte';
 	import LoadingState from '$lib/components/LoadingState.svelte';
+	import RegimeGatePanel from '$lib/components/risk/RegimeGatePanel.svelte';
 	import { createRealtimeRefresh, type RealtimeRefreshController } from '$lib/utils/realtime';
 
 	let dashboard: ForvenDashboardResponse | null = null;
@@ -667,6 +668,8 @@
 		{/if}
 	</div>
 	{/if}
+
+	<RegimeGatePanel gate={risk?.regime_gate} on:changed={() => loadRiskData()} />
 
 	<div class="border border-[#222] bg-[#050505] p-4 space-y-3">
 		<h2 class="text-sm font-bold uppercase tracking-wider text-white">Correlation Groups</h2>

@@ -900,6 +900,7 @@ def get_regime() -> dict[str, object]:
     for asset in ("BTC", "ETH", "SOL"):
         cached = kv_get(f"regime:{asset}")
         if cached:
+            since = kv_get(f"regime:{asset}:since") or {}
             result[asset] = {
                 "regime": cached.get("regime", "UNKNOWN"),
                 "confidence": cached.get("confidence", 0),
@@ -907,13 +908,96 @@ def get_regime() -> dict[str, object]:
                 "ema_alignment": cached.get("ema_alignment", "mixed"),
                 "atr_ratio": cached.get("atr_ratio", 1.0),
                 "rsi": cached.get("rsi", 50),
+                # epoch seconds of the last label flip (None = not yet observed)
+                "since": since.get("since") if since.get("regime") == cached.get("regime") else None,
                 "asset": asset,
             }
     return result
 
 
+_REGIME_SERIES_CACHE: dict[tuple, tuple[float, dict]] = {}
+_REGIME_SERIES_TTL_SECONDS = 300
+_REGIME_SERIES_WARMUP_BARS = 260
+
+
+def get_regime_series(symbol: str, timeframe: str = "1h", bars: int = 1000) -> dict[str, object]:
+    """Per-bar causal regime labels over the tail of a lake series, compressed
+    to contiguous segments for chart shading. Same classifier the backtest,
+    the trade stamp, and the entry gate use — no hindsight labels."""
+    import time as _time
+
+    import pandas as pd
+
+    from forven.data import load_parquet
+
+    bars = max(100, min(int(bars or 1000), 3000))
+    timeframe = str(timeframe or "1h").strip() or "1h"
+    raw = str(symbol or "").strip().upper().replace("/", "-")
+    if not raw:
+        return {"symbol": symbol, "timeframe": timeframe, "segments": []}
+
+    cache_key = (raw, timeframe, bars)
+    cached = _REGIME_SERIES_CACHE.get(cache_key)
+    if cached and _time.time() - cached[0] < _REGIME_SERIES_TTL_SECONDS:
+        return cached[1]
+
+    candidates = [raw] if "-" in raw else [raw + sfx for sfx in ("-USDT", "-USD", "-USDC")] + [raw]
+    df = None
+    resolved = None
+    for candidate in candidates:
+        loaded = load_parquet(candidate, timeframe)
+        if loaded is not None and not loaded.empty and "timestamp" in loaded.columns:
+            df = loaded
+            resolved = candidate
+            break
+    if df is None:
+        payload = {"symbol": raw, "timeframe": timeframe, "segments": []}
+        _REGIME_SERIES_CACHE[cache_key] = (_time.time(), payload)
+        return payload
+
+    # Extra warmup bars so the returned window carries real labels, not the
+    # classifier's <210-bar RANGE_BOUND default.
+    tail = df.tail(bars + _REGIME_SERIES_WARMUP_BARS).reset_index(drop=True)
+    from forven.strategies.backtest import _precompute_regimes
+
+    labels = _precompute_regimes(tail)
+    ts = pd.to_datetime(tail["timestamp"], utc=True, errors="coerce")
+    start = max(0, len(tail) - bars)
+
+    segments: list[dict] = []
+    for i in range(start, len(tail)):
+        stamp = ts.iloc[i]
+        if pd.isna(stamp):
+            continue
+        label = str(labels.iloc[i])
+        if segments and segments[-1]["regime"] == label:
+            segments[-1]["end"] = stamp.isoformat()
+        else:
+            segments.append({"start": stamp.isoformat(), "end": stamp.isoformat(), "regime": label})
+
+    payload = {
+        "symbol": raw,
+        "series": resolved,
+        "timeframe": timeframe,
+        "bars": min(bars, max(0, len(tail) - start)),
+        "segments": segments,
+    }
+    _REGIME_SERIES_CACHE[cache_key] = (_time.time(), payload)
+    return payload
+
+
 def get_risk() -> dict[str, object]:
-    return get_risk_status()
+    payload = get_risk_status()
+    # REGIME-GATE-1: the Risk page's gate panel rides on the existing risk
+    # payload (one fetch). Best-effort — gate telemetry must never take down
+    # the risk endpoint.
+    try:
+        from forven.regime_gate import get_regime_gate_status
+
+        payload["regime_gate"] = get_regime_gate_status()
+    except Exception:
+        payload["regime_gate"] = None
+    return payload
 
 
 def get_sentiment() -> dict[str, object]:

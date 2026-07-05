@@ -772,6 +772,7 @@ CREATE TABLE IF NOT EXISTS trades (
     book TEXT,
     timeframe TEXT,
     source TEXT,
+    regime TEXT,
     signal_data JSON,
     opened_at TEXT,
     closed_at TEXT,
@@ -3430,6 +3431,48 @@ def log_gate_rejection(
         pass  # Non-critical — never block pipeline on telemetry
 
 
+def log_regime_gate_event(
+    strategy_id: str,
+    asset: str,
+    direction: str,
+    regime: str,
+    confidence: float | None,
+    mode: str,
+    decision: str,
+    execution_type: str | None = None,
+    ref_price: float | None = None,
+):
+    """Persist one direction×regime gate decision to the gate ledger.
+
+    decision: 'blocked' (enforce veto) or 'would_block' (observe shadow-log).
+    Allows are never recorded — the ledger answers "what did the gate stop",
+    and the follow-up job later stamps mtm_pct with the return the blocked
+    entry would have made. Best-effort: sits on the entry hot path, so under
+    SQLite write contention it drops the record rather than stalling an open.
+    """
+    try:
+        with get_db_best_effort() as conn:
+            conn.execute(
+                """INSERT INTO regime_gate_events
+                   (strategy_id, asset, direction, regime, confidence, mode,
+                    decision, execution_type, ref_price)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(strategy_id),
+                    str(asset),
+                    str(direction),
+                    str(regime),
+                    float(confidence) if confidence is not None else None,
+                    str(mode),
+                    str(decision),
+                    str(execution_type) if execution_type else None,
+                    float(ref_price) if ref_price not in (None, "") else None,
+                ),
+            )
+    except Exception:
+        pass  # Non-critical — never block an open on gate telemetry
+
+
 def record_signal_result(
     strategy_id: str,
     symbol: str,
@@ -3885,7 +3928,7 @@ def get_recent_trades(limit: int = 20) -> list[dict]:
             SELECT id, display_id, strategy, strategy_id, strategy_name, asset, symbol, direction,
                    size, risk_pct, leverage, entry_price, signal_entry_price, fill_entry_price,
                    exit_price, signal_exit_price, fill_exit_price, status, execution_type, pnl,
-                   pnl_pct, pnl_usd, net_pnl_pct, fees_pct, signal_data, opened_at, closed_at,
+                   pnl_pct, pnl_usd, net_pnl_pct, fees_pct, regime, signal_data, opened_at, closed_at,
                    timeframe, source, created_at
             FROM trades
             ORDER BY opened_at DESC
@@ -3901,7 +3944,7 @@ _ALL_TRADE_COLUMNS = (
     "size, risk_pct, leverage, entry_price, signal_entry_price, fill_entry_price, "
     "exit_price, signal_exit_price, fill_exit_price, entry_slippage_bps, exit_slippage_bps, "
     "status, execution_type, pnl, pnl_pct, pnl_usd, net_pnl_pct, fees_pct, book, "
-    "signal_data, opened_at, closed_at, timeframe, source, created_at"
+    "regime, signal_data, opened_at, closed_at, timeframe, source, created_at"
 )
 
 # Whitelisted ledger sort columns (request key -> SQL expression). A request sort
@@ -4152,7 +4195,7 @@ def get_open_trades(exclude_bots: bool = False) -> list[dict]:
             "SELECT id, display_id, strategy, strategy_id, strategy_name, asset, symbol, direction, size, "
             "entry_price, signal_entry_price, fill_entry_price, exit_price, signal_exit_price, "
             "fill_exit_price, status, execution_type, pnl, pnl_pct, pnl_usd, net_pnl_pct, fees_pct, "
-            "signal_data, opened_at, closed_at, timeframe, source, leverage, created_at "
+            "regime, signal_data, opened_at, closed_at, timeframe, source, leverage, created_at "
             f"FROM trades WHERE status = 'OPEN'{bot_filter} ORDER BY opened_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]

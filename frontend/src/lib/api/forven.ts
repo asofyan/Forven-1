@@ -84,6 +84,46 @@ export interface ForvenDashboardResponse {
 	simulation_prices?: Record<string, number>;
 }
 
+export interface RegimeGateStance {
+	asset: string;
+	regime?: string | null;
+	confidence?: number | null;
+	since?: number | null;
+	restricted: string[];
+}
+
+export interface RegimeGateEvent {
+	id: number;
+	ts: string;
+	strategy_id: string;
+	asset: string;
+	direction: string;
+	regime: string;
+	confidence?: number | null;
+	mode: string;
+	decision: string;
+	execution_type?: string | null;
+	ref_price?: number | null;
+	mtm_pct?: number | null;
+	mtm_evaluated_at?: string | null;
+}
+
+export interface RegimeGateStatus {
+	mode: 'off' | 'observe' | 'enforce';
+	block_long: string[];
+	block_short: string[];
+	min_confidence: number;
+	mtm_horizon_hours: number;
+	stances: RegimeGateStance[];
+	events: RegimeGateEvent[];
+	aggregates: {
+		window_days: number;
+		events: number;
+		mtm_n: number;
+		mtm_avg_pct: number | null;
+	};
+}
+
 export interface ForvenRiskStatus {
 	system_paused?: boolean;
 	kill_switch_enabled?: boolean;
@@ -98,6 +138,8 @@ export interface ForvenRiskStatus {
 	recovery_active?: boolean;
 	recovery_status?: string;
 	recovery_summary?: string;
+	/** REGIME-GATE-1: direction×regime entry gate status (null on gate errors). */
+	regime_gate?: RegimeGateStatus | null;
 	limits?: {
 		max_drawdown?: number;
 		daily_loss_limit?: number;
@@ -193,8 +235,33 @@ export interface ForvenRegimeSnapshot {
 		ema_alignment?: string;
 		atr_ratio?: number;
 		rsi?: number;
+		/** epoch seconds of the last regime flip (null = not yet observed) */
+		since?: number | null;
 		asset?: string;
 	};
+}
+
+export interface RegimeSeriesSegment {
+	start: string;
+	end: string;
+	regime: string;
+}
+
+export interface RegimeSeriesResponse {
+	symbol: string;
+	series?: string | null;
+	timeframe: string;
+	bars?: number;
+	segments: RegimeSeriesSegment[];
+}
+
+export async function getRegimeSeries(
+	symbol: string,
+	timeframe = '1h',
+	bars = 1000
+): Promise<RegimeSeriesResponse> {
+	const params = new URLSearchParams({ symbol, timeframe, bars: String(bars) });
+	return fetchApi<RegimeSeriesResponse>(`/regime/series?${params.toString()}`);
 }
 
 export interface ForvenEquityPoint {
@@ -244,6 +311,8 @@ export interface ForvenTrade {
 	book?: string | null;
 	status?: string;
 	timeframe?: string | null;
+	/** market regime at entry (causal classifier label); null on pre-stamp rows */
+	regime?: string | null;
 	opened_at?: string | null;
 	closed_at?: string | null;
 	created_at?: string | null;
