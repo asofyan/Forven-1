@@ -509,6 +509,7 @@ def _plan_for_crucible(
     crucible: dict[str, Any],
     *,
     task_index: CrucibleTaskIndex | None = None,
+    child_signals: dict[str, Any] | None = None,
 ) -> CrucibleAction | None:
     index = task_index or CrucibleTaskIndex.build()
     crucible_id = str(crucible["id"])
@@ -630,6 +631,37 @@ def _plan_for_crucible(
             priority=4,
         )
 
+    # CRUX-1 exploit lane: a crucible with a PROMOTED descendant (paper/live)
+    # is the only ground-truth signal of a working thesis, yet the old expand
+    # path required proven+protected — only 2 hypotheses ever qualified, so
+    # ~100% of budget went to exploration. Survivor crucibles may expand
+    # repeatedly (open-task dedup + the spawn limit still bound depth).
+    survivor_children = int((child_signals or {}).get("survivor_children") or 0)
+    if survivor_children > 0 and status in {"researching", "proven"}:
+        if _strategy_spawn_limit_exhausted(crucible_id):
+            return None
+        if index.candidate_action_open(crucible_id):
+            return None
+        if _has_busy_strategy(crucible_id):
+            return None
+        return _action(
+            action_kind="expand_viable_crucible",
+            agent_id="strategy-developer",
+            task_type="develop_candidate",
+            title=f"Expand survivor crucible {label}",
+            description=(
+                f"Exploit a WORKING thesis: {label}: {title} already has "
+                f"{survivor_children} promoted (paper/live) descendant(s).\n\n"
+                "Produce a structural variant of the strongest surviving sibling — "
+                "different asset, timeframe, exit style, or regime filter — and set "
+                "parent_strategy_id to that sibling. Call forven_create_strategy or "
+                "register_strategy with the exact provided hypothesis_id/crucible_id. "
+                "Do not call create_hypothesis."
+            ),
+            crucible_id=crucible_id,
+            priority=5,
+        )
+
     return None
 
 
@@ -689,9 +721,44 @@ def plan_next_actions(*, limit: int = 3) -> list[CrucibleAction]:
         action = _propose_crucible_action()
         return [] if task_index.open_action_exists(action.action_kind, action.crucible_id) else [action]
 
+    # CRUX-1: rank the pool by expected value instead of oldest-first. The
+    # FIFO iteration was the planner's economic blindness — a fresh crucible
+    # in a surviving family waited behind years of accumulated disproof.
+    from forven.crucible_allocator import (
+        cached_family_outcome_stats,
+        crucible_value_score,
+        fetch_crucible_child_signals,
+        smoothed_family_rate,
+    )
+    from forven.strategy_diversity import infer_strategy_family
+
+    child_signals = fetch_crucible_child_signals([str(c["id"]) for c in crucibles])
+    family_stats = cached_family_outcome_stats()
+
+    def _score(crucible: dict[str, Any]) -> float:
+        crucible_id = str(crucible["id"])
+        signals = child_signals.get(crucible_id) or {}
+        family = infer_strategy_family(crucible.get("title"))
+        return crucible_value_score(
+            status=str(crucible.get("status") or ""),
+            survivor_children=int(signals.get("survivor_children") or 0),
+            gauntlet_children=int(signals.get("gauntlet_children") or 0),
+            positive_children=int(signals.get("positive_children") or 0),
+            scored_children=int(signals.get("children") or 0),
+            fruitless_develops=task_index.fruitless_develop_count(crucible_id),
+            failed_develops=task_index.failed_action_count("develop_candidate", crucible_id),
+            family_survival_rate=smoothed_family_rate(family, family_stats),
+        )
+
+    crucibles = sorted(crucibles, key=_score, reverse=True)
+
     actions: list[CrucibleAction] = []
     for crucible in crucibles:
-        action = _plan_for_crucible(crucible, task_index=task_index)
+        action = _plan_for_crucible(
+            crucible,
+            task_index=task_index,
+            child_signals=child_signals.get(str(crucible["id"])),
+        )
         if action is None:
             continue
         if task_index.open_action_exists(action.action_kind, action.crucible_id):
@@ -735,9 +802,23 @@ def run_crucible_planner_cycle(*, limit: int = 3) -> dict[str, Any]:
     refine_in_flight = _in_flight_refine_count()
     develop_in_flight = max(0, _current_in_flight_task_count() - refine_in_flight)
     deferred_for_cap = 0
+    deferred_for_daily_budget = 0
+    directives_stamped = 0
+
+    # CRUX-1: hard DAILY develop budget shared with the promotion loop
+    # (in-flight caps bound concurrency, not spend). Read once, track locally.
+    from forven.crucible_allocator import (
+        SHORT_DIRECTIVE_TEXT,
+        develop_budget_remaining,
+        next_trade_mode_directive,
+    )
+
+    daily_budget_remaining = develop_budget_remaining()
 
     assigned_task_ids: list[int] = []
     for action in actions:
+        description = action.description
+        input_data = dict(action.input_data)
         if action.agent_id == "strategy-developer":
             if action.action_kind == "refine_crucible":
                 if refine_in_flight >= refine_budget:
@@ -748,14 +829,26 @@ def run_crucible_planner_cycle(*, limit: int = 3) -> dict[str, Any]:
                 if develop_in_flight >= MAX_IN_FLIGHT_DEFAULT:
                     deferred_for_cap += 1
                     continue
+                if action.task_type == "develop_candidate":
+                    if daily_budget_remaining <= 0:
+                        deferred_for_daily_budget += 1
+                        continue
+                    daily_budget_remaining -= 1
+                    # CRUX-1 direction quota: a share of daily develops carry
+                    # an explicit short/both authoring requirement.
+                    directive = next_trade_mode_directive()
+                    if directive:
+                        input_data["trade_mode_directive"] = directive
+                        description = description + SHORT_DIRECTIVE_TEXT
+                        directives_stamped += 1
                 develop_in_flight += 1
         task_id = assign_task(
             action.agent_id,
             action.task_type,
             action.title,
-            action.description,
-            action.input_data,
-            strategy_id=str(action.input_data.get("strategy_id") or "").strip() or None,
+            description,
+            input_data,
+            strategy_id=str(input_data.get("strategy_id") or "").strip() or None,
             priority=action.priority,
         )
         assigned_task_ids.append(int(task_id))
@@ -767,4 +860,12 @@ def run_crucible_planner_cycle(*, limit: int = 3) -> dict[str, Any]:
     }
     if deferred_for_cap:
         result["deferred_for_in_flight_cap"] = deferred_for_cap
+    if deferred_for_daily_budget:
+        result["deferred_for_daily_budget"] = deferred_for_daily_budget
+        log.info(
+            "crucible planner: daily develop budget exhausted — deferred %d action(s)",
+            deferred_for_daily_budget,
+        )
+    if directives_stamped:
+        result["short_directives_stamped"] = directives_stamped
     return result
