@@ -784,7 +784,10 @@ function toQualityReport(ds: Dataset, q: DataQualityExtended, idx: number): Qual
 }
 
 export async function getDataEngineStatus(): Promise<DataEngineStatus> {
-	return fetchApi('/data/engine/status');
+	// Hard total budget via signal (not timeoutMs): fetchApi retries non-HTTP
+	// failures across every API base candidate, so a per-attempt timeout would
+	// multiply by the candidate count while the Data page waits on this call.
+	return fetchApi('/data/engine/status', { signal: AbortSignal.timeout(15_000) });
 }
 
 export async function planDataEngineBackfill(): Promise<DataEngineBackfillPlan> {

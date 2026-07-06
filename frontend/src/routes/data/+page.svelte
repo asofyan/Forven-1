@@ -183,9 +183,20 @@
 
 	async function loadData(preferred?: { symbol: string; timeframe: string }): Promise<void> {
 		const failures: string[] = [];
+		const datasetsPromise = getDatasets();
+		// Show the dataset list as soon as its own request answers — the tab must
+		// not sit on "Loading..." because one of the six status calls below is slow.
+		void datasetsPromise
+			.then((rows) => {
+				if (Array.isArray(rows)) {
+					datasets = rows;
+					loading = false;
+				}
+			})
+			.catch(() => {});
 		const [settingsResult, datasetsResult, runsResult, dataEngineResult, healthResult, lakeResult, universeResult] = await Promise.allSettled([
 			getSettings(),
-			getDatasets(),
+			datasetsPromise,
 			getIngestionRuns({ limit: 500 }),
 			getDataEngineStatus(),
 			getCollectionHealth(),
