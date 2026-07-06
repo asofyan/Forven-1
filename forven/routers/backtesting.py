@@ -9,7 +9,11 @@ from forven.api_domains import data as data_domain
 from forven.api_security import require_operator_access
 from forven.db import create_strategy_container, get_db
 from forven.hypotheses import get_hypothesis_spawn_stats, require_hypothesis
-from forven.strategies.certification import certify_execution_strategy, resolve_initial_stage
+from forven.strategies.certification import (
+    EXECUTION_CERTIFIED_FAMILIES,
+    certify_execution_strategy,
+    resolve_initial_stage,
+)
 
 log = logging.getLogger("forven.routers.backtesting")
 router = APIRouter(tags=["backtesting"], dependencies=[Depends(require_operator_access)])
@@ -114,10 +118,44 @@ def create_backtesting_strategy(
             ),
         )
 
+    # SYMBOL-1: reject a fabricated/unrepairable EXPLICIT symbol with a clean 422
+    # instead of the old silent BTC/USDT reroute (create_strategy_container now
+    # raises ValueError as the backstop for other callers).
+    if strategy_symbol and strategy_symbol != "GENERIC":
+        from forven.db import normalize_strategy_symbol_strict
+
+        if normalize_strategy_symbol_strict(strategy_symbol, strategy_params) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"unknown_symbol: {strategy_symbol!r} is not a resolvable market "
+                    "symbol (expected e.g. 'BTC/USDT' or a bare base asset). The "
+                    "strategy was NOT created — do not substitute a proxy symbol; "
+                    "if the required substrate has no dataset, keep the hypothesis "
+                    "in research_only instead."
+                ),
+            )
+
     certification = certify_execution_strategy(strategy_type, strategy_params)
     certification_error = certification.format_error(context="creation")
     if certification.unregistered_runtime_type:
         raise HTTPException(status_code=422, detail=certification_error)
+
+    # PARAMS-1: a class-backed custom type minted with EMPTY params is almost
+    # always an upstream param-loss bug (S06100 persisted params={} while its
+    # full spec sat in prose notes) — the container then runs on class defaults
+    # that don't match the documented mechanism, or crashes the runner. Certified
+    # families keep the legacy allowance (engine defaults are their documented
+    # behavior).
+    if not strategy_params and certification.family_type not in EXECUTION_CERTIFIED_FAMILIES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"empty_params: custom strategy type '{strategy_type}' requires a "
+                "non-empty params dict (the parameters documented in notes must be "
+                "serialized into 'params'). The strategy was NOT created."
+            ),
+        )
 
     target_stage = resolve_initial_stage(certification)
     note_lines: list[str] = []
@@ -244,7 +282,9 @@ def create_backtesting_strategy(
         "strategy_id": strategy_id,
         "name": row["name"],
         "type": strategy_type,
-        "symbol": strategy_symbol,
+        # The STORED symbol (post-repair), never the raw request string — the
+        # old echo let the response claim one symbol while the DB held another.
+        "symbol": row["symbol"],
         "timeframe": strategy_timeframe,
         # The STORED params (create_strategy_container may have lifted
         # time_stop_bars into execution_profile) — not the pre-store canonical

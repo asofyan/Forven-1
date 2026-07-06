@@ -332,14 +332,14 @@ def _repair_symbol_format(candidate: str) -> str | None:
     return None
 
 
-def _normalize_strategy_symbol(symbol: str | None, params: dict | None = None) -> str:
-    """Resolve symbol into a non-empty, non-GENERIC value for container creation.
-
-    Also applies :func:`_repair_symbol_format` to every candidate so corrupt
-    formats (timeframe-suffixed pairs, bare base assets) cannot enter the
-    strategies table — those propagate into the keepalive collectors and
-    produce 0-trade backtests indefinitely.
-    """
+def normalize_strategy_symbol_strict(symbol: str | None, params: dict | None = None) -> str | None:
+    """Like :func:`_normalize_strategy_symbol` but with NO last-resort default:
+    returns None when neither the symbol nor any params fallback repairs into a
+    canonical pair. Used by creation paths to REJECT fabricated symbols instead
+    of silently rerouting the strategy to BTC/USDT (SYMBOL-1 — a placeholder
+    like ``HIP3-WRPROXYPLACEHOLDER`` was accepted, rewritten to BTC/USDT in the
+    DB while the API echoed the original, and backtested against a substrate
+    the hypothesis explicitly disclaimed)."""
     primary = str(symbol or "").strip().upper()
     if primary and primary != "GENERIC":
         repaired = _repair_symbol_format(primary)
@@ -366,6 +366,20 @@ def _normalize_strategy_symbol(symbol: str | None, params: dict | None = None) -
             repaired = _repair_symbol_format(value)
             if repaired:
                 return repaired
+    return None
+
+
+def _normalize_strategy_symbol(symbol: str | None, params: dict | None = None) -> str:
+    """Resolve symbol into a non-empty, non-GENERIC value for container creation.
+
+    Also applies :func:`_repair_symbol_format` to every candidate so corrupt
+    formats (timeframe-suffixed pairs, bare base assets) cannot enter the
+    strategies table — those propagate into the keepalive collectors and
+    produce 0-trade backtests indefinitely.
+    """
+    strict = normalize_strategy_symbol_strict(symbol, params)
+    if strict:
+        return strict
 
     # Deterministic last-resort fallback. Keeps containers from being created
     # with placeholder GENERIC symbols, but emits a debug log so we can spot
@@ -4913,6 +4927,19 @@ def create_strategy_container(
         base_id = int(final_strategy_id[1:])
 
     normalized_stage = str(stage or "quick_screen").strip().lower() or "quick_screen"
+    # SYMBOL-1: an EXPLICIT symbol that cannot be repaired into a canonical pair
+    # is rejected, never silently rerouted — the old BTC/USDT last resort let a
+    # fabricated placeholder trade a substrate its hypothesis disclaimed, with
+    # the API echoing the original symbol while the DB stored BTC/USDT. Callers
+    # that omit the symbol entirely keep the legacy documented default.
+    explicit_symbol = str(symbol or "").strip()
+    if explicit_symbol and explicit_symbol.upper() != "GENERIC":
+        if normalize_strategy_symbol_strict(symbol, params) is None:
+            raise ValueError(
+                f"unknown symbol {explicit_symbol!r}: not repairable into a canonical "
+                "BASE/QUOTE pair — pass a real market symbol (e.g. 'BTC/USDT') instead "
+                "of a placeholder; the container was NOT created"
+            )
     normalized_symbol = _normalize_strategy_symbol(symbol, params)
     # DUP-1: refuse creating a strategy DIRECTLY INTO a trading stage when an exact
     # duplicate is already trading — same type + symbol + timeframe + identical params
