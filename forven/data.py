@@ -1749,6 +1749,36 @@ def _build_ohlcv_from_trades(
     return _bars_dict_to_frame(bars)
 
 
+def _forward_fill_ohlcv(frame: pd.DataFrame, tf_ms: int) -> pd.DataFrame:
+    """Fill no-trade gaps with flat bars (O=H=L=C = prior close, volume 0).
+
+    Candles reconstructed from a trades feed only exist for buckets that had
+    trades, so thin/early history is riddled with holes that fail the gauntlet's
+    gap gate. Exchange OHLC endpoints instead forward-fill empty periods with a
+    flat bar; this makes a trade-built series follow that same convention
+    (continuous, gap-free) — and heals an already-stored gappy series on merge.
+    """
+    if frame is None or frame.empty or len(frame) < 2:
+        return frame
+    frame = _normalize_ohlcv_frame(frame)
+    start = _to_ms(frame["timestamp"].iloc[0])
+    end = _to_ms(frame["timestamp"].iloc[-1])
+    expected = (end - start) // tf_ms + 1
+    if expected <= len(frame):
+        return frame  # already continuous — nothing to fill
+    full = pd.DatetimeIndex(
+        pd.to_datetime(range(start, end + tf_ms, tf_ms), unit="ms", utc=True),
+        name="timestamp",
+    )
+    filled = frame.set_index("timestamp").reindex(full)
+    was_missing = filled["open"].isna()
+    ff_close = filled["close"].ffill()
+    for col in ("open", "high", "low", "close"):
+        filled.loc[was_missing, col] = ff_close[was_missing]
+    filled.loc[was_missing, "volume"] = 0.0
+    return _normalize_ohlcv_frame(filled.reset_index())
+
+
 _ingestion_runs = {}
 _ingestion_runs_lock = threading.Lock()
 
@@ -2037,6 +2067,12 @@ def fetch_ohlcv_chunked(
             log.debug("Ignoring unreadable OHLCV snapshot for %s %s while merging remote fetch: %s", fs_symbol, timeframe, exc)
             current = None
         merged = merge_and_dedup(current, fetched)
+        # Trade-reconstructed candles skip no-trade buckets; forward-fill them to
+        # a continuous series (exchange-OHLC convention) so thin history doesn't
+        # fail the gap gate. Applied to the whole merged series, so re-running
+        # "all available" also heals an already-stored gappy trade-built dataset.
+        if use_trades:
+            merged = _forward_fill_ohlcv(merged, tf_ms)
         # Never persist the in-progress bar: a fetch reaches now+tf, so the last
         # row is typically the forming candle. Drop any unclosed bar (and clean a
         # previously-persisted one) before writing the lake.

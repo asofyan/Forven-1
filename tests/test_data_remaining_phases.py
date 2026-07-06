@@ -278,6 +278,30 @@ class TestKrakenTradesHistory:
         after = len(data_mod.load_parquet(SYMBOL, TF))
         assert after >= 50  # backfilled bars persisted, not dropped
 
+    def test_all_available_heals_gappy_series(self, lake, monkeypatch):
+        # A stored trade-built series with no-trade holes is forward-filled to a
+        # continuous series when "all available" re-runs (even with no new data).
+        base = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        H = 3_600_000
+        gappy = pd.DataFrame(
+            [
+                {"timestamp": pd.to_datetime(base, unit="ms", utc=True),
+                 "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1},
+                {"timestamp": pd.to_datetime(base + 5 * H, unit="ms", utc=True),
+                 "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1},
+            ]
+        )
+        data_mod.save_parquet(gappy, SYMBOL, TF, source="kraken")
+        monkeypatch.setattr(
+            data_mod, "_build_ohlcv_from_trades",
+            lambda *a, **k: data_mod._normalize_ohlcv_frame(pd.DataFrame()),
+        )
+        monkeypatch.setattr(data_mod, "get_exchange", lambda ex: object())
+        monkeypatch.setattr(data_mod, "_cached_markets", lambda ex: {})
+        data_mod.fetch_ohlcv_chunked(SYMBOL, TF, exchange_id="kraken", all_available=True)
+        df = data_mod.load_parquet(SYMBOL, TF)
+        assert len(df) == 6  # hours 0..5 now continuous
+
 
 class TestTradesOhlcvBuild:
     def test_aggregates_trades_into_bars(self, monkeypatch):
@@ -331,6 +355,39 @@ class TestTradesOhlcvBuild:
         monkeypatch.setattr(data_mod, "_fetch_trades_once", lambda e, s, since, limit: trades if since <= base else [])
         df = data_mod._build_ohlcv_from_trades(object(), "BTC/USDT", "1h", base, base + 2 * H)
         assert len(df) == 2  # hour-3 trade excluded
+
+    def test_forward_fill_fills_no_trade_gaps(self):
+        base = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        H = 3_600_000
+        frame = pd.DataFrame(
+            [
+                {"timestamp": pd.to_datetime(base, unit="ms", utc=True),
+                 "open": 100, "high": 110, "low": 90, "close": 105, "volume": 5},
+                {"timestamp": pd.to_datetime(base + 3 * H, unit="ms", utc=True),
+                 "open": 130, "high": 140, "low": 125, "close": 135, "volume": 3},
+            ]
+        )
+        out = data_mod._forward_fill_ohlcv(frame, H).reset_index(drop=True)
+        assert len(out) == 4  # hours 0..3 continuous
+        h1, h2 = out.iloc[1], out.iloc[2]
+        # empty hours → flat bar at hour-0's close (105), volume 0
+        assert (h1["open"], h1["high"], h1["low"], h1["close"], h1["volume"]) == (105, 105, 105, 105, 0)
+        assert (h2["close"], h2["volume"]) == (105, 0)
+        # real bars untouched
+        assert out.iloc[0]["close"] == 105 and out.iloc[3]["close"] == 135
+
+    def test_forward_fill_noop_on_continuous(self):
+        base = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        H = 3_600_000
+        frame = pd.DataFrame(
+            [
+                {"timestamp": pd.to_datetime(base + i * H, unit="ms", utc=True),
+                 "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+                for i in range(3)
+            ]
+        )
+        out = data_mod._forward_fill_ohlcv(frame, H)
+        assert len(out) == 3  # already continuous — unchanged
 
 
 # ---------------------------------------------------------------------------
