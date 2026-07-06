@@ -1167,8 +1167,6 @@ def post_handoff_approval(approval_id: int, body: ApprovalHandoffBody) -> dict[s
 
 def post_user_complete_approval(approval_id: int, body: ApprovalDecisionBody) -> dict[str, object]:
     """Mark the linked task as done by the user and notify the Brain."""
-    from datetime import datetime, timezone
-
     approval = get_approval(approval_id)
     if not approval:
         raise HTTPException(status_code=404, detail=f"Approval {approval_id} not found")

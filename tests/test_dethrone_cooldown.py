@@ -11,7 +11,7 @@ Covers the 2026-07-06 fix set for "dethrone recommendations fire too easily":
 
 from datetime import datetime, timedelta, timezone
 
-from forven.db import create_approval, get_db, kv_get, kv_set
+from forven.db import create_approval, get_db, kv_set
 from forven.dethrone_cooldown import (
     DENY_COOLDOWN_ESCALATION_HOURS,
     clear_dethrone_cooldown,
