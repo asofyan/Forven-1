@@ -5273,6 +5273,9 @@ def _classify_activity_log_event(entry: dict) -> str | None:
     if "kill switch" in msg or (source == "daemon" and level == "critical"):
         return "kill_switch_activated"
 
+    if source == "integrations" and "session" in msg and "opened" in msg:
+        return "mcp_session_opened"
+
     if (
         "lifecycle transition" in msg
         or "pipeline override" in msg
