@@ -902,6 +902,56 @@ def set_live_notional_ceiling(
     return ceilings.get(sid) or {}
 
 
+_TERMINAL_STRATEGY_STAGES = {"archived", "rejected", "backtest_failed"}
+
+
+def _ceiling_stage_map(strategy_ids: list[str]) -> dict[str, str]:
+    """Current stage per strategy id (lowercase); missing ids are absent."""
+    sids = [s for s in strategy_ids if s and not s.startswith("bot:")]
+    if not sids:
+        return {}
+    try:
+        with get_db() as conn:
+            placeholders = ",".join("?" * len(sids))
+            rows = conn.execute(
+                f"SELECT id, LOWER(COALESCE(stage, status, '')) AS stage "
+                f"FROM strategies WHERE id IN ({placeholders})",
+                sids,
+            ).fetchall()
+        return {str(r["id"]): str(r["stage"]) for r in rows}
+    except Exception as exc:
+        log.debug("ceiling stage lookup failed: %s", exc)
+        return {}
+
+
+def revoke_dead_strategy_ceilings() -> list[str]:
+    """Revoke live notional ceilings held by terminal (or deleted) strategies.
+
+    A go-live ceiling is live ARMING — an archived/rejected strategy keeping
+    one is a dormant permission that would let a revived zombie size a real
+    order. transition_stage revokes at archive time; this sweep (daily DB
+    maintenance) reaps any that predate that hook or slipped past it.
+    Bot ceilings (``bot:{id}`` keys) are managed by the Bot Factory and skipped.
+    """
+    ceilings = get_live_notional_ceilings()
+    sids = [s for s in ceilings if not str(s).startswith("bot:")]
+    if not sids:
+        return []
+    stages = _ceiling_stage_map(sids)
+    dead = [
+        sid for sid in sids
+        if stages.get(sid) is None or stages.get(sid) in _TERMINAL_STRATEGY_STAGES
+    ]
+    for sid in dead:
+        try:
+            set_live_notional_ceiling(sid, None, actor="dead-strategy-reaper")
+        except Exception as exc:
+            log.warning("could not revoke stale live ceiling for %s: %s", sid, exc)
+    if dead:
+        log.info("Revoked stale live ceilings for terminal strategies: %s", ", ".join(dead))
+    return dead
+
+
 def check_live_strategy_ceiling(strategy_id: str, add_notional_usd: float) -> tuple[bool, str]:
     """Per-order admission against the strategy's go-live notional ceiling.
 
@@ -991,6 +1041,20 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
             ),
         }
     ceilings = get_live_notional_ceilings()
+    # Annotate each ceiling with the strategy's CURRENT stage and hide terminal
+    # zombies from the operator view (the reaper revokes them; this is the
+    # belt-and-braces display filter so a stale KV entry can never render as
+    # apparent live arming). bot: keys belong to the Bot Factory — kept as-is.
+    ceiling_stages = _ceiling_stage_map(list(ceilings.keys()))
+    annotated_ceilings: dict[str, dict] = {}
+    for sid, entry in ceilings.items():
+        if str(sid).startswith("bot:"):
+            annotated_ceilings[sid] = {**entry, "stage": "bot"}
+            continue
+        stage = ceiling_stages.get(sid)
+        if stage is None or stage in _TERMINAL_STRATEGY_STAGES:
+            continue
+        annotated_ceilings[sid] = {**entry, "stage": stage}
     ceilings_missing: list[str] = []
     try:
         with get_db() as conn:
@@ -1007,7 +1071,7 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         "equity_usd": round(eq, 2) if eq else None,
         "equity_available": bool(eq),
         "limits_pct": limits_pct,
-        "strategy_ceilings": ceilings,
+        "strategy_ceilings": annotated_ceilings,
         "ceilings_missing": ceilings_missing,
         "total_open_risk_usd": exposure["total_risk_usd"],
         "total_open_risk_limit_usd": round(max_risk_usd, 2) if max_risk_usd else None,

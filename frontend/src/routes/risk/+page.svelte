@@ -550,8 +550,21 @@
 				<div class="text-[10px] uppercase tracking-wider text-[#666] mb-1">Go-live notional ceilings</div>
 				<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
 					{#each liveCeilings as [sid, ceiling]}
+						{@const ceilingStage = String(ceiling.stage ?? '')}
 						<div class="border border-[#222] bg-[#050505] px-3 py-2 flex items-center justify-between text-[11px]">
-							<a href={`/lab/strategy/${sid}`} class="font-mono text-white hover:text-[#888]">{sid}</a>
+							<span class="flex items-center gap-2 min-w-0">
+								<a href={`/lab/strategy/${sid}`} class="font-mono text-white hover:text-[#888]">{sid}</a>
+								{#if ceilingStage}
+									<span
+										class="border px-1 py-0.5 text-[9px] uppercase tracking-wider {ceilingStage === 'live_graduated' ? 'border-red-900 text-red-400' : 'border-[#333] text-[#666]'}"
+										title={ceilingStage === 'live_graduated'
+											? 'Live strategy'
+											: `Armed for live while at ${ceilingStage} stage — clear the ceiling to disarm`}
+									>
+										{ceilingStage === 'live_graduated' ? 'LIVE' : ceilingStage}
+									</span>
+								{/if}
+							</span>
 							<span class="flex items-center gap-2 text-[#888]">
 								{formatBudgetUsd(Number(ceiling.ceiling_usd ?? 0))} max/asset
 								<button

@@ -215,6 +215,8 @@ export interface ForvenRiskStatus {
 			asset?: string | null;
 			set_by?: string;
 			set_at?: string;
+			/** current stage of the owning strategy ('bot' for Bot Factory keys) */
+			stage?: string;
 		}>;
 		/** Live-stage strategies with no go-live ceiling recorded (pre-existing lives). */
 		ceilings_missing?: string[];
