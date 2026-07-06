@@ -220,6 +220,90 @@ def _directive_counts_today() -> tuple[int, int]:
         return 0, 0
 
 
+def allocator_overview(limit: int = 40) -> dict[str, Any]:
+    """Operator view of the CRUX-1 allocation for the Crucibles page.
+
+    Returns the daily develop budget state, the short-quota state, pool
+    counts, and the active pool ranked by value score with the signals that
+    produced each score — so "where is the research budget going and what is
+    it earning" is answerable at a glance instead of by DB forensics.
+    """
+    # Lazy: crucible_planner imports this module inside functions; importing
+    # it lazily here keeps the modules cycle-free.
+    from forven.crucible_planner import CrucibleTaskIndex, _active_crucible_rows
+    from forven.strategy_diversity import infer_strategy_family
+
+    crucibles = _active_crucible_rows()
+    index = CrucibleTaskIndex.build()
+    signals = fetch_crucible_child_signals([str(c["id"]) for c in crucibles])
+    family_stats = cached_family_outcome_stats()
+
+    ranked: list[dict[str, Any]] = []
+    pool_counts: dict[str, int] = {}
+    for crucible in crucibles:
+        crucible_id = str(crucible["id"])
+        status = str(crucible.get("status") or "").strip().lower()
+        pool_counts[status] = pool_counts.get(status, 0) + 1
+        sig = signals.get(crucible_id) or {}
+        family = infer_strategy_family(crucible.get("title"))
+        family_rate = smoothed_family_rate(family, family_stats)
+        fruitless = index.fruitless_develop_count(crucible_id)
+        failed = index.failed_action_count("develop_candidate", crucible_id)
+        score = crucible_value_score(
+            status=status,
+            survivor_children=int(sig.get("survivor_children") or 0),
+            gauntlet_children=int(sig.get("gauntlet_children") or 0),
+            positive_children=int(sig.get("positive_children") or 0),
+            scored_children=int(sig.get("children") or 0),
+            fruitless_develops=fruitless,
+            failed_develops=failed,
+            family_survival_rate=family_rate,
+        )
+        ranked.append({
+            "id": crucible_id,
+            "display_id": crucible.get("display_id") or crucible_id,
+            "title": str(crucible.get("title") or ""),
+            "status": status,
+            "protection_status": str(crucible.get("protection_status") or ""),
+            "created_at": crucible.get("created_at"),
+            "family": family,
+            "family_survival_rate": round(family_rate, 4),
+            "score": score,
+            "children": int(sig.get("children") or 0),
+            "gauntlet_children": int(sig.get("gauntlet_children") or 0),
+            "survivor_children": int(sig.get("survivor_children") or 0),
+            "positive_children": int(sig.get("positive_children") or 0),
+            "fruitless_develops": fruitless,
+            "failed_develops": failed,
+            "last_child_created_at": sig.get("last_child_created_at"),
+        })
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+
+    budget = develop_daily_budget()
+    used = develop_budget_used_today()
+    total_today, directed_today = _directive_counts_today()
+    quota_pct = float(_discipline()["crucible_short_mode_quota_pct"])
+    return {
+        "budget": {
+            "daily": budget,
+            "used_today": used,
+            "remaining": max(0, budget - used),
+        },
+        "short_quota": {
+            "target_pct": quota_pct,
+            "develops_today": total_today,
+            "directed_today": directed_today,
+            "share_pct": round((directed_today / total_today) * 100.0, 1) if total_today else 0.0,
+        },
+        "pool": {
+            "total": len(crucibles),
+            "by_status": pool_counts,
+            "with_survivors": sum(1 for item in ranked if item["survivor_children"] > 0),
+        },
+        "crucibles": ranked[: max(1, int(limit))],
+    }
+
+
 def next_trade_mode_directive() -> str | None:
     """'short_or_both' when today's directive share is under quota, else None.
 

@@ -19,6 +19,7 @@
 	import { getHypothesisCounts } from '$lib/api/hypotheses';
 	import { goto } from '$app/navigation';
 
+	import AllocatorPanel from '$lib/components/hypotheses/AllocatorPanel.svelte';
 	import HypothesisTable from '$lib/components/hypotheses/HypothesisTable.svelte';
 	import ManualIngestDialog from '$lib/components/hypotheses/ManualIngestDialog.svelte';
 	import UrlIngestDialog from '$lib/components/hypotheses/UrlIngestDialog.svelte';
@@ -121,8 +122,10 @@
 		}
 	}
 
+	let allocatorPanel: AllocatorPanel | null = null;
+
 	async function refreshAll(): Promise<void> {
-		await Promise.all([loadSurface(), loadCounts()]);
+		await Promise.all([loadSurface(), loadCounts(), allocatorPanel?.refresh() ?? Promise.resolve()]);
 	}
 
 	function setBanner(tone: BannerTone, message: string): void {
@@ -614,6 +617,12 @@
 
 	{#if error}
 		<div class="mx-4 mt-3 bg-red-900/20 border border-red-800 text-red-300 text-xs px-3 py-2">{error}</div>
+	{/if}
+
+	{#if managerView === 'active'}
+		<div class="mx-4 mt-3">
+			<AllocatorPanel bind:this={allocatorPanel} />
+		</div>
 	{/if}
 
 	{#if placeholderCount > 0 && managerView === 'active'}
