@@ -402,6 +402,25 @@ STRATEGY_CLASS = RSIMomentum_S00700
 - Indicator periods should have sensible defaults (RSI: 14, EMA: 20/50/200, BB: 20)
 - You can define any parameters your strategy needs — the system stores them as-is for novel families
 
+### Trading short or both sides (REQUIRED declarations)
+
+The engine defaults every strategy to `long_only`. If your strategy shorts, declare BOTH:
+
+```python
+class MyDualSideStrategy(BaseStrategy):
+    # The subset of sides your signal logic actually implements:
+    supported_trade_modes = {"long_only", "short_only", "both"}
+
+    @property
+    def default_params(self) -> dict:
+        return {"trade_mode": "both", ...}   # the mode this strategy runs by default
+```
+
+An explicit `trade_mode` in YOUR `default_params` is honored even if you forget the
+`supported_trade_modes` attribute — but a `trade_mode` passed only as a backtest request
+override on an undeclared class is rejected with `does not support trade_mode='both'`,
+and every gauntlet test fails with it. Declare both, always.
+
 ### Parameter Naming — Best Practices
 
 You have **full creative freedom** with parameter names. The system accepts any parameters
