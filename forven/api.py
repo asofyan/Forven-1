@@ -237,6 +237,12 @@ async def lifespan(_app: FastAPI):
     # loop, and the agent workers emit observable log lines under any launcher.
     _configure_runtime_logging()
 
+    # Enable faulthandler so SIGUSR2 dumps Python thread stacks to stderr.
+    # Critical for debugging event-loop freezes without gdb/py-spy.
+    import faulthandler, signal
+    faulthandler.register(signal.SIGUSR2, all_threads=True, chain=False)
+    log.info("faulthandler: SIGUSR2 → thread dump (all_threads=True)")
+
     # Surface missing/incompatible DECLARED dependencies at boot, under ANY
     # launcher. The shell launchers preflight before starting, but a direct
     # `uvicorn forven.api:app` / Docker run would otherwise only discover a

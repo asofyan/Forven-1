@@ -109,24 +109,41 @@ def _build_prompt(approval: Mapping[str, Any]) -> str:
     )
 
 
+# Maximum wall-clock seconds for an auxiliary classification call.
+# Mirrors forven.recall.LATENCY_BUDGET_SECONDS.
+_AUX_LATENCY_BUDGET_SECONDS: float = 10.0
+
+
 def _call_aux_llm(prompt: str, routing: Mapping[str, Any]) -> str:
     """Synchronous helper that runs the auxiliary call inside whatever event
     loop context we're in. Mirrors ``forven.recall._call_aux_llm`` so tests
     can monkeypatch this whole function uniformly across auxiliary subsystems.
+
+    Bounded by ``_AUX_LATENCY_BUDGET_SECONDS``; raises ``concurrent.futures.TimeoutError``
+    (or ``asyncio.TimeoutError``) on expiry so callers can degrade gracefully.
     """
     from forven.ai import call_ai
 
     provider = routing.get("provider") or ""
     model_id = routing.get("model_id") or ""
     route = [(provider, model_id), *(routing.get("fallbacks") or [])]
-    coro = call_ai(provider=provider, model=model_id, prompt=prompt, fallback=False, route=route)
+
+    async def _invoke() -> str:
+        return await asyncio.wait_for(
+            call_ai(provider=provider, model=model_id, prompt=prompt, fallback=False, route=route),
+            timeout=_AUX_LATENCY_BUDGET_SECONDS,
+        )
+
     try:
-        loop = asyncio.get_running_loop()  # noqa: F841
+        asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(_invoke())
+
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+        return pool.submit(asyncio.run, _invoke()).result(
+            timeout=_AUX_LATENCY_BUDGET_SECONDS + 2.0
+        )
 
 
 def _parse_json_response(text: str) -> dict[str, Any] | None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from forven.db import _now, kv_get, kv_set
@@ -90,8 +91,24 @@ def _load_system_state() -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+_pause_state_cache: dict[str, Any] | None = None
+_pause_state_cache_ts: float = 0.0
+_PAUSE_STATE_CACHE_TTL: float = 5.0  # seconds — avoids DB query on every daemon tick
+
+
+def _invalidate_pause_state_cache() -> None:
+    """Clear the cache so the next read goes to the database."""
+    global _pause_state_cache, _pause_state_cache_ts
+    _pause_state_cache = None
+    _pause_state_cache_ts = 0.0
+
+
 def get_system_pause_state() -> dict[str, Any]:
     """Return the canonical pause state while still honoring the legacy flag."""
+    global _pause_state_cache, _pause_state_cache_ts
+    now = time.monotonic()
+    if _pause_state_cache is not None and (now - _pause_state_cache_ts) < _PAUSE_STATE_CACHE_TTL:
+        return _pause_state_cache
     state = _load_system_state()
     if "paused" in state:
         paused = _coerce_bool(state.get("paused"), False)
@@ -106,7 +123,7 @@ def get_system_pause_state() -> dict[str, Any]:
     if stored_mode is None and "paused" not in state and "generation_paused" not in state:
         derived_mode = _DEFAULT_MODE
         paused, generation_paused = _mode_to_flags(derived_mode)
-    return {
+    result = {
         "paused": paused,
         "paused_at": str(paused_at) if paused and paused_at else None,
         "generation_paused": generation_paused,
@@ -118,6 +135,9 @@ def get_system_pause_state() -> dict[str, Any]:
         "system_mode": derived_mode,
         "system_mode_at": state.get("system_mode_at"),
     }
+    _pause_state_cache = result
+    _pause_state_cache_ts = now
+    return result
 
 
 def is_system_paused() -> bool:
@@ -176,6 +196,7 @@ def set_system_paused(paused: bool, *, paused_at: str | None = None) -> dict[str
     else:
         state["system_mode_at"] = state.get("system_mode_at") or normalized_paused_at or _now()
     kv_set(_SYSTEM_STATE_KEY, state)
+    _invalidate_pause_state_cache()
     kv_set(_LEGACY_SYSTEM_PAUSED_KEY, normalized_paused)
     from forven.system_mode_policy import sync_manual_mode_transition
 
@@ -234,6 +255,7 @@ def set_generation_paused(
         state["system_mode"] = _flags_to_mode(system_paused, normalized_paused)
         state["system_mode_at"] = normalized_paused_at or state.get("system_mode_at") or _now()
     kv_set(_SYSTEM_STATE_KEY, state)
+    _invalidate_pause_state_cache()
     from forven.system_mode_policy import sync_manual_mode_transition
 
     sync_manual_mode_transition(previous_mode=previous_mode, current_mode=state["system_mode"])
@@ -273,6 +295,7 @@ def set_system_mode(mode: str, *, changed_at: str | None = None) -> dict[str, An
     state["generation_paused_at"] = timestamp if generation_paused else None
 
     kv_set(_SYSTEM_STATE_KEY, state)
+    _invalidate_pause_state_cache()
     from forven.system_mode_policy import sync_manual_mode_transition
 
     sync_manual_mode_transition(previous_mode=previous_mode, current_mode=normalized)

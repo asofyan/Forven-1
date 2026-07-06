@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,9 @@ ID_WIDTH_BY_PREFIX = {
 }
 log = logging.getLogger("forven.db")
 _WAL_CONFIGURED_PATHS: set[str] = set()
+# Serialise sqlite3.connect() / conn.close() to prevent C-level deadlocks
+# when multiple threads open/close connections concurrently.
+_db_connect_lock = threading.Lock()
 
 # Untrusted strategy code runs ONLY inside the out-of-process strategy worker
 # (forven.sandbox.strategy_worker sets FORVEN_IN_STRATEGY_WORKER). That worker must
@@ -442,7 +446,8 @@ def get_db():
     _assert_db_access_allowed()
     ensure_dirs()
     db_key = str(FORVEN_DB)
-    conn = sqlite3.connect(db_key, timeout=60)
+    with _db_connect_lock:
+        conn = sqlite3.connect(db_key, timeout=60)
     conn.row_factory = sqlite3.Row
     if db_key not in _WAL_CONFIGURED_PATHS:
         try:
@@ -462,7 +467,8 @@ def get_db():
         conn.rollback()
         raise
     finally:
-        conn.close()
+        with _db_connect_lock:
+            conn.close()
 
 
 @contextmanager
@@ -477,7 +483,8 @@ def get_db_best_effort(timeout_seconds: float = 0.25):
     timeout = max(float(timeout_seconds), 0.0)
     busy_timeout_ms = max(1, int(timeout * 1000))
     db_key = str(FORVEN_DB)
-    conn = sqlite3.connect(db_key, timeout=timeout)
+    with _db_connect_lock:
+        conn = sqlite3.connect(db_key, timeout=timeout)
     conn.row_factory = sqlite3.Row
     if db_key not in _WAL_CONFIGURED_PATHS:
         try:
@@ -497,7 +504,8 @@ def get_db_best_effort(timeout_seconds: float = 0.25):
         conn.rollback()
         raise
     finally:
-        conn.close()
+        with _db_connect_lock:
+            conn.close()
 
 
 @contextmanager

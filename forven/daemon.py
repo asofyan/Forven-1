@@ -1921,22 +1921,28 @@ async def async_market_loop(state: dict):
 
     last_fallback_poll = 0.0
     last_candle_refresh = 0.0
+    last_state_persist = 0.0  # throttle _persist_daemon_state writes
     try:
         while not shutdown.is_set():
             try:
                 await asyncio.sleep(1)
+                now = time.time()
+
                 if not autonomous_runtime_allowed():
                     if consumer is not None or feeder is not None:
                         await _stop_market_workers()
                     state["market_loop_status"] = "paused_manual"
                     state["last_price_source"] = "manual_pause"
-                    await asyncio.to_thread(_persist_daemon_state, state)
+                    if now - last_state_persist >= 10.0:
+                        await asyncio.to_thread(_persist_daemon_state, state)
+                        last_state_persist = now
                     continue
 
                 if consumer is None or feeder is None:
                     consumer, feeder = await _start_market_workers()
                     state["market_loop_status"] = "active"
                     await asyncio.to_thread(_persist_daemon_state, state)
+                    last_state_persist = now
 
                 now = time.time()
 
