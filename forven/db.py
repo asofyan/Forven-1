@@ -3998,8 +3998,15 @@ def _build_trade_filters(
 
     norm_exec = str(execution_type or "").strip().lower()
     if norm_exec:
-        clauses.append("LOWER(COALESCE(execution_type, '')) = ?")
-        params.append(norm_exec)
+        # `paper` and `paper_challenger` are one simulated stage on two execution
+        # engines (kernel vs legacy per-bar); the blotter shows both as "Paper", so
+        # filtering "Paper" must match either — otherwise the label and the filter
+        # disagree and challenger rows silently vanish from the Paper view.
+        if norm_exec == "paper":
+            clauses.append("LOWER(COALESCE(execution_type, '')) IN ('paper', 'paper_challenger')")
+        else:
+            clauses.append("LOWER(COALESCE(execution_type, '')) = ?")
+            params.append(norm_exec)
 
     strat = str(strategy or "").strip()
     if strat:

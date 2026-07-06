@@ -246,6 +246,17 @@
 		return (pnl / n) * 100;
 	}
 
+	/** Display label for a trade's execution engine. `paper` and `paper_challenger`
+	 * are the same simulated stage on two engines (kernel vs legacy per-bar); the
+	 * blotter shows one "Paper" label so the distinction isn't user-facing. */
+	function execTypeLabel(execType: string | null | undefined): string {
+		const v = String(execType ?? '').toLowerCase();
+		if (v === 'paper' || v === 'paper_challenger') return 'Paper';
+		if (v === 'live') return 'Live';
+		if (v === 'simulation') return 'Sim';
+		return execType ? String(execType) : '—';
+	}
+
 	/** Strategy link target: hop into that strategy's trade on the Paper Trades or
 	 * Live Trades page (selecting its session), NOT the strategy-lab container. */
 	function tradeHref(t: ForvenTrade): string {
@@ -532,8 +543,9 @@
 									class="px-1.5 py-0.5 border text-[10px] uppercase {String(trade.execution_type ?? '').toLowerCase() === 'live'
 										? 'border-red-900 text-red-400'
 										: 'border-[#333] text-[#888]'}"
+									title={String(trade.execution_type ?? '—')}
 								>
-									{String(trade.execution_type ?? '—')}
+									{execTypeLabel(trade.execution_type)}
 								</span>
 							</td>
 							<td class="px-2 py-1.5 text-center">
