@@ -336,14 +336,14 @@ def _repair_symbol_format(candidate: str) -> str | None:
     return None
 
 
-def _normalize_strategy_symbol(symbol: str | None, params: dict | None = None) -> str:
-    """Resolve symbol into a non-empty, non-GENERIC value for container creation.
-
-    Also applies :func:`_repair_symbol_format` to every candidate so corrupt
-    formats (timeframe-suffixed pairs, bare base assets) cannot enter the
-    strategies table — those propagate into the keepalive collectors and
-    produce 0-trade backtests indefinitely.
-    """
+def normalize_strategy_symbol_strict(symbol: str | None, params: dict | None = None) -> str | None:
+    """Like :func:`_normalize_strategy_symbol` but with NO last-resort default:
+    returns None when neither the symbol nor any params fallback repairs into a
+    canonical pair. Used by creation paths to REJECT fabricated symbols instead
+    of silently rerouting the strategy to BTC/USDT (SYMBOL-1 — a placeholder
+    like ``HIP3-WRPROXYPLACEHOLDER`` was accepted, rewritten to BTC/USDT in the
+    DB while the API echoed the original, and backtested against a substrate
+    the hypothesis explicitly disclaimed)."""
     primary = str(symbol or "").strip().upper()
     if primary and primary != "GENERIC":
         repaired = _repair_symbol_format(primary)
@@ -370,6 +370,20 @@ def _normalize_strategy_symbol(symbol: str | None, params: dict | None = None) -
             repaired = _repair_symbol_format(value)
             if repaired:
                 return repaired
+    return None
+
+
+def _normalize_strategy_symbol(symbol: str | None, params: dict | None = None) -> str:
+    """Resolve symbol into a non-empty, non-GENERIC value for container creation.
+
+    Also applies :func:`_repair_symbol_format` to every candidate so corrupt
+    formats (timeframe-suffixed pairs, bare base assets) cannot enter the
+    strategies table — those propagate into the keepalive collectors and
+    produce 0-trade backtests indefinitely.
+    """
+    strict = normalize_strategy_symbol_strict(symbol, params)
+    if strict:
+        return strict
 
     # Deterministic last-resort fallback. Keeps containers from being created
     # with placeholder GENERIC symbols, but emits a debug log so we can spot
@@ -780,6 +794,7 @@ CREATE TABLE IF NOT EXISTS trades (
     book TEXT,
     timeframe TEXT,
     source TEXT,
+    regime TEXT,
     signal_data JSON,
     opened_at TEXT,
     closed_at TEXT,
@@ -1840,6 +1855,10 @@ def _run_migrations(conn: sqlite3.Connection):
     _ensure_column(conn, "trades", "timeframe", "TEXT")
     _ensure_column(conn, "trades", "source", "TEXT")
     _ensure_column(conn, "trades", "created_at", "TEXT")
+    # RETRY-STORM-1: first-class exchange rejection reason for FAILED opens (was
+    # buried in the signal_data blob) — read by the failed-open retry brake and
+    # queryable for storm diagnosis.
+    _ensure_column(conn, "trades", "failure_reason", "TEXT")
     _ensure_column(conn, "agent_tasks", "strategy_id", "TEXT")
     _ensure_column(conn, "agent_tasks", "display_id", "TEXT")
     _ensure_column(conn, "agent_tasks", "audit_log", "JSON DEFAULT '[]'")
@@ -1941,6 +1960,10 @@ def _run_migrations(conn: sqlite3.Connection):
     _ensure_column(conn, "strategies", "stage_changed_at", "TEXT")
     _ensure_column(conn, "strategies", "compatible_regimes", "JSON")
     _ensure_column(conn, "strategies", "hypothesis_id", "TEXT")
+    # Write-through snapshot of the last computed Deflated Sharpe (advisory;
+    # list views display it without paying the per-strategy computation).
+    _ensure_column(conn, "strategies", "deflated_sharpe", "REAL")
+    _ensure_column(conn, "strategies", "deflated_sharpe_at", "TEXT")
     _ensure_column(conn, "hypotheses", "display_id", "TEXT")
     _ensure_column(conn, "hypotheses", "manager_state", "TEXT NOT NULL DEFAULT 'active'")
     _ensure_column(conn, "hypotheses", "archived_at", "TEXT")
@@ -3438,6 +3461,48 @@ def log_gate_rejection(
         pass  # Non-critical — never block pipeline on telemetry
 
 
+def log_regime_gate_event(
+    strategy_id: str,
+    asset: str,
+    direction: str,
+    regime: str,
+    confidence: float | None,
+    mode: str,
+    decision: str,
+    execution_type: str | None = None,
+    ref_price: float | None = None,
+):
+    """Persist one direction×regime gate decision to the gate ledger.
+
+    decision: 'blocked' (enforce veto) or 'would_block' (observe shadow-log).
+    Allows are never recorded — the ledger answers "what did the gate stop",
+    and the follow-up job later stamps mtm_pct with the return the blocked
+    entry would have made. Best-effort: sits on the entry hot path, so under
+    SQLite write contention it drops the record rather than stalling an open.
+    """
+    try:
+        with get_db_best_effort() as conn:
+            conn.execute(
+                """INSERT INTO regime_gate_events
+                   (strategy_id, asset, direction, regime, confidence, mode,
+                    decision, execution_type, ref_price)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(strategy_id),
+                    str(asset),
+                    str(direction),
+                    str(regime),
+                    float(confidence) if confidence is not None else None,
+                    str(mode),
+                    str(decision),
+                    str(execution_type) if execution_type else None,
+                    float(ref_price) if ref_price not in (None, "") else None,
+                ),
+            )
+    except Exception:
+        pass  # Non-critical — never block an open on gate telemetry
+
+
 def record_signal_result(
     strategy_id: str,
     symbol: str,
@@ -3893,7 +3958,7 @@ def get_recent_trades(limit: int = 20) -> list[dict]:
             SELECT id, display_id, strategy, strategy_id, strategy_name, asset, symbol, direction,
                    size, risk_pct, leverage, entry_price, signal_entry_price, fill_entry_price,
                    exit_price, signal_exit_price, fill_exit_price, status, execution_type, pnl,
-                   pnl_pct, pnl_usd, net_pnl_pct, fees_pct, signal_data, opened_at, closed_at,
+                   pnl_pct, pnl_usd, net_pnl_pct, fees_pct, regime, signal_data, opened_at, closed_at,
                    timeframe, source, created_at
             FROM trades
             ORDER BY opened_at DESC
@@ -3909,7 +3974,7 @@ _ALL_TRADE_COLUMNS = (
     "size, risk_pct, leverage, entry_price, signal_entry_price, fill_entry_price, "
     "exit_price, signal_exit_price, fill_exit_price, entry_slippage_bps, exit_slippage_bps, "
     "status, execution_type, pnl, pnl_pct, pnl_usd, net_pnl_pct, fees_pct, book, "
-    "signal_data, opened_at, closed_at, timeframe, source, created_at"
+    "regime, signal_data, opened_at, closed_at, timeframe, source, created_at"
 )
 
 # Whitelisted ledger sort columns (request key -> SQL expression). A request sort
@@ -3963,8 +4028,15 @@ def _build_trade_filters(
 
     norm_exec = str(execution_type or "").strip().lower()
     if norm_exec:
-        clauses.append("LOWER(COALESCE(execution_type, '')) = ?")
-        params.append(norm_exec)
+        # `paper` and `paper_challenger` are one simulated stage on two execution
+        # engines (kernel vs legacy per-bar); the blotter shows both as "Paper", so
+        # filtering "Paper" must match either — otherwise the label and the filter
+        # disagree and challenger rows silently vanish from the Paper view.
+        if norm_exec == "paper":
+            clauses.append("LOWER(COALESCE(execution_type, '')) IN ('paper', 'paper_challenger')")
+        else:
+            clauses.append("LOWER(COALESCE(execution_type, '')) = ?")
+            params.append(norm_exec)
 
     strat = str(strategy or "").strip()
     if strat:
@@ -4160,7 +4232,7 @@ def get_open_trades(exclude_bots: bool = False) -> list[dict]:
             "SELECT id, display_id, strategy, strategy_id, strategy_name, asset, symbol, direction, size, "
             "entry_price, signal_entry_price, fill_entry_price, exit_price, signal_exit_price, "
             "fill_exit_price, status, execution_type, pnl, pnl_pct, pnl_usd, net_pnl_pct, fees_pct, "
-            "signal_data, opened_at, closed_at, timeframe, source, leverage, created_at "
+            "regime, signal_data, opened_at, closed_at, timeframe, source, leverage, created_at "
             f"FROM trades WHERE status = 'OPEN'{bot_filter} ORDER BY opened_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -4791,6 +4863,38 @@ def create_strategy_container(
     same `hypothesis_id` as this new strategy — lineage cannot cross
     hypotheses. Raises ValueError on mismatch.
     """
+    # TRADE-MODE-1 (2026-07-06 audit): a class whose supported_trade_modes
+    # excludes long_only was silently backtested long_only anyway — the
+    # trade-mode resolver defaults to long_only when params carry no
+    # trade_mode, and long_only is always "supported" at resolution. Every
+    # short/both-only strategy therefore ran the whole funnel in the wrong
+    # direction (e.g. custom/adx_momentum_short). This is the single choke
+    # point every creation path funnels through, so inject the class's own
+    # preferred direction here. Best-effort: registry unavailable -> no-op.
+    params = dict(params or {})
+    if "trade_mode" not in params:
+        try:
+            from forven.strategies.registry import _TYPE_MAP, discover
+
+            discover()
+            cls = _TYPE_MAP.get(str(type_ or "").strip())
+            supported = getattr(cls, "supported_trade_modes", None) if cls else None
+            modes = {str(m).strip().lower() for m in supported} if supported else set()
+            if modes and "long_only" not in modes:
+                params["trade_mode"] = "both" if "both" in modes else sorted(modes)[0]
+        except Exception:
+            pass
+    # RISK-PARITY-1: lift unit-unambiguous top-level risk params (time_stop_bars)
+    # into the honored execution_profile channel at mint, so the engine actually
+    # enforces them in backtest/paper/live instead of leaving them silently inert
+    # (S05276 held 95h past its declared 60h ceiling). Mint-time only — never
+    # applied at backtest resolution, so existing strategies' verdicts don't drift.
+    try:
+        from forven.strategies.sizing import lift_unambiguous_risk_params
+
+        params = lift_unambiguous_risk_params(params)
+    except Exception:
+        pass
     normalized_parent = str(parent_strategy_id or "").strip() or None
     if normalized_parent:
         parent_row = conn.execute(
@@ -4835,6 +4939,19 @@ def create_strategy_container(
         base_id = int(final_strategy_id[1:])
 
     normalized_stage = str(stage or "quick_screen").strip().lower() or "quick_screen"
+    # SYMBOL-1: an EXPLICIT symbol that cannot be repaired into a canonical pair
+    # is rejected, never silently rerouted — the old BTC/USDT last resort let a
+    # fabricated placeholder trade a substrate its hypothesis disclaimed, with
+    # the API echoing the original symbol while the DB stored BTC/USDT. Callers
+    # that omit the symbol entirely keep the legacy documented default.
+    explicit_symbol = str(symbol or "").strip()
+    if explicit_symbol and explicit_symbol.upper() != "GENERIC":
+        if normalize_strategy_symbol_strict(symbol, params) is None:
+            raise ValueError(
+                f"unknown symbol {explicit_symbol!r}: not repairable into a canonical "
+                "BASE/QUOTE pair — pass a real market symbol (e.g. 'BTC/USDT') instead "
+                "of a placeholder; the container was NOT created"
+            )
     normalized_symbol = _normalize_strategy_symbol(symbol, params)
     # DUP-1: refuse creating a strategy DIRECTLY INTO a trading stage when an exact
     # duplicate is already trading — same type + symbol + timeframe + identical params

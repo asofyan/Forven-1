@@ -39,6 +39,7 @@
 	import HeatmapChart from '$lib/components/charts/HeatmapChart.svelte';
 	import RobustnessPanel from '$lib/components/robustness/RobustnessPanel.svelte';
 	import GauntletStatusCard from '$lib/components/robustness/GauntletStatusCard.svelte';
+	import RegimePerfStrip from '$lib/components/regime/RegimePerfStrip.svelte';
 	import ExecutionSettingsFields from '$lib/components/lab/ExecutionSettingsFields.svelte';
 	import type { SizingMode, ExecutionProfileDraft } from '$lib/types/executionProfile';
 	import {
@@ -79,6 +80,7 @@
 	import StrategyExportMenu from '$lib/components/strategy/StrategyExportMenu.svelte';
 	import StrategyImportDialog from '$lib/components/strategy/StrategyImportDialog.svelte';
 	import StageControl from '$lib/components/strategy/StageControl.svelte';
+	import { getForgeNavPosition, type ForgeNavEntry } from '$lib/stores/forgeNav';
 	import type { StrategyImportResult } from '$lib/api';
 	import { openDeepdive } from '$lib/stores/deepdiveStore';
 
@@ -3244,6 +3246,16 @@
 		goto(returnTo);
 	}
 
+	// ── Prev/next container navigation ──────────────────────────────────────────
+	// Walks the Forge list order captured when this container was opened (filters,
+	// search, and sort included). Deep links without that context get no arrows.
+	$: forgeNav = getForgeNavPosition(strategyId);
+
+	function goToNeighbor(entry: ForgeNavEntry | null): void {
+		if (!entry) return;
+		goto(`/lab/strategy/${encodeURIComponent(entry.id)}?returnTo=${encodeURIComponent(returnTo)}`);
+	}
+
 	function exportToTradingView(): void {
 		if (!container) return;
 		try {
@@ -4084,6 +4096,36 @@
 		>
 			Back
 		</button>
+		{#if forgeNav}
+			<span class="text-gray-700">|</span>
+			<div class="flex items-center gap-1" data-testid="forge-nav">
+				<button
+					type="button"
+					data-testid="forge-nav-prev"
+					class="border border-[#2b2b2b] bg-black px-2 py-0.5 text-xs text-[#888] transition hover:text-white disabled:cursor-default disabled:opacity-30 disabled:hover:text-[#888]"
+					disabled={!forgeNav.prev}
+					title={forgeNav.prev ? `Previous: ${forgeNav.prev.label || forgeNav.prev.id}` : 'First container in the list'}
+					aria-label="Previous strategy container"
+					on:click={() => goToNeighbor(forgeNav?.prev ?? null)}
+				>
+					‹
+				</button>
+				<span class="font-mono text-[10px] text-[#555]" title="Position in the Forge list you came from">
+					{forgeNav.index + 1}/{forgeNav.total}
+				</span>
+				<button
+					type="button"
+					data-testid="forge-nav-next"
+					class="border border-[#2b2b2b] bg-black px-2 py-0.5 text-xs text-[#888] transition hover:text-white disabled:cursor-default disabled:opacity-30 disabled:hover:text-[#888]"
+					disabled={!forgeNav.next}
+					title={forgeNav.next ? `Next: ${forgeNav.next.label || forgeNav.next.id}` : 'Last container in the list'}
+					aria-label="Next strategy container"
+					on:click={() => goToNeighbor(forgeNav?.next ?? null)}
+				>
+					›
+				</button>
+			</div>
+		{/if}
 		<span class="text-gray-700">|</span>
 		{#if container}
 			{#if editingName}
@@ -4410,6 +4452,8 @@
 							}}
 							on:promote={() => openStageChange()}
 						/>
+
+						<RegimePerfStrip {validationHistory} />
 					</div>
 
 					<div class="space-y-3">

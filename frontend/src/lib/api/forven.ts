@@ -85,6 +85,47 @@ export interface ForvenDashboardResponse {
 	simulation_prices?: Record<string, number>;
 }
 
+export interface RegimeGateStance {
+	asset: string;
+	regime?: string | null;
+	confidence?: number | null;
+	since?: number | null;
+	restricted: string[];
+}
+
+export interface RegimeGateEvent {
+	id: number;
+	ts: string;
+	strategy_id: string;
+	asset: string;
+	direction: string;
+	regime: string;
+	confidence?: number | null;
+	mode: string;
+	decision: string;
+	execution_type?: string | null;
+	ref_price?: number | null;
+	mtm_pct?: number | null;
+	mtm_evaluated_at?: string | null;
+}
+
+export interface RegimeGateStatus {
+	mode: 'off' | 'observe' | 'enforce';
+	block_long: string[];
+	block_short: string[];
+	min_confidence: number;
+	mtm_horizon_hours: number;
+	stances: RegimeGateStance[];
+	events: RegimeGateEvent[];
+	aggregates: {
+		window_days: number;
+		events: number;
+		mtm_n: number;
+		mtm_avg_pct: number | null;
+		by_execution?: Record<string, { events: number; mtm_n: number; mtm_avg_pct: number | null }>;
+	};
+}
+
 export interface ForvenRiskStatus {
 	system_paused?: boolean;
 	kill_switch_enabled?: boolean;
@@ -99,6 +140,8 @@ export interface ForvenRiskStatus {
 	recovery_active?: boolean;
 	recovery_status?: string;
 	recovery_summary?: string;
+	/** REGIME-GATE-1: direction×regime entry gate status (null on gate errors). */
+	regime_gate?: RegimeGateStatus | null;
 	limits?: {
 		max_drawdown?: number;
 		daily_loss_limit?: number;
@@ -114,6 +157,17 @@ export interface ForvenRiskStatus {
 			net?: number;
 		}>;
 	};
+	/** Paper-sandbox complement of `portfolio` (display-only, never gating). */
+	portfolio_paper?: {
+		total_net_risk?: number;
+		groups?: Record<string, {
+			gross_long?: number;
+			gross_short?: number;
+			net?: number;
+		}>;
+	};
+	open_positions_paper?: number;
+	current_per_trade_risk_paper?: number;
 	/** PORT-1: the LIVE account-level budget (dollar risk-to-stop + net exposure vs equity). */
 	portfolio_budget_live?: {
 		enabled?: boolean;
@@ -162,6 +216,8 @@ export interface ForvenRiskStatus {
 			asset?: string | null;
 			set_by?: string;
 			set_at?: string;
+			/** current stage of the owning strategy ('bot' for Bot Factory keys) */
+			stage?: string;
 		}>;
 		/** Live-stage strategies with no go-live ceiling recorded (pre-existing lives). */
 		ceilings_missing?: string[];
@@ -194,8 +250,33 @@ export interface ForvenRegimeSnapshot {
 		ema_alignment?: string;
 		atr_ratio?: number;
 		rsi?: number;
+		/** epoch seconds of the last regime flip (null = not yet observed) */
+		since?: number | null;
 		asset?: string;
 	};
+}
+
+export interface RegimeSeriesSegment {
+	start: string;
+	end: string;
+	regime: string;
+}
+
+export interface RegimeSeriesResponse {
+	symbol: string;
+	series?: string | null;
+	timeframe: string;
+	bars?: number;
+	segments: RegimeSeriesSegment[];
+}
+
+export async function getRegimeSeries(
+	symbol: string,
+	timeframe = '1h',
+	bars = 1000
+): Promise<RegimeSeriesResponse> {
+	const params = new URLSearchParams({ symbol, timeframe, bars: String(bars) });
+	return fetchApi<RegimeSeriesResponse>(`/regime/series?${params.toString()}`);
 }
 
 export interface ForvenEquityPoint {
@@ -245,6 +326,8 @@ export interface ForvenTrade {
 	book?: string | null;
 	status?: string;
 	timeframe?: string | null;
+	/** market regime at entry (causal classifier label); null on pre-stamp rows */
+	regime?: string | null;
 	opened_at?: string | null;
 	closed_at?: string | null;
 	created_at?: string | null;
@@ -1816,12 +1899,57 @@ export interface ApprovalTaskDetail {
 	tool_calls: Array<Record<string, unknown>>;
 }
 
+/** Point-in-time strategy summary embedded in promotion/dethrone approval payloads
+ *  (payload.strategy_snapshot). Everything optional: approvals created before
+ *  2026-07-06 carry no snapshot. */
+export interface StrategySnapshot {
+	display_id?: string | null;
+	name?: string | null;
+	display_name?: string | null;
+	symbol?: string | null;
+	timeframe?: string | null;
+	stage?: string | null;
+	stage_changed_at?: string | null;
+	backtest?: {
+		sharpe?: number | null;
+		total_return?: number | null;
+		max_drawdown?: number | null;
+		trades?: number | null;
+	} | null;
+	forward?: {
+		window_days?: number | null;
+		closed_trades?: number | null;
+		realized_pnl_pct_sum?: number | null;
+		wins?: number | null;
+	} | null;
+	captured_at?: string | null;
+}
+
+/** Live decision context returned by GET /approvals/{id}/context for
+ *  strategy-targeted approvals. */
+export interface ApprovalStrategyContext {
+	strategy?: Record<string, unknown> | null;
+	dethrone_history?: {
+		pending?: number;
+		approved?: number;
+		denied?: number;
+		expired?: number;
+		last_denied_at?: string | null;
+	} | null;
+	cooldown?: {
+		active?: boolean;
+		until?: string | null;
+		deny_count?: number;
+	} | null;
+}
+
 export interface ApprovalContextResponse {
 	approval: ApprovalRecord;
 	linked_task?: ApprovalTaskSummary | null;
 	troubleshoot_task?: ApprovalTaskSummary | null;
 	linked_task_detail?: ApprovalTaskDetail | null;
 	troubleshoot_task_detail?: ApprovalTaskDetail | null;
+	strategy_context?: ApprovalStrategyContext | null;
 	recommended_mode: 'diagnosis' | 'execution' | string;
 }
 
@@ -2199,6 +2327,11 @@ export interface ForvenSettings {
 	pipeline_gate_failure_archive_attempts: number;
 	agent_task_claim_limit: number;
 	brain_task_claim_limit: number;
+	// Throughput preset bundles + the DERIVED active name, both backend-computed
+	// (forven/throughput_policy.py) so the Settings dial can't drift from the
+	// values the backend compares against.
+	throughput_presets?: Record<string, Record<string, number>>;
+	throughput_preset_effective?: string;
 	auto_approve_code_edits: boolean;
 	auto_approve_promotions: boolean;
 	code_strategy_requires_approval: boolean;

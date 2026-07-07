@@ -57,6 +57,7 @@ from forven.scheduler import (
     seed_forven_jobs,
 )
 from forven.secret_storage import decrypt_secret, encrypt_secret
+from forven.throughput_policy import THROUGHPUT_DEFAULTS
 from forven import strategy_lifecycle as lifecycle_service
 from forven.workspace import read_workspace, write_workspace
 from forven.util import generate_pkce, generate_state, normalize_stage
@@ -488,6 +489,14 @@ _AGENT_MODEL_CATALOG = [
     {"provider": "gemini", "model_id": "gemini-2.5-flash-lite", "label": "Google Gemini 2.5 Flash Lite"},
     {"provider": "gemini", "model_id": "gemini-2.0-flash", "label": "Google Gemini 2.0 Flash"},
     {"provider": "gemini", "model_id": "gemini-1.5-flash", "label": "Google Gemini 1.5 Flash"},
+    # Google's open Gemma models — same endpoint/key as Gemini, but far more
+    # generous free-tier daily quota. Great for simple completions (e.g. the
+    # no-code strategy builder); note Gemma does NOT support tool-calling, so
+    # it's unsuited to the agent tool-loop slots.
+    {"provider": "gemini", "model_id": "gemma-3-27b-it", "label": "Google Gemma 3 27B"},
+    {"provider": "gemini", "model_id": "gemma-3-12b-it", "label": "Google Gemma 3 12B"},
+    {"provider": "gemini", "model_id": "gemma-3-4b-it", "label": "Google Gemma 3 4B"},
+    {"provider": "gemini", "model_id": "gemma-3-1b-it", "label": "Google Gemma 3 1B"},
     # Cerebras / Mistral / xAI are also live-discovered; these seed sensible
     # defaults + a fallback when discovery is unavailable.
     {"provider": "cerebras", "model_id": "llama-3.3-70b", "label": "Cerebras Llama 3.3 70B"},
@@ -589,6 +598,17 @@ def _normalize_model_id(value: object) -> str:
     return normalized
 
 
+def _prettify_gemma_id(model_id: str) -> str:
+    """"gemma-3-27b-it" -> "Gemma 3 27B" (drop the -it instruction-tuned suffix)."""
+    core = model_id[:-3] if model_id.lower().endswith("-it") else model_id
+    words = [
+        (tok.upper() if any(c.isdigit() for c in tok) else tok.capitalize())
+        for tok in core.split("-")
+        if tok
+    ]
+    return " ".join(words) or model_id
+
+
 def _coerce_discovered_model_record(model_id: str, provider: str, label: str | None = None) -> dict:
     normalized_model_id = _normalize_model_id(model_id)
     if not normalized_model_id:
@@ -596,7 +616,12 @@ def _coerce_discovered_model_record(model_id: str, provider: str, label: str | N
     provider_name = _MODEL_PROVIDER_DISPLAY_NAMES.get(provider, provider.capitalize())
     resolved_label = (label or "").strip() or normalized_model_id
     if resolved_label.lower() == normalized_model_id.lower():
-        resolved_label = f"{provider_name} {resolved_label}"
+        # Gemma is served under the "gemini" provider but must NOT be labelled
+        # "Google Gemini gemma-…" — brand it as Gemma so the picker is truthful.
+        if provider == "gemini" and normalized_model_id.lower().startswith("gemma"):
+            resolved_label = f"Google {_prettify_gemma_id(normalized_model_id)}"
+        else:
+            resolved_label = f"{provider_name} {resolved_label}"
     return {
         "provider": provider,
         "model_id": normalized_model_id,
@@ -720,9 +745,13 @@ def _looks_like_groq_discovery_model(model: str) -> bool:
 
 def _looks_like_gemini_discovery_model(model: str) -> bool:
     lowered = model.lower().strip()  # "models/" prefix already stripped upstream
-    if not lowered.startswith("gemini-"):
+    # Google's OpenAI-compatible endpoint serves BOTH Gemini and the open Gemma
+    # models under the same URL/key. Gemma ids look like "gemma-3-27b-it" and get
+    # far more generous free-tier daily quota than Gemini Flash, so surface them
+    # too instead of filtering them out.
+    if not (lowered.startswith("gemini-") or lowered.startswith("gemma-")):
         return False
-    # Gemini's compat /models also lists non-text modalities; keep chat models.
+    # The compat /models also lists non-text modalities; keep chat models only.
     if any(
         tag in lowered
         for tag in (
@@ -1699,6 +1728,10 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "strict_regime_gating": True,
     "regime_min_confidence": 0.3,
     "allow_unknown_regime_strategies": False,
+    "regime_gate_mode": "observe",
+    "regime_gate_block_long": "TREND_DOWN,HIGH_VOL",
+    "regime_gate_block_short": "",
+    "regime_gate_min_confidence": 0.6,
     "self_healing_enabled": True,
     "auto_restart_on_crash": True,
     "maintenance_start_hour": None,
@@ -1707,10 +1740,12 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "throughput_auto_scheduler_control": True,
     "adaptive_pipeline_throughput_enabled": False,
     "pipeline_target_clear_hours": 6,
-    "ideation_interval_minutes": 120,
-    "coding_interval_minutes": 60,
-    "testing_interval_minutes": 60,
-    "graduation_interval_minutes": 120,
+    # Throughput knobs (shared single-source defaults; the scheduler fallbacks
+    # and the "balanced" throughput preset reference the same constants).
+    "ideation_interval_minutes": THROUGHPUT_DEFAULTS["ideation_interval_minutes"],
+    "coding_interval_minutes": THROUGHPUT_DEFAULTS["coding_interval_minutes"],
+    "testing_interval_minutes": THROUGHPUT_DEFAULTS["testing_interval_minutes"],
+    "graduation_interval_minutes": THROUGHPUT_DEFAULTS["graduation_interval_minutes"],
     "scanner_signal_interval_minutes": 5,
     "scanner_execution_interval_minutes": 5,
     "scanner_allow_direct_market_fetch": True,
@@ -1728,9 +1763,9 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "backtest_matrix_workers": 4,
     # Process-wide cap on concurrent backtest SUBPROCESSES (memory ceiling all the
     # parallel pipeline levers queue on). See forven/strategies/concurrency.py.
-    "backtest_subprocess_budget": 4,
+    "backtest_subprocess_budget": THROUGHPUT_DEFAULTS["backtest_subprocess_budget"],
     # Gauntlet workflows advanced concurrently per tick (1 = serial drain).
-    "gauntlet_drain_workers": 3,
+    "gauntlet_drain_workers": THROUGHPUT_DEFAULTS["gauntlet_drain_workers"],
     "pipeline_saturation_threshold": 100,
     "pipeline_resume_threshold": 60,
     "pipeline_drain_max_seconds": 300,
@@ -1738,7 +1773,7 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "gauntlet_auto_quick_screen_enabled": True,
     "gauntlet_quick_screen_max_attempts": 3,
     "gauntlet_step_stale_minutes": 30,
-    "agent_task_claim_limit": 12,
+    "agent_task_claim_limit": THROUGHPUT_DEFAULTS["agent_task_claim_limit"],
     "brain_task_claim_limit": 12,
     # Soft cap on the pending brain_invoke queue before the scheduler prunes
     # (generic pings first, routine dispatches preserved; a hard ceiling backstops).
@@ -2620,6 +2655,31 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             ("live_max_effective_exposure_pct", 200.0),
             ("live_correlation_window_bars", 720.0),
             ("live_correlation_missing_default", 1.0),
+            # RETRY-STORM-1: failed-open retry brake (forven.exchange.risk.can_open).
+            ("live_failed_open_cooldown_minutes", 15.0),
+            ("live_failed_open_max_attempts", 3.0),
+            ("live_failed_open_window_hours", 6.0),
+            # PORT-LAYER-1: portfolio allocator (forven.portfolio_allocator).
+            ("portfolio_lookback_days", 60.0),
+            ("portfolio_target_book_vol_pct", 0.0),
+            ("portfolio_min_risk_multiplier", 0.25),
+            ("portfolio_max_risk_multiplier", 2.0),
+            # PORT-LAYER-2: funding-carry basket (forven.basket_runtime).
+            ("basket_rebalance_hours", 24.0),
+            ("basket_n_legs", 5.0),
+            ("basket_gross_leverage", 1.0),
+            ("basket_universe_min_bars", 17520.0),
+            # BASKET-2: incumbency buffer on basket re-ranking (forven.basket_runtime).
+            ("basket_rank_buffer", 3.0),
+            # LIVE-LOOP-1: paper→live graduation recommender (forven.live_graduation).
+            ("graduation_min_soak_days", 14.0),
+            ("graduation_min_paper_trades", 10.0),
+            ("graduation_min_measured_trades", 5.0),
+            ("graduation_base_arm_usd", 100.0),
+            ("graduation_max_arm_usd", 250.0),
+            ("graduation_daily_limit", 2.0),
+            ("graduation_deny_cooldown_days", 7.0),
+            ("graduation_skew_lookback_days", 30.0),
         ):
             if _pb_key in payload:
                 updates[_pb_key] = _coerce_float(payload.get(_pb_key), _coerce_float(updates.get(_pb_key), _pb_default))
@@ -2627,6 +2687,36 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["live_correlation_budget_enabled"] = _coerce_bool(
                 payload.get("live_correlation_budget_enabled"),
                 bool(updates.get("live_correlation_budget_enabled", True)),
+            )
+        # PORT-LAYER-1 toggles (forven.portfolio_allocator).
+        if "portfolio_allocator_enabled" in payload:
+            updates["portfolio_allocator_enabled"] = _coerce_bool(
+                payload.get("portfolio_allocator_enabled"),
+                bool(updates.get("portfolio_allocator_enabled", False)),
+            )
+        if "portfolio_allocator_live" in payload:
+            updates["portfolio_allocator_live"] = _coerce_bool(
+                payload.get("portfolio_allocator_live"),
+                bool(updates.get("portfolio_allocator_live", False)),
+            )
+        # PORT-GATE-1: master switch for the whole portfolio layer.
+        if "portfolio_layer_enabled" in payload:
+            updates["portfolio_layer_enabled"] = _coerce_bool(
+                payload.get("portfolio_layer_enabled"),
+                bool(updates.get("portfolio_layer_enabled", False)),
+            )
+        # LIVE-LOOP-1 toggle: graduation recommender ships dark
+        # (forven.live_graduation — recommendation-only, never arms capital).
+        if "live_graduation_recommender_enabled" in payload:
+            updates["live_graduation_recommender_enabled"] = _coerce_bool(
+                payload.get("live_graduation_recommender_enabled"),
+                bool(updates.get("live_graduation_recommender_enabled", False)),
+            )
+        # PORT-LAYER-2 toggle (forven.basket_runtime).
+        if "basket_funding_carry_enabled" in payload:
+            updates["basket_funding_carry_enabled"] = _coerce_bool(
+                payload.get("basket_funding_carry_enabled"),
+                bool(updates.get("basket_funding_carry_enabled", False)),
             )
         # EQ-BASIS-1: whether the master wallet counts toward the live equity
         # basis when direction books are enabled (forven.daemon).
@@ -2656,6 +2746,23 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["regime_min_confidence"] = _coerce_float(payload.get("regime_min_confidence"), updates["regime_min_confidence"])
         if "allow_unknown_regime_strategies" in payload:
             updates["allow_unknown_regime_strategies"] = _coerce_bool(payload.get("allow_unknown_regime_strategies"), updates["allow_unknown_regime_strategies"])
+        # Direction×regime entry gate (REGIME-GATE-1). Same KV-blob contract as
+        # the strict-regime knobs: forven.config getters read these directly.
+        if "regime_gate_mode" in payload:
+            _rg_mode = str(payload.get("regime_gate_mode") or "").strip().lower()
+            updates["regime_gate_mode"] = _rg_mode if _rg_mode in ("off", "observe", "enforce") else "observe"
+        for _rg_csv_key in ("regime_gate_block_long", "regime_gate_block_short"):
+            if _rg_csv_key in payload:
+                from forven.regime import normalize_regime_label as _rg_norm
+                _rg_parts = [
+                    _rg_norm(part)
+                    for part in str(payload.get(_rg_csv_key) or "").split(",")
+                ]
+                updates[_rg_csv_key] = ",".join(sorted({p for p in _rg_parts if p}))
+        if "regime_gate_min_confidence" in payload:
+            updates["regime_gate_min_confidence"] = max(
+                0.0, min(1.0, _coerce_float(payload.get("regime_gate_min_confidence"), 0.6))
+            )
         # Promotion-safety gates (read top-level from forven:settings by
         # forven.policy.evaluate_promotion and forven.hypothesis_graduation).
         if "allow_unsupported_backtest_risk_controls" in payload:
@@ -3085,15 +3192,15 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
         raw_research_settings = payload.get("research_settings")
         if not isinstance(raw_research_settings, dict):
             raw_research_settings = payload
+        stored_research_settings = updates.get("research_settings")
+        if not isinstance(stored_research_settings, dict):
+            stored_research_settings = {}
+        # DEEP-merge the incoming partial over STORED values (the UI sends only
+        # the edited leaves). The previous shallow spread replaced whole nested
+        # dicts, so editing e.g. hypothesis_discipline.crucible_daily_develop_budget
+        # would silently reset its customized siblings back to defaults.
         updates["research_settings"] = _merge_research_settings_payload(
-            _merge_research_settings_payload(updates.get("research_settings"))
-            | {}
-        )
-        updates["research_settings"] = _merge_research_settings_payload(
-            {
-                **dict(updates.get("research_settings") or {}),
-                **dict(raw_research_settings or {}),
-            }
+            _deep_merge_dicts(stored_research_settings, dict(raw_research_settings or {}))
         )
 
     elif section in {"data-engine", "data_engine"}:
@@ -4491,6 +4598,8 @@ def _normalize_trade_rows(value) -> list[dict]:
             trade["exit_reason"] = str(row["exit_reason"])
         if row.get("size_fraction") not in (None, ""):
             trade["size_fraction"] = _coerce_float(row.get("size_fraction"))
+        if row.get("regime") not in (None, ""):
+            trade["regime"] = str(row["regime"])
         trades.append(trade)
     return trades
 
@@ -5263,6 +5372,9 @@ def _classify_activity_log_event(entry: dict) -> str | None:
 
     if "kill switch" in msg or (source == "daemon" and level == "critical"):
         return "kill_switch_activated"
+
+    if source == "integrations" and "session" in msg and "opened" in msg:
+        return "mcp_session_opened"
 
     if (
         "lifecycle transition" in msg
@@ -6087,16 +6199,25 @@ def _persist_backtest_result_row(
     if not normalized_strategy_id:
         raise ValueError("strategy_id is required")
 
+    from forven.data_provenance import stamp_data_fingerprint
     from forven.engine_provenance import stamp_engine_version
 
-    metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
-    config_json = json.dumps(stamp_engine_version(config), separators=(",", ":"), default=str)
     created_value = str(created_at or _now()).strip() or _now()
     start_value = str(start_date or "").strip() or None
     end_value = str(end_date or "").strip() or None
     result_type_value = str(result_type or "backtest").strip().lower() or "backtest"
     symbol_value = str(symbol or "").strip().upper()
     timeframe_value = str(timeframe or "").strip() or "1h"
+
+    metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
+    # Provenance stamps: the ENGINE version that produced the numbers, and the
+    # DATA semantics they were scored on (per-stream cadence + scale). Either
+    # changing makes this artifact stale evidence (engine_provenance /
+    # data_provenance module docstrings).
+    stamped_config = stamp_data_fingerprint(
+        stamp_engine_version(config), symbol_value, timeframe_value
+    )
+    config_json = json.dumps(stamped_config, separators=(",", ":"), default=str)
 
     with get_db() as conn:
         conn.execute(
@@ -6527,6 +6648,18 @@ def get_settings():
         }
     except Exception:
         pass
+    # Throughput preset bundles + the DERIVED active name (value-compare; nothing
+    # named is persisted). The backend owns both so the Settings dial, the API
+    # payload, and telemetry can never disagree about which preset is in effect.
+    try:
+        from forven.throughput_policy import THROUGHPUT_PRESETS, effective_throughput_preset
+
+        payload["throughput_presets"] = {
+            _name: dict(_bundle) for _name, _bundle in THROUGHPUT_PRESETS.items()
+        }
+        payload["throughput_preset_effective"] = effective_throughput_preset(payload)
+    except Exception:
+        pass
     # Reflect the authoritative regime-gating values (config.json + env overrides),
     # which the live gate actually enforces, rather than the stale KV blob — so the
     # Lab/Risk panel can't show a value diverging from what's enforced.
@@ -6535,6 +6668,10 @@ def get_settings():
         payload["strict_regime_gating"] = _regime_cfg.get_strict_regime_gating()
         payload["regime_min_confidence"] = _regime_cfg.get_regime_min_confidence()
         payload["allow_unknown_regime_strategies"] = _regime_cfg.get_allow_unknown_regime_strategies()
+        payload["regime_gate_mode"] = _regime_cfg.get_regime_gate_mode()
+        payload["regime_gate_block_long"] = ",".join(sorted(_regime_cfg.get_regime_gate_block_long()))
+        payload["regime_gate_block_short"] = ",".join(sorted(_regime_cfg.get_regime_gate_block_short()))
+        payload["regime_gate_min_confidence"] = _regime_cfg.get_regime_gate_min_confidence()
     except Exception:
         pass
     # Reflect the REAL Discord delivery preferences so the Notifications panel
@@ -9702,8 +9839,11 @@ def _normalize_trade_artifact_rows(raw_rows: object) -> list[dict]:
         }
         # Carry through descriptive fields (only when present) so the result
         # viewer can show direction / hold time / MAE-MFE and the manual
-        # backtester's exit reason + position size_fraction.
-        for key in ("direction", "exit_reason"):
+        # backtester's exit reason + position size_fraction. `regime` is the
+        # kernel's causal entry-bar label — per-regime analysis needs it to
+        # survive persistence (2026-07-05 graveyard audit re-classified 35k
+        # trades from candles because it was dropped here).
+        for key in ("direction", "exit_reason", "regime"):
             if row.get(key) not in (None, ""):
                 trade_row[key] = str(row[key])
         if row.get("bars_held") not in (None, ""):
@@ -10474,10 +10614,22 @@ def _execution_profile_parity_warnings(controls: dict | None, leverage: float | 
                 f"Backtest risk/trade (~{effective_risk:.1%}) exceeds the live per-trade cap ({per_trade_cap:.1%}) — "
                 f"live will reject or shrink it, understating drawdown and overstating returns."
             )
-    if controls.get("trailing_stop_pct") is not None:
-        warnings.append("Trailing stop has no live equivalent (the scanner takes its stop from the signal); the live edge may differ.")
-    if controls.get("time_stop_bars") is not None:
-        warnings.append("Time-stop (N-bar exit) has no live equivalent in the scanner; the live edge may differ.")
+    # Trailing stops and time-stops ARE enforced live on the kernel execution
+    # path (the default: execution_kernel reads the same profile the backtest
+    # does). Only the LEGACY non-kernel scanner path ignores them, so warn
+    # conditionally instead of claiming "no live equivalent" (stale pre-kernel
+    # text that told operators an enforced control was unenforced).
+    try:
+        from forven.scanner import _live_kernel_execution_enabled
+
+        _kernel_live = bool(_live_kernel_execution_enabled())
+    except Exception:
+        _kernel_live = True
+    if not _kernel_live:
+        if controls.get("trailing_stop_pct") is not None:
+            warnings.append("Trailing stop is only enforced live on the kernel execution path, which is disabled (live_kernel_execution=off); the live edge may differ.")
+        if controls.get("time_stop_bars") is not None:
+            warnings.append("Time-stop (N-bar exit) is only enforced live on the kernel execution path, which is disabled (live_kernel_execution=off); the live edge may differ.")
     try:
         lev = float(leverage) if leverage is not None else None
     except (TypeError, ValueError):

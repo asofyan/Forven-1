@@ -147,6 +147,21 @@ def _get_risk_limits() -> dict[str, float]:
     return base_limits
 
 
+def max_risk_per_trade_limit() -> float:
+    """The ACTIVE per-trade risk cap as an equity fraction (0.02 = 2%).
+
+    Mode-aware (testnet vs mainnet profile) and honoring the operator's
+    max_risk_per_trade_pct / legacy max_position_size_pct override. This is
+    the same number can_open's Rule 0b enforces; exposed so profile SELECTION
+    (gauntlet execution-profile stamping) can constrain its search grid to
+    policy — kernel-parity callers legitimately skip the order-time cap
+    (enforce_risk_caps=False mirrors the frozen profile), so a profile above
+    the cap must never be stamped in the first place (S05215 shipped to paper
+    at 3% against a 2% cap, 2026-07-06).
+    """
+    return float(_get_risk_limits()["max_risk_per_trade"])
+
+
 def _load_risk_settings() -> dict:
     """Return persisted settings as a plain dict."""
     try:
@@ -274,6 +289,156 @@ def _is_strategy_in_loss_cooldown(strategy: str, cooldown_hours: float) -> tuple
         f"Cooldown active for {normalized_strategy}: last closed trade was a loss at "
         f"{closed_at.isoformat()}. Wait {remaining:.1f}h before reopening."
     )
+
+
+def _get_failed_open_cooldown_minutes(settings: dict) -> float:
+    try:
+        minutes = float(settings.get("live_failed_open_cooldown_minutes", 15) or 0)
+    except Exception:
+        return 15.0
+    return max(0.0, minutes)
+
+
+def _get_failed_open_max_attempts(settings: dict) -> int:
+    try:
+        attempts = int(settings.get("live_failed_open_max_attempts", 3) or 0)
+    except Exception:
+        return 3
+    return max(0, attempts)
+
+
+def _get_failed_open_window_hours(settings: dict) -> float:
+    try:
+        hours = float(settings.get("live_failed_open_window_hours", 6) or 0)
+    except Exception:
+        return 6.0
+    return max(0.0, hours)
+
+
+def _is_strategy_in_failed_open_cooldown(
+    strategy: str, asset: str, direction: str, settings: dict
+) -> tuple[bool, str | None]:
+    """RETRY-STORM-1: brake re-submission after FAILED live opens.
+
+    When a live open FAILS at the exchange the trade row is marked FAILED and its
+    slot freed — but the kernel still wants the position on the next scan, sees no
+    OPEN/CLOSED counterpart, and submits a brand-new REAL order every tick (S05665
+    fired 5 failed submissions in 20 minutes). Two brakes, both Settings-editable:
+
+    - cooldown: after a FAILED open, the same strategy+asset+direction may not
+      re-submit until ``live_failed_open_cooldown_minutes`` passes (0 disables);
+    - breaker: ``live_failed_open_max_attempts`` FAILED opens inside
+      ``live_failed_open_window_hours`` stand the intent down until the window
+      drains (0 attempts disables). The breaker emits a deduped ``trade_blocked``
+      notification so the operator knows retries are suspended, not just failing.
+    """
+    normalized_strategy = str(strategy or "").strip()
+    normalized_asset = str(asset or "").strip().upper()
+    normalized_direction = str(direction or "long").strip().lower() or "long"
+    cooldown_minutes = _get_failed_open_cooldown_minutes(settings)
+    max_attempts = _get_failed_open_max_attempts(settings)
+    window_hours = _get_failed_open_window_hours(settings)
+    if not normalized_strategy or not normalized_asset:
+        return False, None
+    if cooldown_minutes <= 0 and (max_attempts <= 0 or window_hours <= 0):
+        return False, None
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(closed_at, ''), created_at) AS failed_at,
+                   failure_reason
+            FROM trades
+            WHERE status = 'FAILED'
+              AND (
+                COALESCE(NULLIF(strategy_id, ''), strategy) = ?
+                OR strategy = ?
+              )
+              AND UPPER(COALESCE(asset, '')) = ?
+              AND LOWER(COALESCE(direction, 'long')) = ?
+              AND COALESCE(execution_type, 'live') NOT IN ('paper', 'paper_challenger', 'simulation')
+            ORDER BY failed_at DESC
+            LIMIT 50
+            """,
+            (normalized_strategy, normalized_strategy, normalized_asset, normalized_direction),
+        ).fetchall()
+    if not rows:
+        return False, None
+
+    now = get_now()
+    lookback_hours = max(window_hours, cooldown_minutes / 60.0)
+    failures: list[datetime] = []
+    last_reason: str | None = None
+    for row in rows:
+        trade = dict(row)
+        raw = str(trade.get("failed_at") or "").strip()
+        if not raw:
+            continue
+        try:
+            failed_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if failed_at.tzinfo is None:
+            failed_at = failed_at.replace(tzinfo=now.tzinfo)
+        if (now - failed_at).total_seconds() > lookback_hours * 3600.0:
+            continue
+        failures.append(failed_at)
+        if last_reason is None:
+            last_reason = str(trade.get("failure_reason") or "").strip() or None
+    if not failures:
+        return False, None
+
+    reason_suffix = f" Last exchange error: {last_reason}" if last_reason else ""
+
+    # Breaker: too many failures inside the window → stand down until it drains.
+    if max_attempts > 0 and window_hours > 0:
+        in_window = [f for f in failures if (now - f).total_seconds() <= window_hours * 3600.0]
+        if len(in_window) >= max_attempts:
+            message = (
+                f"Failed-open breaker for {normalized_strategy}: {len(in_window)} failed live "
+                f"opens on {normalized_asset} {normalized_direction} in the last {window_hours:g}h "
+                f"(limit {max_attempts}). Standing down until the window drains.{reason_suffix}"
+            )
+            try:
+                from forven.notifications import emit_notification
+
+                emit_notification(
+                    "trade_blocked",
+                    severity="warn",
+                    source="risk",
+                    title=f"Live opens suspended ({normalized_asset})",
+                    summary=message,
+                    body=message,
+                    dedupe_key=(
+                        f"failed_open_breaker:{normalized_strategy}:"
+                        f"{normalized_asset}:{normalized_direction}"
+                    ),
+                    metadata={
+                        "strategy_id": normalized_strategy,
+                        "asset": normalized_asset,
+                        "direction": normalized_direction,
+                        "failed_attempts": len(in_window),
+                        "window_hours": window_hours,
+                    },
+                )
+            except Exception:
+                log.debug("failed-open breaker notification failed", exc_info=True)
+            return True, message
+
+    # Cooldown: the most recent failure must age past the cooldown before retry.
+    if cooldown_minutes > 0:
+        latest = max(failures)
+        elapsed_minutes = (now - latest).total_seconds() / 60.0
+        if elapsed_minutes < cooldown_minutes:
+            remaining = max(cooldown_minutes - elapsed_minutes, 0.0)
+            return True, (
+                f"Failed-open cooldown for {normalized_strategy}: last live open on "
+                f"{normalized_asset} {normalized_direction} FAILED {elapsed_minutes:.1f}m ago. "
+                f"Wait {remaining:.1f}m before retrying.{reason_suffix}"
+            )
+
+    return False, None
+
 
 # Correlation groups — assets in same group are treated as one correlated pool
 CORRELATION_GROUPS = {
@@ -428,6 +593,16 @@ def _live_scope_positions(positions: dict) -> dict:
     }
 
 
+def _paper_scope_positions(positions: dict) -> dict:
+    """Paper/simulation positions — the complement of _live_scope_positions,
+    for the Risk page's PAPER scope view."""
+    return {
+        trade_id: pos
+        for trade_id, pos in positions.items()
+        if _position_execution_type(pos) in _PAPER_EXECUTION_TYPES
+    }
+
+
 def get_group_exposure(group: str, positions: dict | None = None) -> dict:
     """Calculate net directional exposure for a correlation group."""
     if positions is None:
@@ -459,13 +634,20 @@ def get_group_exposure(group: str, positions: dict | None = None) -> dict:
     }
 
 
-def get_portfolio_summary() -> dict:
-    """Real-wallet portfolio risk summary across all groups.
+def get_portfolio_summary(scope: str = "live") -> dict:
+    """Portfolio risk summary across all groups, scoped by execution type.
 
-    Scoped to non-paper positions: this is the live-portfolio guardrail view
+    Default "live" = non-paper positions: the live-portfolio guardrail view
     (CLI `risk`, the /risk page), so paper sandbox rows must not inflate it.
+    "paper" gives the paper-sandbox complement for the Risk page's PAPER view
+    — display-only, never a gating input (paper sessions don't share a budget).
     """
-    positions = _live_scope_positions(_get_positions())
+    all_positions = _get_positions()
+    positions = (
+        _paper_scope_positions(all_positions)
+        if scope == "paper"
+        else _live_scope_positions(all_positions)
+    )
     summary = {}
     for group in CORRELATION_GROUPS:
         summary[group] = get_group_exposure(group, positions)
@@ -885,6 +1067,60 @@ def set_live_notional_ceiling(
     return ceilings.get(sid) or {}
 
 
+_TERMINAL_STRATEGY_STAGES = {"archived", "rejected", "backtest_failed"}
+
+
+def _ceiling_stage_map(strategy_ids: list[str]) -> dict[str, str]:
+    """Current stage per strategy id (lowercase); missing ids are absent."""
+    sids = [s for s in strategy_ids if s and not s.startswith("bot:")]
+    if not sids:
+        return {}
+    try:
+        with get_db() as conn:
+            placeholders = ",".join("?" * len(sids))
+            rows = conn.execute(
+                f"SELECT id, LOWER(COALESCE(stage, status, '')) AS stage "
+                f"FROM strategies WHERE id IN ({placeholders})",
+                sids,
+            ).fetchall()
+        return {str(r["id"]): str(r["stage"]) for r in rows}
+    except Exception as exc:
+        log.debug("ceiling stage lookup failed: %s", exc)
+        return {}
+
+
+def revoke_dead_strategy_ceilings() -> list[str]:
+    """Revoke live notional ceilings held by terminal (or deleted) strategies.
+
+    A go-live ceiling is live ARMING — an archived/rejected strategy keeping
+    one is a dormant permission that would let a revived zombie size a real
+    order. transition_stage revokes at archive time; this sweep (daily DB
+    maintenance) reaps any that predate that hook or slipped past it.
+    Bot ceilings (``bot:{id}`` keys) are managed by the Bot Factory and skipped.
+    """
+    ceilings = get_live_notional_ceilings()
+    # Bot ceilings are managed by the Bot Factory; basket ceilings by the
+    # basket arming/disarm lifecycle. Neither id exists in the strategies
+    # table, so sweeping them here would revoke a LIVE armed cap — after
+    # which check_live_strategy_ceiling fails open.
+    sids = [s for s in ceilings if not str(s).startswith(("bot:", "basket:"))]
+    if not sids:
+        return []
+    stages = _ceiling_stage_map(sids)
+    dead = [
+        sid for sid in sids
+        if stages.get(sid) is None or stages.get(sid) in _TERMINAL_STRATEGY_STAGES
+    ]
+    for sid in dead:
+        try:
+            set_live_notional_ceiling(sid, None, actor="dead-strategy-reaper")
+        except Exception as exc:
+            log.warning("could not revoke stale live ceiling for %s: %s", sid, exc)
+    if dead:
+        log.info("Revoked stale live ceilings for terminal strategies: %s", ", ".join(dead))
+    return dead
+
+
 def check_live_strategy_ceiling(strategy_id: str, add_notional_usd: float) -> tuple[bool, str]:
     """Per-order admission against the strategy's go-live notional ceiling.
 
@@ -974,6 +1210,20 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
             ),
         }
     ceilings = get_live_notional_ceilings()
+    # Annotate each ceiling with the strategy's CURRENT stage and hide terminal
+    # zombies from the operator view (the reaper revokes them; this is the
+    # belt-and-braces display filter so a stale KV entry can never render as
+    # apparent live arming). bot: keys belong to the Bot Factory — kept as-is.
+    ceiling_stages = _ceiling_stage_map(list(ceilings.keys()))
+    annotated_ceilings: dict[str, dict] = {}
+    for sid, entry in ceilings.items():
+        if str(sid).startswith("bot:"):
+            annotated_ceilings[sid] = {**entry, "stage": "bot"}
+            continue
+        stage = ceiling_stages.get(sid)
+        if stage is None or stage in _TERMINAL_STRATEGY_STAGES:
+            continue
+        annotated_ceilings[sid] = {**entry, "stage": stage}
     ceilings_missing: list[str] = []
     try:
         with get_db() as conn:
@@ -990,7 +1240,7 @@ def live_portfolio_budget_snapshot(equity: float | None = None) -> dict:
         "equity_usd": round(eq, 2) if eq else None,
         "equity_available": bool(eq),
         "limits_pct": limits_pct,
-        "strategy_ceilings": ceilings,
+        "strategy_ceilings": annotated_ceilings,
         "ceilings_missing": ceilings_missing,
         "total_open_risk_usd": exposure["total_risk_usd"],
         "total_open_risk_limit_usd": round(max_risk_usd, 2) if max_risk_usd else None,
@@ -1227,6 +1477,20 @@ def can_open(
         cooling_down, cooldown_reason = _is_strategy_in_loss_cooldown(strategy, cooldown_after_loss_hours)
         if cooling_down:
             return False, 0.0, cooldown_reason or "Strategy is in cooldown after a losing trade."
+
+        # RETRY-STORM-1: after a FAILED live open the kernel reconciler still wants
+        # the position on the next scan (FAILED rows are invisible to its recorded
+        # view) and would submit a fresh REAL order every tick. Brake retries with
+        # a per-failure cooldown plus a stand-down breaker. Live scope only — paper
+        # opens never fail at an exchange. Deliberately NOT skippable via
+        # enforce_risk_caps: this is a safety gate in the same class as the
+        # kill-switch and loss cooldown.
+        if not is_paper_scope:
+            storm_blocked, storm_reason = _is_strategy_in_failed_open_cooldown(
+                strategy, asset, direction, settings
+            )
+            if storm_blocked:
+                return False, 0.0, storm_reason or "Recent failed live opens — retry cooldown active."
 
         # Rule 1: Assets outside a known correlation group are treated as their
         # OWN singleton group (group == asset) so Rules 2-4 still apply — they no
@@ -3797,13 +4061,17 @@ def close_all_positions() -> list[dict]:
         close_accounts: list[str | None] = [None]
         try:
             from forven.exchange import books as _books_mod
-            if _books_mod.books_enabled():
-                seen_acc: set[str] = set()
-                for _lbl, _addr in _books_mod.active_book_addresses():
-                    key = str(_addr).strip().lower() if _addr else ""
-                    if key and key not in seen_acc:
-                        seen_acc.add(key)
-                        close_accounts.append(_addr)
+            # active_book_addresses covers direction books (when enabled) AND
+            # named wallets, which hold real positions (live bots, the armed
+            # basket) regardless of the direction-books switch — an emergency
+            # flatten that only empties the master with books off would leave
+            # every named-wallet position running. Sweep it unconditionally.
+            seen_acc: set[str] = set()
+            for _lbl, _addr in _books_mod.active_book_addresses():
+                key = str(_addr).strip().lower() if _addr else ""
+                if key and key not in seen_acc:
+                    seen_acc.add(key)
+                    close_accounts.append(_addr)
         except Exception:
             pass
 
@@ -4214,6 +4482,12 @@ def get_risk_status() -> dict:
         candidate = _coerce_non_negative_float(_position.get("risk_pct"))
         if candidate is not None and candidate > current_per_trade_risk:
             current_per_trade_risk = candidate
+    # Paper counterpart for the Risk page's PAPER scope (display-only).
+    current_per_trade_risk_paper = 0.0
+    for _position in _paper_scope_positions(all_positions).values():
+        candidate = _coerce_non_negative_float(_position.get("risk_pct"))
+        if candidate is not None and candidate > current_per_trade_risk_paper:
+            current_per_trade_risk_paper = candidate
 
     return {
         "execution_mode": cfg.get_execution_mode(),
@@ -4229,6 +4503,7 @@ def get_risk_status() -> dict:
         "open_positions_paper": int(paper_open_positions),
         "live_books": _live_books_status_safe(),
         "current_per_trade_risk": round(float(current_per_trade_risk), 4),
+        "current_per_trade_risk_paper": round(float(current_per_trade_risk_paper), 4),
         "recovery_active": bool(recovery.get("recovery_active")),
         "recovery_status": recovery.get("recovery_status"),
         "recovery_started_at": recovery.get("recovery_started_at"),
@@ -4241,6 +4516,9 @@ def get_risk_status() -> dict:
         "recovery_last_checked_at": recovery.get("recovery_last_checked_at"),
         "recovery_network": recovery.get("recovery_network"),
         "portfolio": summary,
+        # PAPER-scope complement of `portfolio` for the Risk page's Live/Paper
+        # toggle. Display-only: paper sandboxes never share a budget or gate.
+        "portfolio_paper": get_portfolio_summary(scope="paper"),
         # PORT-1: the live account-level budget (dollar risk-to-stop + net exposure
         # vs equity) — distinct from limits.portfolio_budget, the legacy risk-pct
         # slot ledger. The frontend risk page renders this block.

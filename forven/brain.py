@@ -10,7 +10,7 @@ import logging
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -38,6 +38,7 @@ from forven.workspace import (
     today_memory_path,
 )
 from forven.util import normalize_stage
+from forven.dethrone_cooldown import clear_dethrone_cooldown, dethrone_cooldown_active_until
 from forven.policy import evaluate_promotion, load_pipeline_config
 from forven.strategies.certification import certify_execution_strategy
 
@@ -611,6 +612,73 @@ def _find_active_promotion_approval(conn, strategy_id: str, requested_status: st
     ).fetchone()
 
 
+_SNAPSHOT_FORWARD_WINDOW_DAYS = 14
+
+
+def _strategy_approval_snapshot(conn, strategy_id: str) -> dict | None:
+    """Point-in-time strategy summary embedded in approval payloads.
+
+    Fail-soft by contract: returns None on any error — a broken metrics blob
+    or schema drift must never block approval creation.
+    """
+    try:
+        row = conn.execute(
+            "SELECT display_id, name, display_name, symbol, timeframe, stage, "
+            "stage_changed_at, metrics FROM strategies WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+        if not row:
+            return None
+
+        metrics = _parse_metrics_blob(row["metrics"])
+        _, sharpe = _metric_with_key(metrics, "sharpe", "sharpe_ratio")
+        _, total_return = _metric_with_key(metrics, "total_return", "total_return_pct", "return_pct")
+        _, max_drawdown = _metric_with_key(metrics, "max_drawdown", "max_drawdown_pct", "max_dd")
+        _, trades = _metric_with_key(metrics, "trades", "num_trades", "total_trades", "trade_count")
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=_SNAPSHOT_FORWARD_WINDOW_DAYS)
+        ).isoformat()
+        forward_row = conn.execute(
+            "SELECT COUNT(*) AS c, SUM(pnl_pct) AS pnl_sum, "
+            "SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) AS wins "
+            "FROM trades WHERE COALESCE(strategy_id, strategy) = ? "
+            "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
+            "AND datetime(closed_at) >= datetime(?)",
+            (strategy_id, cutoff),
+        ).fetchone()
+
+        return {
+            "display_id": row["display_id"],
+            "name": row["name"],
+            "display_name": row["display_name"],
+            "symbol": row["symbol"],
+            "timeframe": row["timeframe"],
+            "stage": row["stage"],
+            "stage_changed_at": row["stage_changed_at"],
+            "backtest": {
+                "sharpe": sharpe,
+                "total_return": total_return,
+                "max_drawdown": max_drawdown,
+                "trades": int(trades) if trades is not None else None,
+            },
+            "forward": {
+                "window_days": _SNAPSHOT_FORWARD_WINDOW_DAYS,
+                "closed_trades": int(forward_row["c"]) if forward_row else 0,
+                "realized_pnl_pct_sum": (
+                    round(float(forward_row["pnl_sum"]), 4)
+                    if forward_row and forward_row["pnl_sum"] is not None
+                    else None
+                ),
+                "wins": int(forward_row["wins"]) if forward_row and forward_row["wins"] is not None else 0,
+            },
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception:
+        log.warning("strategy approval snapshot failed for %s", strategy_id, exc_info=True)
+        return None
+
+
 def _queue_promotion_approval(
     conn,
     *,
@@ -619,6 +687,7 @@ def _queue_promotion_approval(
     requested_status: str,
     actor: str,
     reason: str,
+    evidence: dict | None = None,
 ) -> tuple[int, bool]:
     existing = _find_active_promotion_approval(conn, strategy_id, requested_status)
     if existing:
@@ -631,6 +700,21 @@ def _queue_promotion_approval(
     if compact_reason:
         approval_reason = f"{approval_reason}: {compact_reason[:220]}"
 
+    payload = {
+        "strategy_id": strategy_id,
+        "current_stage": current_stage,
+        "recommended_action": "promote",
+        "recommended_target_stage": requested_status,
+        "operator_required": True,
+        "trigger_actor": actor,
+        "trigger_reason": compact_reason or None,
+    }
+    if evidence:
+        payload["evidence"] = dict(evidence)
+    snapshot = _strategy_approval_snapshot(conn, strategy_id)
+    if snapshot:
+        payload["strategy_snapshot"] = snapshot
+
     approval_id = create_approval(
         _PROMOTION_APPROVAL_TYPE,
         target_type="strategy",
@@ -639,15 +723,7 @@ def _queue_promotion_approval(
         status="pending_approval",
         actor=actor,
         reason=approval_reason,
-        payload={
-            "strategy_id": strategy_id,
-            "current_stage": current_stage,
-            "recommended_action": "promote",
-            "recommended_target_stage": requested_status,
-            "operator_required": True,
-            "trigger_actor": actor,
-            "trigger_reason": compact_reason or None,
-        },
+        payload=payload,
         owner="ceo",
         conn=conn,
     )
@@ -666,6 +742,64 @@ def _requires_operator_dethrone_approval(current_stage: str, target_stage: str) 
     if current_rank is None or target_rank is None:
         return False
     return target_rank < current_rank
+
+
+def _paper_dethrone_soak_block(conn, strategy_id: str, current_stage: str) -> str | None:
+    """Paper soak guard: no dethrone RECOMMENDATION until the strategy has had
+    a real chance to prove itself.
+
+    Hard floor of dethrone.paper_min_soak_days; between the floor and
+    dethrone.paper_max_soak_days the strategy stays protected while it has
+    fewer than dethrone.paper_min_closed_trades closed paper trades in the
+    current stay (low-frequency strategies may execute once a week or less).
+    Returns a human-readable block reason while protected, else None.
+    Fail-open: unreadable config/rows allow the recommendation.
+    """
+    if _normalize_stage(current_stage) != "paper":
+        return None
+    try:
+        cfg = load_pipeline_config().get("dethrone") or {}
+        min_days = float(cfg.get("paper_min_soak_days", 7))
+        max_days = float(cfg.get("paper_max_soak_days", 14))
+        min_trades = int(cfg.get("paper_min_closed_trades", 5))
+        if min_days <= 0 and max_days <= 0:
+            return None
+
+        row = conn.execute(
+            "SELECT stage_changed_at FROM strategies WHERE id = ?", (strategy_id,)
+        ).fetchone()
+        stage_changed_raw = str(row["stage_changed_at"] or "").strip() if row else ""
+        if not stage_changed_raw:
+            return None
+        stage_changed = datetime.fromisoformat(stage_changed_raw)
+        if stage_changed.tzinfo is None:
+            stage_changed = stage_changed.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - stage_changed).total_seconds() / 86400.0
+
+        if age_days >= max(min_days, max_days):
+            return None
+        if age_days < min_days:
+            return (
+                f"paper soak: {age_days:.1f}d of the {min_days:.0f}d minimum before "
+                f"dethrone recommendations"
+            )
+        trade_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM trades "
+            "WHERE COALESCE(strategy_id, strategy) = ? AND status = 'CLOSED' "
+            "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%' "
+            "AND datetime(closed_at) >= datetime(?)",
+            (strategy_id, stage_changed_raw),
+        ).fetchone()
+        closed_trades = int(trade_row["c"]) if trade_row else 0
+        if closed_trades < min_trades:
+            return (
+                f"paper soak extended: only {closed_trades}/{min_trades} closed paper "
+                f"trades in {age_days:.1f}d (protected until {max_days:.0f}d)"
+            )
+        return None
+    except Exception:
+        log.warning("paper dethrone soak check failed for %s", strategy_id, exc_info=True)
+        return None
 
 
 def _find_active_dethrone_approval(
@@ -701,6 +835,7 @@ def _queue_dethrone_approval(
     requested_status: str,
     actor: str,
     reason: str,
+    evidence: dict | None = None,
 ) -> tuple[int, bool]:
     existing = _find_active_dethrone_approval(conn, strategy_id, requested_status)
     if existing:
@@ -713,6 +848,21 @@ def _queue_dethrone_approval(
     if compact_reason:
         approval_reason = f"{approval_reason}: {compact_reason[:220]}"
 
+    payload = {
+        "strategy_id": strategy_id,
+        "current_stage": current_stage,
+        "recommended_action": "dethrone",
+        "recommended_target_stage": requested_status,
+        "operator_required": True,
+        "trigger_actor": actor,
+        "trigger_reason": compact_reason or None,
+    }
+    if evidence:
+        payload["evidence"] = dict(evidence)
+    snapshot = _strategy_approval_snapshot(conn, strategy_id)
+    if snapshot:
+        payload["strategy_snapshot"] = snapshot
+
     approval_id = create_approval(
         _DETHRONE_APPROVAL_TYPE,
         target_type="strategy",
@@ -721,15 +871,7 @@ def _queue_dethrone_approval(
         status="pending_approval",
         actor=actor,
         reason=approval_reason,
-        payload={
-            "strategy_id": strategy_id,
-            "current_stage": current_stage,
-            "recommended_action": "dethrone",
-            "recommended_target_stage": requested_status,
-            "operator_required": True,
-            "trigger_actor": actor,
-            "trigger_reason": compact_reason or None,
-        },
+        payload=payload,
         owner="ceo",
         conn=conn,
     )
@@ -1250,6 +1392,73 @@ def _terminal_task_strategy_stage(conn, strategy_id: str | None) -> str | None:
     return stage if stage in _TERMINAL_TASK_STAGES else None
 
 
+_DETHRONE_TASK_INTENT_RE = re.compile(
+    r"\b(demote|demotion|dethrone|retire|retirement|archive|close[-\s]?out|scrub|flip\s+stage)\b"
+    r"|\bclose\b[^\n]{0,60}\b(trade|position|E\d{3,})\b",
+    re.IGNORECASE,
+)
+
+
+def _dethrone_protected_task_block(
+    conn, strategy_id: str | None, title: str, description: str
+) -> str | None:
+    """Refuse demotion/close-out tasks aimed at a dethrone-protected strategy.
+
+    The soak/cooldown guards block the stage transition itself, but the Brain
+    re-dispatches agents at the same blocked goal every cycle (observed: 4+
+    agent tasks in a day against one soak-protected strategy, each burning a
+    full agent run on a transition that cannot succeed). Park the goal at
+    assignment time with the same reason the transition gate gives.
+
+    The strategy id is re-resolved from the task text here because demotion
+    tasks arrive under task types (execution, risk_audit, ...) that
+    _resolve_task_strategy_id deliberately excludes from text inference.
+    Fail-open: resolution/config errors allow the assignment.
+    """
+    text = f"{title or ''}\n{description or ''}"
+    if not _DETHRONE_TASK_INTENT_RE.search(text):
+        return None
+    try:
+        sid = str(strategy_id or "").strip().upper()
+        if not sid:
+            for candidate in re.findall(r"\bS\d{3,}\b", text.upper()):
+                if conn.execute(
+                    "SELECT 1 FROM strategies WHERE id = ? LIMIT 1", (candidate,)
+                ).fetchone():
+                    sid = candidate
+                    break
+        if not sid:
+            return None
+        row = conn.execute(
+            "SELECT stage, status, stage_changed_at FROM strategies WHERE id = ? LIMIT 1",
+            (sid,),
+        ).fetchone()
+        if not row:
+            return None
+        current_stage = str(row["stage"] or row["status"] or "").strip().lower()
+        try:
+            cooldown_until = dethrone_cooldown_active_until(sid, conn=conn)
+        except Exception:
+            cooldown_until = None
+        if cooldown_until:
+            block = f"operator deny cooldown until {cooldown_until}"
+        else:
+            block = _paper_dethrone_soak_block(conn, sid, current_stage)
+        if not block:
+            return None
+        return (
+            f"{sid} is dethrone-protected ({block}). Its current stage is "
+            f"'{current_stage}' as of {row['stage_changed_at']} — earned through the "
+            f"normal pipeline, so any earlier archival you remember is stale. Do not "
+            f"re-assign demotion/close-out tasks for it; the protection expires on its "
+            f"own, and only the operator can demote sooner (manual demotions execute "
+            f"directly)."
+        )
+    except Exception:
+        log.warning("dethrone-protected task check failed", exc_info=True)
+        return None
+
+
 def transition_stage(
     strategy_id: str,
     target_stage: str,
@@ -1258,6 +1467,7 @@ def transition_stage(
     notes: str | None = None,
     force: bool = False,
     skip_approval_gate: bool = False,
+    evidence: dict | None = None,
 ) -> dict[str, str | None]:
     """Move a strategy between lifecycle stages in one atomic update path."""
     normalized_target = _normalize_stage(target_stage)
@@ -1368,6 +1578,29 @@ def transition_stage(
             raise ValueError(f"Invalid transition: {current_stage} -> {normalized_target}")
 
         if _requires_operator_dethrone_approval(current_stage, normalized_target) and not force:
+            # Deny cooldown: the operator recently rejected a dethrone rec for
+            # this strategy, so background demotion attempts stay blocked
+            # WITHOUT re-filing a new approval until the window expires.
+            # Fail-open on read errors — the safe fallback is surfacing the
+            # approval, not suppressing recommendations forever.
+            try:
+                cooldown_until = dethrone_cooldown_active_until(strategy_id, conn=conn)
+            except Exception:
+                cooldown_until = None
+            if cooldown_until:
+                return _record_blocked_transition(
+                    (
+                        f"Dethrone suppressed: operator denied a recent recommendation "
+                        f"for {strategy_id} (cooldown until {cooldown_until})"
+                    ),
+                    "dethrone_cooldown_active",
+                )
+            soak_block = _paper_dethrone_soak_block(conn, strategy_id, current_stage)
+            if soak_block:
+                return _record_blocked_transition(
+                    f"Dethrone suppressed: {soak_block}",
+                    "dethrone_soak_active",
+                )
             approval_id, reused = _queue_dethrone_approval(
                 conn,
                 strategy_id=strategy_id,
@@ -1375,6 +1608,7 @@ def transition_stage(
                 requested_status=normalized_target,
                 actor=actor,
                 reason=reason,
+                evidence=evidence,
             )
             action = "Existing dethrone approval reused" if reused else "Dethrone approval queued"
             blocked = _record_blocked_transition(
@@ -1595,6 +1829,7 @@ def transition_stage(
                 requested_status=normalized_target,
                 actor=actor,
                 reason=reason,
+                evidence=evidence,
             )
             action = "Existing promotion approval reused" if reused else "Promotion approval queued"
             blocked = _record_blocked_transition(
@@ -1655,6 +1890,31 @@ def transition_stage(
         # un-retireable trap. So: decay-driven retirement (actor='decay_tracker')
         # and explicit operator force may retire it (clearing the flag first);
         # all other automated actors stay blocked and must clear canonical=0 first.
+        # ARCH-1: a terminal strategy must not keep real-money exposure. Open LIVE
+        # positions block the transition outright — even under force — because the
+        # scanner only loads paper/live-stage strategies, so archiving would leave a
+        # real position with its exit management amputated. Flatten via the manual
+        # position controls first. Paper positions do NOT block: they are force-
+        # closed right after the transition commits (post-commit hook below), with
+        # the pipeline-hygiene sweep as the backstop.
+        if normalized_target in _TERMINAL_TASK_STAGES:
+            open_live_rows = conn.execute(
+                "SELECT id FROM trades "
+                "WHERE COALESCE(NULLIF(strategy_id, ''), strategy) = ? AND status = 'OPEN' "
+                "AND LOWER(COALESCE(execution_type, 'live')) NOT IN ('paper', 'paper_challenger', 'simulation')",
+                (strategy_id,),
+            ).fetchall()
+            if open_live_rows:
+                live_ids = ", ".join(str(r["id"]) for r in open_live_rows)
+                return _record_blocked_transition(
+                    block_reason=(
+                        f"Strategy holds {len(open_live_rows)} open LIVE position(s) "
+                        f"({live_ids}) — close them first; a terminal stage would "
+                        "orphan real-money exposure."
+                    ),
+                    motion="terminal_blocked_open_live_position",
+                )
+
         clear_canonical_on_commit = False
         if normalized_target in {"archived", "rejected"}:
             canonical_row = conn.execute(
@@ -1786,6 +2046,15 @@ def transition_stage(
             ),
         )
 
+        # The strategy actually left its operator-owned stage — any deny
+        # cooldown belongs to the stay that just ended. Uses the held conn
+        # (nested kv writes here would self-deadlock on the WAL writer lock).
+        if current_stage in _OPERATOR_OWNED_STAGES and normalized_target != current_stage:
+            try:
+                clear_dethrone_cooldown(strategy_id, conn=conn)
+            except Exception:
+                log.warning("dethrone cooldown clear failed for %s", strategy_id, exc_info=True)
+
         conn.execute(
             "INSERT INTO strategy_events "
             "(strategy_id, from_state, to_state, actor, reason, owner_from, owner_to, details_json, created_at) "
@@ -1870,6 +2139,28 @@ def transition_stage(
                         wf_cancelled,
                         strategy_id,
                     )
+                # GO-LIVE-1 hygiene: a terminal strategy must not stay live-armed.
+                # Its go-live notional ceiling is dormant live PERMISSION — revoke
+                # it here so archive/reject always disarms. Same-conn KV surgery
+                # (no nested get_db inside this write txn); the daily maintenance
+                # reaper (revoke_dead_strategy_ceilings) is the backstop.
+                from forven.exchange.risk import _LIVE_CEILINGS_KV_KEY
+
+                kv_row = conn.execute(
+                    "SELECT value FROM kv WHERE key = ?", (_LIVE_CEILINGS_KV_KEY,)
+                ).fetchone()
+                if kv_row and kv_row["value"]:
+                    ceilings = json.loads(kv_row["value"])
+                    if isinstance(ceilings, dict) and strategy_id in ceilings:
+                        ceilings.pop(strategy_id, None)
+                        conn.execute(
+                            "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
+                            (_LIVE_CEILINGS_KV_KEY, json.dumps(ceilings), now),
+                        )
+                        log.info(
+                            "Revoked live notional ceiling for terminal strategy %s",
+                            strategy_id,
+                        )
             except Exception:
                 log.warning(
                     "Failed to cancel gauntlet workflow(s) for terminal strategy %s",
@@ -2002,6 +2293,42 @@ def transition_stage(
             log.warning("Failed to queue post-mortem task for %s: %s", strategy_id, exc)
 
     log.info("Stage transition %s: %s -> %s", strategy_id, current_stage, normalized_target)
+
+    # ARCH-1: the terminal transition committed — flatten any open PAPER positions
+    # now, so a terminal strategy never keeps a position whose exit management the
+    # scanner just stopped running (open LIVE positions blocked the transition
+    # above). Done AFTER the write transaction closes (the close machinery opens
+    # its own connections and fetches a venue price — both would self-deadlock or
+    # stall the held WAL writer lock). Best-effort: a close skipped on a venue-read
+    # hiccup is retried by the pipeline-hygiene sweep backstop.
+    if normalized_target in _TERMINAL_TASK_STAGES:
+        try:
+            from forven.trade_state import close_open_paper_trades_for_strategy
+
+            closure = close_open_paper_trades_for_strategy(
+                strategy_id,
+                close_reason="terminal_stage_close",
+                note=(
+                    f"Auto-closed: strategy transitioned {current_stage} -> "
+                    f"{normalized_target} ({actor})"
+                ),
+            )
+            if closure.get("closed"):
+                log.info(
+                    "Closed %d open paper position(s) for terminal strategy %s: %s",
+                    len(closure["closed"]), strategy_id, ", ".join(closure["closed"]),
+                )
+            if closure.get("skipped"):
+                log.warning(
+                    "Could not close %d open paper position(s) for terminal strategy %s "
+                    "(hygiene sweep will retry): %s",
+                    len(closure["skipped"]), strategy_id, ", ".join(closure["skipped"]),
+                )
+        except Exception:
+            log.warning(
+                "Terminal paper-position close failed for %s (hygiene sweep will retry)",
+                strategy_id, exc_info=True,
+            )
 
     # Live go-live equity baseline: stamp the REAL Hyperliquid account equity at the
     # moment a strategy graduates to live, so its live "Capital" card reports a true
@@ -2150,6 +2477,16 @@ def handoff_execution_failure_to_developer(
     )
 
 
+def _safe_effective_throughput_preset() -> str:
+    """Effective throughput preset for telemetry; 'unknown' on ANY failure."""
+    try:
+        from forven.throughput_policy import effective_throughput_preset
+
+        return effective_throughput_preset()
+    except Exception:
+        return "unknown"
+
+
 def escalate_to_engineer(
     title: str,
     description: str,
@@ -2174,6 +2511,10 @@ def escalate_to_engineer(
         "severity": severity,
         "context": context or {},
         "reported_at": datetime.now(timezone.utc).isoformat(),
+        # Triage context: whether the instance was throttled (trickle/conserve)
+        # or running hot (max) when the bug surfaced is the first question for
+        # "pipeline is slow/stalled" reports. Never let the stamp break reporting.
+        "throughput_preset": _safe_effective_throughput_preset(),
     }
     # First-class operator notification — the triage queue. Deduped by title so a
     # repeated report of the same bug doesn't spam, while distinct bugs each show.
@@ -2896,6 +3237,24 @@ def assign_task_direct(
                 resolved_strategy_id,
                 terminal_stage,
             )
+        elif str(task_type or "").strip().lower() not in ("post_mortem", "manual"):
+            dethrone_block = _dethrone_protected_task_block(
+                conn, resolved_strategy_id, title, description
+            )
+            if dethrone_block:
+                conn.execute(
+                    """UPDATE agent_tasks
+                       SET status = 'cancelled',
+                           completed_at = ?,
+                           error = ?
+                       WHERE id = ?""",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        dethrone_block,
+                        task_id,
+                    ),
+                )
+                log.info("Cancelled task %s: %s", display_id, dethrone_block)
 
         if needs_approval:
             conn.execute(
@@ -3483,7 +3842,11 @@ def assign_risk_audit():
     # Exclude Bot Factory paper trades — the live risk audit must not count them
     # as portfolio exposure.
     open_trades = get_open_trades(exclude_bots=True)
-    status = kv_get("status") or {}
+    # Real risk snapshot (KV daemon_state) — the legacy "status" key was never
+    # written, so the audit prompt always claimed the kill switch was inactive.
+    from forven.portfolio_status import portfolio_status_snapshot
+
+    snapshot = portfolio_status_snapshot()
     
     settings = kv_get("forven:settings", {})
     pipeline = kv_get("forven:pipeline_thresholds", {})
@@ -3502,7 +3865,11 @@ def assign_risk_audit():
     prompt = (
         "RISK AUDIT ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ Review portfolio health and exposure.\n\n"
         f"Open positions: {len(open_trades)}\n"
-        f"Kill switch: {'ACTIVE' if status.get('killSwitch') else 'inactive'}\n\n"
+        f"Kill switch: {'ACTIVE' if snapshot['kill_switch_active'] else 'inactive'}\n"
+        f"Account equity: ${snapshot['account_equity']:,.2f}"
+        f" (HWM ${snapshot['high_water_mark']:,.2f},"
+        f" drawdown {snapshot['drawdown_pct']:.1f}%,"
+        f" daily PnL {snapshot['daily_pnl_pct']:+.2f}%)\n\n"
         "Your tasks:\n"
         "1. Review all open positions ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ check if any are approaching stop-loss levels\n"
         "2. Calculate total portfolio exposure and correlation between positions\n"

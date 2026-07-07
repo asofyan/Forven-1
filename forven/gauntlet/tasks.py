@@ -1386,6 +1386,19 @@ def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id:
     ):
         return {"skipped": True, "reason": "execution profile already selected"}
 
+    # Constrain the sizing grid to the ACTIVE per-trade risk cap. The stamped
+    # profile is executed with enforce_risk_caps=False (parity: paper/live
+    # mirror the frozen engine), so the order-time cap never re-checks it —
+    # a profile above policy must not be selectable here at all. Without this,
+    # the grid's 0.05 default stamped 3% profiles against a 2% testnet cap
+    # (S05215/S06127, 2026-07-06 risk-audit reports).
+    try:
+        from forven.exchange.risk import max_risk_per_trade_limit
+
+        risk_cap = max_risk_per_trade_limit()
+    except Exception:
+        risk_cap = 0.02
+
     selection = select_execution_profile(
         strategy_id=strategy_id,
         asset=str(row.get("symbol") or "BTC"),
@@ -1393,6 +1406,7 @@ def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id:
         params=params,
         timeframe=str(row.get("timeframe") or "1h"),
         regime_gate=False,  # match the paper scanner's kernel call (the parity reference)
+        max_risk=risk_cap,
         lean=True,          # bounded grid for promotion-time latency
     )
 
@@ -1551,6 +1565,11 @@ def run_paper_promotion_gate(workflow: dict[str, Any], step: dict[str, Any]) -> 
         or "stale validation" in _blocked_text
         or "engine version" in _blocked_text
         or "validation in flight" in _blocked_text
+        # Insufficient WFA fold evidence is a RETRYABLE absence, never a merit
+        # fail (commit 531e0943's intent): the trade-rate-aware window sizing
+        # re-runs judgeably on the next pass. Draining it to failed_gate
+        # archived genuinely-unjudged strategies via the workflow path.
+        or "window insufficient" in _blocked_text
     ):
         # PENDING RE-VALIDATION, not a merit failure. The gauntlet gate's artifact-
         # ordering / freshness check fails when a validation (walk_forward) is older

@@ -9,6 +9,7 @@ from statistics import mean, pstdev
 from typing import Any
 
 from forven.db import create_approval, get_db, kv_get, kv_set, log_activity, log_gate_rejection
+from forven.dethrone_cooldown import dethrone_cooldown_active_until
 
 from forven.gauntlet.legitimacy import validate_robustness_payload
 from forven.util import normalize_stage
@@ -223,6 +224,17 @@ DEFAULT_PIPELINE_CONFIG = {
         # OOS Sharpe may not exceed IS Sharpe by more than this ratio (OOS>>IS
         # signals a lucky/overfit OOS window).
         "max_oos_is_ratio": 1.5,
+    },
+    "dethrone": {
+        # Paper soak protection (2026-07-06 operator request): a paper strategy
+        # may not be RECOMMENDED for dethrone until it has had a chance to
+        # prove itself. Hard floor of paper_min_soak_days; low-frequency
+        # strategies (fewer than paper_min_closed_trades forward executions —
+        # some trade once a week or less) stay protected up to
+        # paper_max_soak_days. Operator force-demotions bypass this entirely.
+        "paper_min_soak_days": 7,
+        "paper_max_soak_days": 14,
+        "paper_min_closed_trades": 5,
     },
     "live_graduated": {
         "allocation_schedule": [
@@ -1219,7 +1231,30 @@ def _check_artifact_rows_exist(strategy_id: str, required_types: list[str]) -> t
             f"Missing passing persisted artifact rows for: {', '.join(missing)}. "
             f"Run or rerun these tests until the saved verdicts pass.",
         )
-    return True, f"All required artifact rows passed: {', '.join(sorted(passing))}"
+    # Two-tier transparency: a walk_forward row can pass the PAPER tier (fold
+    # pass-rate over judgeable folds) while its strict artifact verdict is FAIL
+    # (avg IS/OOS Sharpe, degradation — the paper->live bar). Without saying so,
+    # the report reads as a false green next to the artifact's FAIL verdict and
+    # operators either mistrust the gate or promote past evidence they meant to
+    # check (2026-07-06 session: an S06126 lean-pass was misread as the
+    # 2026-07-03 false-green bug).
+    notes: list[str] = []
+    for test_name in sorted(passing):
+        payload = payloads.get(test_name)
+        raw = (
+            str(payload.get("raw_verdict") or "").strip().upper()
+            if isinstance(payload, dict)
+            else ""
+        )
+        if raw == "FAIL":
+            notes.append(
+                f"{test_name} passed paper-tier criteria; its strict artifact verdict is "
+                "FAIL (enforced at the paper->live gate)"
+            )
+    detail = f"All required artifact rows passed: {', '.join(sorted(passing))}"
+    if notes:
+        detail += ". " + "; ".join(notes)
+    return True, detail
 
 
 def check_promotion_readiness(strategy_id: str) -> dict:
@@ -1258,10 +1293,14 @@ def check_promotion_readiness(strategy_id: str) -> dict:
     config = load_pipeline_config()
     gauntlet_cfg = config.get("gauntlet", {})
     required_tests = gauntlet_cfg.get("required_tests", [])
-    if required_tests:
-        _run_check("validation_artifacts", "gate_require_artifact_rows_enabled",
-                   "gate_require_artifact_rows_required",
-                   _check_artifact_rows_exist, strategy_id, required_tests)
+    # The GATE treats an empty required_tests as "enforce ALL" (strictest);
+    # the readiness report must mirror that, not skip validation entirely —
+    # otherwise an explicit [] shows ready:true over a persisted WFA FAIL
+    # (the 2026-07-03 false-green shape) while the real gate gets STRICTER.
+    _run_check("validation_artifacts", "gate_require_artifact_rows_enabled",
+               "gate_require_artifact_rows_required",
+               _check_artifact_rows_exist, strategy_id,
+               list(required_tests) or list(_GAUNTLET_VALIDATION_TYPES))
 
     ready = all(s["status"] in ("passed", "skipped", "warning") for s in steps)
     return {"ready": ready, "steps": steps, "strategy_id": strategy_id}
@@ -1951,7 +1990,7 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT result_type, metrics_json, config_json
+            SELECT result_type, metrics_json, config_json, symbol, timeframe
             FROM backtest_results
             WHERE strategy_id = ?
               AND (deleted_at IS NULL OR TRIM(COALESCE(deleted_at, '')) = '')
@@ -1984,6 +2023,26 @@ def _extract_gauntlet_verdict_payloads(strategy_id: str, row, metrics: dict) -> 
         if is_stale_engine_artifact(config_blob):
             stale_engine_types.add(normalized_type)
             continue
+        # Same rule for DATA semantics: a verdict scored while a stream carried
+        # a different print cadence / value scale describes numbers the current
+        # lake would never produce (the 2026-07-07 funding-interval incident:
+        # +54%/yr "validated" on mid-rewrite files, -14%/yr on the settled
+        # ones). Stale-data rows claim their type and contribute no payload —
+        # the test re-runs through the normal missing-artifact flow. Unstamped
+        # rows are grandfathered (forven/data_provenance.py).
+        try:
+            from forven.data_provenance import is_stale_data_artifact
+
+            if is_stale_data_artifact(
+                config_blob,
+                str(result_row["symbol"] or ""),
+                str(result_row["timeframe"] or "1h"),
+            ):
+                stale_engine_types.add(normalized_type)
+                continue
+        except Exception:
+            # Provenance faults must never block verdict reads.
+            pass
         status = str(metrics_blob.get("status") or config_blob.get("status") or "").strip().lower()
         if status in {"pending", "queued", "running", "started", "submitted"}:
             continue
@@ -2444,6 +2503,10 @@ def _extract_reason_code(reason_text: str) -> str:
     # specific code wins.
     if "engine version" in text or "stale-engine" in text:
         return "stale_engine_artifacts"
+    # Data-semantics staleness (data_provenance): the stream cadence/scale a
+    # verdict was scored on has changed — awaiting re-validation, not merit.
+    if "data fingerprint" in text or "stale-data" in text or "data semantics" in text:
+        return "stale_data_artifacts"
     if "stale validation tests" in text or "ordering violation" in text:
         return "stale_validation"
     if "zero trades" in text or "produces no signals" in text:
@@ -2458,6 +2521,17 @@ def _extract_reason_code(reason_text: str) -> str:
         return "source_divergence_reject"
     if "overfit" in text:
         return "overfit_reject"
+    # WFA fold-DENSITY shortfalls are evidence-insufficiency, not merit: the
+    # window was too small for the strategy's trade cadence to produce >=2
+    # judgeable folds (S06127 2026-07-06: auto-archived on 5 background polls of
+    # one unchanged sparse-fold artifact, then PASSED 0.67 fold-pass-rate once
+    # the window was sized to its cadence). Matched before the generic "s00552"
+    # bucket so these never feed the repeated-failure archive counter. The fold
+    # PASS-RATE reject stays a genuine (counting) s00552_reject.
+    if "walk-forward window insufficient" in text or (
+        "walk-forward has" in text and "requires minimum" in text
+    ):
+        return "wfa_window_insufficient"
     if "s00552" in text:
         return "s00552_reject"
     if "s00152" in text:
@@ -2588,13 +2662,19 @@ _EVIDENCE_ABSENCE_REASON_CODES = {
     # Artifacts from a previous BACKTEST_ENGINE_VERSION awaiting automatic
     # re-validation (engine_provenance) — says nothing about edge quality.
     "stale_engine_artifacts",
+    # Artifacts scored on different DATA semantics (data_provenance) awaiting
+    # re-validation — same class as an engine bump, from the data side.
+    "stale_data_artifacts",
     "missing_evidence",
     # Paper warm-up: not enough forward days/trades accumulated yet (L-21).
     "insufficient_paper_evidence",
+    # WFA produced too few judgeable (>= wfa_min_fold_trades) folds — the window
+    # was undersized for the strategy's trade cadence. Re-runnable, says nothing
+    # about edge quality (S06127 2026-07-06).
+    "wfa_window_insufficient",
 }
 _DETHRONE_APPROVAL_TYPE = "strategy_dethrone_recommendation"
 _DETHRONE_MANUAL_STAGES = {"paper", "paper_trading", "live_graduated", "deployed"}
-_DETHRONE_REVIEW_COOLDOWN_HOURS = 24
 
 
 def _resolve_dethrone_target_stage(current_stage: str) -> str:
@@ -2604,23 +2684,6 @@ def _resolve_dethrone_target_stage(current_stage: str) -> str:
     if normalized in {"live_graduated", "deployed"}:
         return "paper"
     return "archived"
-
-
-def _dethrone_cooldown_key(strategy_id: str) -> str:
-    return f"forven:dethrone:cooldown:{strategy_id}"
-
-
-def _is_dethrone_cooldown_active(strategy_id: str) -> bool:
-    raw = kv_get(_dethrone_cooldown_key(strategy_id))
-    if not isinstance(raw, str) or not raw.strip():
-        return False
-    try:
-        ts = datetime.fromisoformat(raw.strip())
-    except Exception:
-        return False
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) < (ts + timedelta(hours=_DETHRONE_REVIEW_COOLDOWN_HOURS))
 
 
 def _queue_dethrone_recommendation(
@@ -2908,7 +2971,45 @@ def _queue_challenger_dethrone(
     if pending:
         return int(pending["id"])
 
-    recommended_target_stage = _resolve_dethrone_target_stage(incumbent_stage)
+    if dethrone_cooldown_active_until(incumbent_id, conn=conn):
+        logging.getLogger("forven.policy").info(
+            "challenger dethrone suppressed by deny cooldown: %s", incumbent_id
+        )
+        return None
+
+    try:
+        from forven.brain import _paper_dethrone_soak_block
+
+        soak_block = _paper_dethrone_soak_block(conn, incumbent_id, incumbent_stage)
+    except Exception:
+        soak_block = None
+    if soak_block:
+        logging.getLogger("forven.policy").info(
+            "challenger dethrone suppressed for %s: %s", incumbent_id, soak_block
+        )
+        return None
+
+    payload = {
+        "strategy_id": incumbent_id,
+        "current_stage": incumbent_stage,
+        "trigger": "superior_challenger",
+        "challenger_id": challenger_id,
+        "challenger_sharpe": challenger_sharpe,
+        "incumbent_sharpe": incumbent_sharpe,
+        "recommended_action": "dethrone",
+        "recommended_target_stage": _resolve_dethrone_target_stage(incumbent_stage),
+        "operator_required": True,
+    }
+    try:
+        from forven.brain import _strategy_approval_snapshot
+
+        snapshot = _strategy_approval_snapshot(conn, incumbent_id)
+        if snapshot:
+            payload["strategy_snapshot"] = snapshot
+    except Exception:
+        pass
+
+    recommended_target_stage = payload["recommended_target_stage"]
     approval_id = create_approval(
         approval_type=_DETHRONE_APPROVAL_TYPE,
         target_type="strategy",
@@ -2920,17 +3021,7 @@ def _queue_challenger_dethrone(
             f"Dethrone recommendation: challenger {challenger_id} (Sharpe {challenger_sharpe}) "
             f"materially beats incumbent {incumbent_id} (Sharpe {incumbent_sharpe}) on the same slot"
         ),
-        payload={
-            "strategy_id": incumbent_id,
-            "current_stage": incumbent_stage,
-            "trigger": "superior_challenger",
-            "challenger_id": challenger_id,
-            "challenger_sharpe": challenger_sharpe,
-            "incumbent_sharpe": incumbent_sharpe,
-            "recommended_action": "dethrone",
-            "recommended_target_stage": recommended_target_stage,
-            "operator_required": True,
-        },
+        payload=payload,
         owner="ceo",
         conn=conn,
     )
@@ -3087,7 +3178,7 @@ def _check_repeated_failure_auto_archive(
                         strategy_id, current_stage, failure_count, gate, reason_code,
                     )
                     return
-                if _is_dethrone_cooldown_active(strategy_id):
+                if dethrone_cooldown_active_until(strategy_id, conn=conn):
                     return
                 approval_id = _queue_dethrone_recommendation(
                     conn=conn,
@@ -3795,7 +3886,14 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
             wfa_pass_rate = 1.0 if wfa_pass_rate else 0.0
         wfa_pass_rate = float(wfa_pass_rate)
         if enforce_wfa and wfa_folds < wfa_thresholds["min_folds"]:
-            return False, f"S00552 REJECT: Walk-forward has {wfa_folds} folds, requires minimum {wfa_thresholds['min_folds']}"
+            # Same evidence-density class as the insufficient_fold_evidence block
+            # above (only N-of-min judgeable folds instead of zero): actionable
+            # re-run, not a merit failure — taxonomy maps it to the counter-exempt
+            # wfa_window_insufficient code.
+            return False, (
+                f"S00552 REJECT: Walk-forward has {wfa_folds} folds, requires minimum "
+                f"{wfa_thresholds['min_folds']}; re-run WFA on the trade-frequency-aware window"
+            )
         # Single source of truth for the WFA fold-pass-rate floor: the same
         # robustness_thresholds.wfa_fold_pass_rate_min the composite scorer uses
         # (_validation_row_passed), so the money gate and the rank score can't

@@ -168,9 +168,16 @@ def test_enrich_backtest_frame_gains_order_flow_columns(tmp_path):
     with _patch_dirs(tmp_path):
         out = dm.enrich(frame, "BTC-USDT", "1h", exclude_streams=("funding", "oi"))
 
-    for col in ("ls_ratio", "taker_buy_sell_ratio", "long_liq_usd", "short_liq_usd", "liq_imbalance"):
+    for col in ("ls_ratio", "taker_buy_sell_ratio"):
         assert col in out.columns, f"order-flow column {col} missing from backtest frame"
         assert out[col].notna().all(), f"{col} has NaNs (sparse columns must be filled, not evict rows)"
+    for col in ("long_liq_usd", "short_liq_usd", "liq_imbalance"):
+        assert col in out.columns, f"order-flow column {col} missing from backtest frame"
+        # Liquidations fill 0.0 only WITHIN coverage (fill_coverage_only): the
+        # first bar predates the stream's first bucket CLOSE and must stay NaN —
+        # blanket zeros before capture start would hand backtests fake data.
+        assert out[col].iloc[0] != out[col].iloc[0], f"{col} pre-coverage bar must be NaN"
+        assert out[col].iloc[1:].notna().all(), f"{col} has NaNs within coverage"
     # No row eviction; IS leg intact.
     assert len(out) == len(frame)
     assert isinstance(out.index, pd.DatetimeIndex)
@@ -240,6 +247,51 @@ def test_enrich_stream_failure_logged_at_warning(tmp_path, caplog):
 
     assert len(out) == len(frame)
     assert any("LSR enrichment skipped" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _filter_backtest_frame_to_window must not strip enrichment columns
+# ---------------------------------------------------------------------------
+
+def test_window_filter_preserves_enrichment_columns():
+    """Optimizer repro (2026-07-07): grid_search pre-loads ENRICHED candles once
+    and re-windows them per trial via _filter_backtest_frame_to_window. The
+    filter used to route through _normalize_backtest_frame's OHLCV-only
+    projection, silently dropping iv_btc/taker/basis/... — aux-data strategies
+    then emitted zero signals and every trial 'Succeeded' with all-zero
+    metrics."""
+    from forven.strategies.backtest import _filter_backtest_frame_to_window
+
+    frame = _backtest_frame(n=500)
+    frame["iv_btc"] = np.linspace(30.0, 80.0, len(frame))
+    frame["taker_buy_sell_ratio"] = 1.0
+
+    out = _filter_backtest_frame_to_window(
+        frame,
+        start_date="2026-01-05",
+        end_date="2026-01-15",
+        warmup_bars=24,
+    )
+
+    assert not out.empty
+    assert "iv_btc" in out.columns, "enrichment column stripped by the window filter"
+    assert "taker_buy_sell_ratio" in out.columns
+    assert out["iv_btc"].notna().all()
+    # Window semantics unchanged: warmup before start, nothing after end.
+    assert out.index[-1] <= pd.Timestamp("2026-01-15", tz="UTC")
+    assert list(out.columns[:5]) == ["open", "high", "low", "close", "volume"]
+
+
+def test_normalize_backtest_frame_default_still_ohlcv_only():
+    """The default projection contract is unchanged for every other caller."""
+    from forven.strategies.backtest import _normalize_backtest_frame
+
+    frame = _backtest_frame()
+    frame["iv_btc"] = 40.0
+
+    out = _normalize_backtest_frame(frame)
+
+    assert list(out.columns) == ["open", "high", "low", "close", "volume"]
 
 
 # ---------------------------------------------------------------------------

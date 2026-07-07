@@ -6,8 +6,8 @@
 	 *  - Agents — EVERY agent (core + strategy-developers, including the Brain):
 	 *    its model + ordered fallback chain. This is the only place an agent's
 	 *    model is set; the Roster shows it read-only.
-	 *  - 5 auxiliary task kinds: compression, recall, skill_extraction,
-	 *    post_mortem, approval — lightweight Brain sub-task models.
+	 *  - 3 auxiliary task kinds: recall, skill_extraction, approval —
+	 *    lightweight Brain sub-task models.
 	 *  - Backup provider — the global safety net when a slot's primary fails.
 	 *  - Per-slot fallback chains + provider priority.
 	 *
@@ -28,7 +28,7 @@
 	 *    key `agent:<id>`.
 	 *  - provider_priority + aux/backup fallback_chains (+ derived primary) → PUT
 	 *    /api/model-policy (updateForvenModelPolicy) — one call.
-	 *  - 5 auxiliary kinds → PUT /api/brain/auxiliary (updateBrainAuxiliary). The
+	 *  - 3 auxiliary kinds → PUT /api/brain/auxiliary (updateBrainAuxiliary). The
 	 *    backend stores a single {provider, model_id} per aux kind; the optional
 	 *    per-slot fallback ordering is persisted alongside in model-policy's
 	 *    fallback_chains under a slot-scoped key (`aux:<kind>` / `backup`) so the
@@ -116,6 +116,63 @@
 	// The model each agent had on load — used to decide whether to PATCH the row.
 	let agentBaseKey: Record<string, string> = {};
 
+	// ---- Bulk "set every agent to one model" -------------------------------- //
+	// The clone-to-all the operator wanted: switching models shouldn't mean
+	// re-picking the dropdown on every agent. Pick a primary model AND an ordered
+	// fallback chain here, hit Apply, and every agent below gets both (the Brain
+	// included — which also derives the default model), marking each changed agent
+	// dirty so the one tab-wide Save persists them together. An EMPTY bulk chain
+	// deliberately leaves each agent's existing fallbacks untouched, so a quick
+	// primary-only swap can never wipe configured chains.
+	let bulkKey = '';
+	let bulkFallbacks: string[] = [];
+
+	function onBulkChange(e: CustomEvent<{ value: string; fallbacks: string[] }>) {
+		bulkKey = e.detail.value;
+		bulkFallbacks = e.detail.fallbacks;
+	}
+
+	function sameChain(a: string[], b: string[]): boolean {
+		return a.length === b.length && a.every((k, i) => k === b[i]);
+	}
+
+	function applyModelToAllAgents() {
+		if (!bulkKey || agentRows.length === 0) return;
+		const applyChain = bulkFallbacks.length > 0;
+		const nextKey = { ...agentKey };
+		const nextFallbacks = { ...agentFallbacks };
+		const nextDirty = { ...agentDirty };
+		let changed = 0;
+		for (const row of agentRows) {
+			const keySame = (nextKey[row.id] ?? '') === bulkKey;
+			const chainSame = !applyChain || sameChain(nextFallbacks[row.id] ?? [], bulkFallbacks);
+			if (keySame && chainSame) continue;
+			nextKey[row.id] = bulkKey;
+			if (applyChain) nextFallbacks[row.id] = [...bulkFallbacks];
+			nextDirty[row.id] = true;
+			changed += 1;
+		}
+		agentKey = nextKey;
+		agentFallbacks = nextFallbacks;
+		agentDirty = nextDirty;
+		if (changed > 0) {
+			const chainNote = applyChain
+				? ` + ${bulkFallbacks.length} fallback${bulkFallbacks.length === 1 ? '' : 's'}`
+				: '';
+			addToast(
+				`Set ${changed} agent${changed === 1 ? '' : 's'} to ${labelForOptionKey(bulkKey)}${chainNote} — review, then Save.`,
+				'success'
+			);
+		} else {
+			addToast(
+				applyChain
+					? 'Every agent already had that model and fallback chain.'
+					: 'Every agent was already on that model.',
+				'info'
+			);
+		}
+	}
+
 	// ---- Brain-derived primary --------------------------------------------- //
 	// The model-policy primary (default for any slot without an explicit model)
 	// is DERIVED from the Brain agent's selection in the Agents section above.
@@ -128,29 +185,67 @@
 	$: brainModelLabel = brainKey ? labelForOptionKey(brainKey) : '';
 
 	// ---- Auxiliary --------------------------------------------------------- //
-	const AUX_KINDS: BrainAuxiliaryTaskKind[] = [
-		'compression',
-		'recall',
-		'skill_extraction',
-		'post_mortem',
-		// `approval` is requested by the spec; the BrainAuxiliaryTaskKind union
-		// in the client may not list it yet, so cast at the boundary.
-		'approval' as BrainAuxiliaryTaskKind,
-	];
+	// Only kinds with a real backend consumer are listed (the historical
+	// "compression" and "post_mortem" slots were removed — nothing read them).
+	const AUX_KINDS: BrainAuxiliaryTaskKind[] = ['recall', 'skill_extraction', 'approval'];
 	const AUX_LABELS: Record<string, string> = {
-		compression: 'Compression',
 		recall: 'Recall',
 		skill_extraction: 'Skill extraction',
-		post_mortem: 'Post-mortem',
 		approval: 'Approval classifier',
 	};
 	const AUX_DESCRIPTIONS: Record<string, string> = {
-		compression: 'Summarizes long context before it hits the primary reasoning model.',
 		recall: 'Re-ranks FTS5 hits and writes the recall summary on /brain/recall.',
 		skill_extraction: 'Distills successful trade patterns into reusable skill cards.',
-		post_mortem: 'Writes the after-action analysis for completed decisions.',
 		approval: 'Classifies pending approvals (auto-approve / escalate / hold).',
 	};
+
+	// Bulk "set every auxiliary task to" — same clone-to-all as the Agents
+	// section: primary + optional chain applied to every aux slot; an empty
+	// chain leaves each slot's existing fallbacks untouched.
+	let bulkAuxKey = '';
+	let bulkAuxFallbacks: string[] = [];
+
+	function onBulkAuxChange(e: CustomEvent<{ value: string; fallbacks: string[] }>) {
+		bulkAuxKey = e.detail.value;
+		bulkAuxFallbacks = e.detail.fallbacks;
+	}
+
+	function applyModelToAllAux() {
+		if (!bulkAuxKey) return;
+		const applyChain = bulkAuxFallbacks.length > 0;
+		const nextKey = { ...auxKey };
+		const nextFallbacks = { ...auxFallbacks };
+		const nextDirty = { ...auxDirty };
+		let changed = 0;
+		for (const kind of AUX_KINDS) {
+			const keySame = (nextKey[kind] ?? '') === bulkAuxKey;
+			const chainSame = !applyChain || sameChain(nextFallbacks[kind] ?? [], bulkAuxFallbacks);
+			if (keySame && chainSame) continue;
+			nextKey[kind] = bulkAuxKey;
+			if (applyChain) nextFallbacks[kind] = [...bulkAuxFallbacks];
+			nextDirty[kind] = true;
+			changed += 1;
+		}
+		auxKey = nextKey;
+		auxFallbacks = nextFallbacks;
+		auxDirty = nextDirty;
+		if (changed > 0) {
+			const chainNote = applyChain
+				? ` + ${bulkAuxFallbacks.length} fallback${bulkAuxFallbacks.length === 1 ? '' : 's'}`
+				: '';
+			addToast(
+				`Set ${changed} auxiliary task${changed === 1 ? '' : 's'} to ${labelForOptionKey(bulkAuxKey)}${chainNote} — review, then Save.`,
+				'success'
+			);
+		} else {
+			addToast(
+				applyChain
+					? 'Every auxiliary task already had that model and fallback chain.'
+					: 'Every auxiliary task was already on that model.',
+				'info'
+			);
+		}
+	}
 
 	let auxKey: Record<string, string> = {};
 	let auxFallbacks: Record<string, string[]> = {};
@@ -476,6 +571,33 @@
 			it read-only. The <span class="text-[#ccc]">Brain's</span> selection also becomes the
 			default model for any routing slot below with no explicit choice.
 		</p>
+		{#if agentRows.length > 0 && !noneSelectable}
+			<div class="space-y-2">
+				<ul>
+					<ModelSlotPicker
+						label="Set every agent to"
+						description="Pick a primary model — and optionally a fallback chain — then apply both to every agent below. An empty chain here leaves each agent's existing fallbacks untouched."
+						value={bulkKey}
+						fallbacks={bulkFallbacks}
+						{selectable}
+						allowUnset
+						unsetLabel="— pick a model —"
+						on:change={onBulkChange}
+					/>
+				</ul>
+				<div class="flex justify-end">
+					<button
+						type="button"
+						on:click={applyModelToAllAgents}
+						disabled={!bulkKey}
+						class="terminal-button text-xs px-3 py-1.5 disabled:opacity-50"
+						title="Set this model (and fallback chain, if one is picked) for every agent below. An empty chain leaves existing chains as-is; nothing saves until you hit Save."
+					>
+						Apply to all {agentRows.length}
+					</button>
+				</div>
+			</div>
+		{/if}
 		{#if agentRows.length === 0}
 			<p class="text-xs text-[#555]">No agents found.</p>
 		{:else}
@@ -520,6 +642,33 @@
 		<p class="text-xs text-[#666]">
 			Lightweight models for specific Brain sub-tasks. Each is independent of the default model.
 		</p>
+		{#if !noneSelectable}
+			<div class="space-y-2">
+				<ul>
+					<ModelSlotPicker
+						label="Set every auxiliary task to"
+						description="Pick a primary model — and optionally a fallback chain — then apply both to every auxiliary task below. An empty chain here leaves each task's existing fallbacks untouched."
+						value={bulkAuxKey}
+						fallbacks={bulkAuxFallbacks}
+						{selectable}
+						allowUnset
+						unsetLabel="— pick a model —"
+						on:change={onBulkAuxChange}
+					/>
+				</ul>
+				<div class="flex justify-end">
+					<button
+						type="button"
+						on:click={applyModelToAllAux}
+						disabled={!bulkAuxKey}
+						class="terminal-button text-xs px-3 py-1.5 disabled:opacity-50"
+						title="Set this model (and fallback chain, if one is picked) for every auxiliary task below. An empty chain leaves existing chains as-is; nothing saves until you hit Save."
+					>
+						Apply to all {AUX_KINDS.length}
+					</button>
+				</div>
+			</div>
+		{/if}
 		<ul class="space-y-3">
 			{#each AUX_KINDS as kind (kind)}
 				<div class="space-y-2">

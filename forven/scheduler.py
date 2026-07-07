@@ -25,6 +25,7 @@ from croniter import croniter
 from forven.model_routing import get_default_model_for_provider
 from forven.db import create_pending_task, get_db, init_db, is_user_active, kv_get, kv_set, kv_set_best_effort, log_activity, reap_long_running_agent_tasks, recover_stale_running_tasks
 from forven.system_pause import is_autonomy_paused, is_generation_paused
+from forven.throughput_policy import THROUGHPUT_DEFAULTS
 from forven.task_timeouts import coerce_stale_recovery_minutes, recommended_agent_reaper_timeout_minutes, recommended_stale_recovery_minutes
 
 
@@ -41,7 +42,13 @@ _DEFAULT_JOB_IDS = {
     "forven-decay-tracker",
     "forven-weekly-review",
     "forven-regime-update",
+    "forven-regime-gate-mtm",
     "forven-slippage-monitor",
+    # SEED-DRIFT-1: these two were seeded but missing from this allowlist, so
+    # every reconcile_forven_jobs run silently DELETED them (the testnet harness
+    # and exec-quality watchdog quietly stopped running until the next reseed).
+    "forven-exec-quality-watchdog",
+    "forven-testnet-harness",
     "forven-scanner-signal",
     "forven-scanner-hourly",
     "forven-recalibration",
@@ -81,6 +88,34 @@ _DEFAULT_JOB_IDS = {
     "forven-phantom-sweep",
     "forven-param-optimization",
 }
+
+# PORT-GATE-1: the portfolio layer's jobs exist only while its master switch is
+# on — seeding them unconditionally would leak the dark feature's existence on
+# the scheduler page. _default_job_ids() folds them in when enabled, so
+# reconcile_forven_jobs REMOVES them when the layer is later disabled and
+# RESTORES them (via reseed) when it's enabled. Flipping the flag takes effect
+# on the next scheduler reconcile or restart.
+_PORTFOLIO_JOB_IDS = {
+    "forven-portfolio-allocation",
+    "forven-basket-funding-carry",
+}
+
+
+def _portfolio_layer_on() -> bool:
+    try:
+        from forven.portfolio_allocator import portfolio_layer_enabled
+
+        return bool(portfolio_layer_enabled())
+    except Exception:
+        return False
+
+
+def _default_job_ids() -> set[str]:
+    if _portfolio_layer_on():
+        return _DEFAULT_JOB_IDS | _PORTFOLIO_JOB_IDS
+    return set(_DEFAULT_JOB_IDS)
+
+
 _SUPERSEDED_CRUCIBLE_AGENT_JOB_IDS = {
     "forven-ideation-daily",
 }
@@ -367,27 +402,30 @@ def _load_runtime_scheduler_tuning() -> dict[str, int | bool]:
             1,
             100,
         ),
+        # Fallbacks come from the shared single-source constants (they used to be
+        # hardcoded 15/15/5 here — dead in practice, since startup seeding persists
+        # the api_core defaults into KV, but drift-prone for the settings UI).
         "ideation_interval_minutes": _coerce_int(
             settings.get("ideation_interval_minutes"),
-            15,
+            THROUGHPUT_DEFAULTS["ideation_interval_minutes"],
             1,
             1440,
         ),
         "coding_interval_minutes": _coerce_int(
             settings.get("coding_interval_minutes"),
-            15,
+            THROUGHPUT_DEFAULTS["coding_interval_minutes"],
             1,
             1440,
         ),
         "testing_interval_minutes": _coerce_int(
             settings.get("testing_interval_minutes"),
-            5,
+            THROUGHPUT_DEFAULTS["testing_interval_minutes"],
             1,
             1440,
         ),
         "graduation_interval_minutes": _coerce_int(
             settings.get("graduation_interval_minutes"),
-            120,
+            THROUGHPUT_DEFAULTS["graduation_interval_minutes"],
             1,
             10080,
         ),
@@ -1496,6 +1534,25 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             log.info("Regime update job refreshed market_pot for %d deployed strategy rows", updated)
             return "ok", None
 
+        # PORT-LAYER-1: measured-risk portfolio allocation snapshot. Internally
+        # flag-gated (no-op unless portfolio_allocator_enabled) and fail-soft.
+        if kind == "portfolio_allocation_refresh":
+            from forven.portfolio_allocator import refresh_portfolio_allocation
+            snapshot = await _run_sync_job(refresh_portfolio_allocation)
+            if snapshot is None:
+                return "ok", "allocator disabled or refresh skipped"
+            return "ok", None
+
+        # PORT-LAYER-2: funding-carry basket forward paper tick. Internally
+        # flag-gated (no-op unless basket_funding_carry_enabled) and fail-soft;
+        # marks/accrues hourly, rebalances on its own cadence (default 24h).
+        if kind == "basket_funding_carry_tick":
+            from forven.basket_runtime import run_basket_tick
+            report = await _run_sync_job(run_basket_tick)
+            if report is None:
+                return "ok", "basket disabled or tick skipped"
+            return "ok", None
+
         # Strategy decay tracker — auto-demote degraded paper/deployed strategies
         if kind == "decay_tracker":
             from forven.monitoring import run_decay_tracker
@@ -1727,6 +1784,20 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             flagged = int(result.get("flagged_count") or 0) if isinstance(result, dict) else 0
             return "ok", (f"{flagged} strategy bucket(s) over cost budget" if flagged else None)
 
+        # Live-graduation recommender — daily paper→live candidate scan; queues
+        # operator approvals only (arming stays in the typed GO-LIVE flow) and
+        # no-ops unless live_graduation_recommender_enabled is set
+        if kind == "live_graduation_scan":
+            from forven.live_graduation import run_live_graduation_scan
+            result = await _run_sync_job(run_live_graduation_scan)
+            if not isinstance(result, dict):
+                return "ok", "recommender disabled"
+            queued = len(result.get("queued") or [])
+            return "ok", (
+                f"{queued} graduation recommendation(s) queued" if queued
+                else f"{result.get('eligible', 0)} eligible of {result.get('scanned', 0)} scanned"
+            )
+
         if kind == "recalibrate":
             try:
                 from forven.recalibrator import check_and_recalibrate
@@ -1759,6 +1830,18 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                 log.error("Testnet execution harness FAILED — see kv forven:testnet_harness:last_run")
                 return "error", "testnet execution harness failed"
             log.info("Testnet execution harness: %s", status)
+            return "ok", None
+
+        # Regime gate MTM follow-up — back-fill mark-to-market on gate ledger
+        # events whose 48h horizon has passed (REGIME-GATE-1 prove-it loop).
+        if kind == "regime_gate_mtm":
+            from forven.regime_gate import evaluate_pending_mtm
+            result = await _run_sync_job(evaluate_pending_mtm)
+            if isinstance(result, dict):
+                log.info(
+                    "Regime gate MTM follow-up: %s evaluated, %s pending",
+                    result.get("evaluated"), result.get("pending"),
+                )
             return "ok", None
 
         # Ghost container scan — detect strategies with missing/broken containers
@@ -1930,7 +2013,7 @@ async def run_job(job: dict) -> tuple[str, str | None]:
 
         # Hyperliquid venue candles for the traded subset (venue-fidelity series)
         if kind == "hl_venue_collect":
-            from forven.dataeng.venue import collect_hl_venue_series
+            from forven.dataeng.venue import collect_hl_funding_snapshot, collect_hl_venue_series
             await _run_sync_job(
                 collect_hl_venue_series,
                 timeout_seconds=_coerce_timeout_seconds(
@@ -1938,6 +2021,13 @@ async def run_job(job: dict) -> tuple[str, str | None]:
                     _DATA_MANAGER_TIMEOUT_DEFAULTS["hl_venue_collect"],
                 ),
             )
+            # PORT-HLFUND-1: one info call snapshots every HL perp's current
+            # hourly funding — the series the HL-native basket ranks/accrues on.
+            # Fail-soft: a funding hiccup must not fail the candle collection.
+            try:
+                await _run_sync_job(collect_hl_funding_snapshot, timeout_seconds=60)
+            except Exception:
+                log.warning("HL funding snapshot failed", exc_info=True)
             return "ok", None
 
         # DataManager — Fear & Greed Index collection
@@ -3125,6 +3215,30 @@ def seed_forven_jobs():
         payload={"kind": "testnet_execution_harness"},
     )
 
+    # PORT-GATE-1: the portfolio layer's jobs are seeded only while its master
+    # switch is on (see _default_job_ids — reconcile removes/restores them when
+    # the flag flips). Each job is additionally no-op unless its own toggle is
+    # enabled, and correlations/panels are cached so the hourly cadence is cheap.
+    if _portfolio_layer_on():
+        add_job(
+            job_id="forven-portfolio-allocation",
+            name="Portfolio Allocation Refresh",
+            schedule_type="interval",
+            schedule_expr="3600000",
+            command="portfolio-allocation",
+            timezone_str="UTC",
+            payload={"kind": "portfolio_allocation_refresh"},
+        )
+        add_job(
+            job_id="forven-basket-funding-carry",
+            name="Funding-Carry Basket Paper Tick",
+            schedule_type="interval",
+            schedule_expr="3600000",
+            command="basket-funding-carry",
+            timezone_str="UTC",
+            payload={"kind": "basket_funding_carry_tick"},
+        )
+
     # 5. Regime + Market Pot refresh — every 4 hours
     add_job(
         job_id="forven-regime-update",
@@ -3138,6 +3252,19 @@ def seed_forven_jobs():
             "provider": "openai",
             "model": default_openai_model,
         },
+    )
+
+    # 5.1. Regime gate MTM follow-up — every 30 minutes. Stamps blocked (or
+    # would-have-blocked) entries with the return they'd have made ~48h later,
+    # so the Risk page's gate panel proves the gate with data, not faith.
+    add_job(
+        job_id="forven-regime-gate-mtm",
+        name="Regime Gate MTM Follow-Up",
+        schedule_type="interval",
+        schedule_expr="1800000",
+        command="regime-gate-mtm",
+        timezone_str="UTC",
+        payload={"kind": "regime_gate_mtm"},
     )
 
     # 5.5. Execution Slippage Monitor — Every 30 minutes
@@ -3169,6 +3296,19 @@ def seed_forven_jobs():
             "lookback_days": 30,
             "min_trades": 5,
         },
+    )
+
+    # 5.5c. Live-Graduation Recommender — daily paper→live candidate scan.
+    # Recommendation-only (operator approval + typed GO-LIVE arming stay in
+    # charge); the job no-ops unless live_graduation_recommender_enabled is set.
+    add_job(
+        job_id="forven-live-graduation-scan",
+        name="Live Graduation Recommender",
+        schedule_type="cron",
+        schedule_expr="45 6 * * *",
+        command="live-graduation-scan",
+        timezone_str="UTC",
+        payload={"kind": "live_graduation_scan"},
     )
 
     # 5.6. Adaptive regime recalibration — Every 30 minutes
@@ -3571,6 +3711,10 @@ def reconcile_forven_jobs() -> dict[str, int]:
         {"removed": <count>, "added": <count>}
     """
     removed = 0
+    # PORT-GATE-1: expected ids are dynamic — the portfolio layer's jobs count
+    # as defaults only while its master switch is on, so disabling the layer
+    # reaps its jobs here and re-enabling restores them via the reseed below.
+    expected_ids = _default_job_ids()
     with get_db() as conn:
         existing = {row["id"] for row in conn.execute("SELECT id FROM scheduler_jobs")}
         stale_jobs = [
@@ -3580,7 +3724,7 @@ def reconcile_forven_jobs() -> dict[str, int]:
                 job_id.startswith(_LEGACY_DEFAULT_JOB_PREFIXES)
                 or (
                     job_id.startswith("forven-")
-                    and job_id not in _DEFAULT_JOB_IDS
+                    and job_id not in expected_ids
                 )
             )
         ]
@@ -3593,7 +3737,7 @@ def reconcile_forven_jobs() -> dict[str, int]:
 
     with get_db() as conn:
         current_ids = {row["id"] for row in conn.execute("SELECT id FROM scheduler_jobs")}
-    missing = _DEFAULT_JOB_IDS.difference(current_ids)
+    missing = expected_ids.difference(current_ids)
 
     if missing:
         # Full reseed keeps deterministic defaults and restores any removed core jobs.
