@@ -293,7 +293,50 @@ def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, 
         "cost": round(cost, 8),
         "positions": len(state["weights"]),
     })
+    _check_beta_drift(state)
     return state, report
+
+
+# Beta-drift watch: the basket's PnL is supposed to be COLLECTED FEES, not
+# price bets. When price PnL dominates over a meaningful window, the edge is
+# decaying (or the book stopped being neutral) — the operator must hear it
+# without staring at the page.
+BETA_DRIFT_WINDOW_TICKS = 24 * 7  # trailing week of hourly ticks
+BETA_DRIFT_MIN_TICKS = 48  # don't judge on noise
+BETA_DRIFT_FUNDING_SHARE_FLOOR = 0.5
+
+
+def _check_beta_drift(state: dict) -> None:
+    try:
+        history = (state.get("history") or [])[-BETA_DRIFT_WINDOW_TICKS:]
+        active = [h for h in history if h.get("funding_pnl") or h.get("price_pnl")]
+        if len(active) < BETA_DRIFT_MIN_TICKS:
+            return
+        funding_abs = sum(abs(float(h.get("funding_pnl", 0.0))) for h in active)
+        price_abs = sum(abs(float(h.get("price_pnl", 0.0))) for h in active)
+        gross = funding_abs + price_abs
+        if gross <= 0:
+            return
+        funding_share = funding_abs / gross
+        if funding_share >= BETA_DRIFT_FUNDING_SHARE_FLOOR:
+            return
+        from forven.notifications import emit_notification
+
+        emit_notification(
+            "risk_alert",
+            severity="warn",
+            source="basket_runtime",
+            title="Funding-carry basket drifting toward beta",
+            summary=(
+                f"Over the trailing {len(active)} active ticks, funding is only "
+                f"{funding_share:.0%} of gross PnL (floor {BETA_DRIFT_FUNDING_SHARE_FLOOR:.0%}) — "
+                "returns are coming from price moves, not collected fees. The carry "
+                "edge may be decaying; do not arm (or consider disarming) live execution."
+            ),
+            dedupe_key="basket_beta_drift",
+        )
+    except Exception:
+        log.debug("beta-drift check failed", exc_info=True)
 
 
 def _accrue_funding(weights: dict, panel, prev_tick_iso: str | None, now: datetime) -> float:

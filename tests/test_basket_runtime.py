@@ -285,3 +285,65 @@ def test_summary_exposes_carry_universe_and_cadence(forven_db, monkeypatch):
     assert summary["config"]["rebalance_hours"] == 24.0
     assert len(summary["recent_ticks"]) == 1 and summary["recent_ticks"][0]["rebalanced"]
     basket_runtime.reset_basket_state()
+
+
+# --------------------------------------------------------------- beta drift
+
+
+def test_beta_drift_alert_fires_when_price_dominates(forven_db, monkeypatch):
+    from forven import basket_runtime
+
+    emitted = []
+    import forven.notifications as notifications
+
+    monkeypatch.setattr(
+        notifications, "emit_notification",
+        lambda event_type, **kw: emitted.append((event_type, kw)) or {},
+    )
+    state = _fresh_state("x")
+    # A week of ticks where price PnL dwarfs funding.
+    state["history"] = [
+        {"t": f"h{i}", "equity": 1.0, "funding_pnl": 0.0001, "price_pnl": 0.002, "cost": 0.0}
+        for i in range(60)
+    ]
+    basket_runtime._check_beta_drift(state)
+    assert emitted and emitted[0][0] == "risk_alert"
+    assert "drifting toward beta" in emitted[0][1]["title"]
+
+
+def test_beta_drift_silent_when_funding_dominates(forven_db, monkeypatch):
+    from forven import basket_runtime
+
+    emitted = []
+    import forven.notifications as notifications
+
+    monkeypatch.setattr(
+        notifications, "emit_notification",
+        lambda event_type, **kw: emitted.append((event_type, kw)) or {},
+    )
+    state = _fresh_state("x")
+    state["history"] = [
+        {"t": f"h{i}", "equity": 1.0, "funding_pnl": 0.002, "price_pnl": 0.0001, "cost": 0.0}
+        for i in range(60)
+    ]
+    basket_runtime._check_beta_drift(state)
+    assert emitted == []
+
+
+def test_beta_drift_needs_minimum_history(forven_db, monkeypatch):
+    from forven import basket_runtime
+
+    emitted = []
+    import forven.notifications as notifications
+
+    monkeypatch.setattr(
+        notifications, "emit_notification",
+        lambda event_type, **kw: emitted.append((event_type, kw)) or {},
+    )
+    state = _fresh_state("x")
+    state["history"] = [
+        {"t": f"h{i}", "equity": 1.0, "funding_pnl": 0.0001, "price_pnl": 0.002, "cost": 0.0}
+        for i in range(10)  # below BETA_DRIFT_MIN_TICKS
+    ]
+    basket_runtime._check_beta_drift(state)
+    assert emitted == []
