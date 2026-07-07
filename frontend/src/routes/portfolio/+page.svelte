@@ -1,12 +1,16 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import {
+		armBasketLive,
+		disarmBasketLive,
+		getBasketLive,
 		getPortfolioAllocation,
 		getPortfolioBasket,
 		getPortfolioLayerEnabled,
 		refreshPortfolioAllocation,
 		resetPortfolioBasket,
 		tickPortfolioBasket,
+		type BasketLiveStatus,
 		type BasketSummary,
 		type PortfolioAllocationResponse,
 	} from '$lib/api/portfolio';
@@ -17,6 +21,49 @@
 
 	let basket: BasketSummary | null = null;
 	let allocation: PortfolioAllocationResponse | null = null;
+	let live: BasketLiveStatus | null = null;
+	let armWallet = '';
+	let armCapital = 500;
+	let armPhrase = '';
+	let armBusy = false;
+	let disarmBusy = false;
+	let confirmingFlatten = false;
+
+	async function doArm() {
+		armBusy = true;
+		actionMessage = '';
+		try {
+			await armBasketLive(armPhrase, armCapital, armWallet);
+			actionMessage = 'Live execution ARMED — the next tick reconciles the wallet.';
+			armPhrase = '';
+			await load();
+		} catch (e) {
+			actionMessage = `Arming refused: ${e instanceof Error ? e.message : e}`;
+		} finally {
+			armBusy = false;
+		}
+	}
+
+	async function doDisarm(flatten: boolean) {
+		if (flatten && !confirmingFlatten) {
+			confirmingFlatten = true;
+			return;
+		}
+		confirmingFlatten = false;
+		disarmBusy = true;
+		actionMessage = '';
+		try {
+			await disarmBasketLive(flatten);
+			actionMessage = flatten
+				? 'Disarmed and flattened — every wallet position was closed reduce-only.'
+				: 'Disarmed — positions left in the wallet; use Disarm + flatten to close them.';
+			await load();
+		} catch (e) {
+			actionMessage = `Disarm failed: ${e instanceof Error ? e.message : e}`;
+		} finally {
+			disarmBusy = false;
+		}
+	}
 	let loading = true;
 	let error = '';
 	let actionMessage = '';
@@ -37,9 +84,14 @@
 				loading = false;
 				return;
 			}
-			const [b, a] = await Promise.all([getPortfolioBasket(), getPortfolioAllocation()]);
+			const [b, a, lv] = await Promise.all([
+				getPortfolioBasket(),
+				getPortfolioAllocation(),
+				getBasketLive().catch(() => null),
+			]);
 			basket = b;
 			allocation = a;
+			live = lv;
 			error = '';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -147,6 +199,10 @@
 	);
 	$: measuredCount = snapshot?.book?.measured_strategies ?? 0;
 	$: virtualBook = snapshot?.book?.virtual ?? null;
+	$: forwardBook = snapshot?.book?.forward ?? null;
+	$: forwardCurve = ((forwardBook?.curve ?? []) as Array<{ t: string; equity: number }>).map(
+		(pnt): EquityPoint => ({ timestamp: pnt.t, equity: pnt.equity })
+	);
 
 	const fmtPct = (v: number | null | undefined, digits = 2) =>
 		v === null || v === undefined || Number.isNaN(v) ? '—' : `${(v * 100).toFixed(digits)}%`;
@@ -160,6 +216,40 @@
 			return iso;
 		}
 	};
+
+	// --- reference capital: render fractions as money ------------------------
+	// The engine works in fractions of 1.0 (so results scale to any capital),
+	// but fractions read as noise. Everything renders in dollars at a
+	// reference capital the operator picks; the underlying math is untouched.
+	let referenceCapital = 10_000;
+	onMount(() => {
+		const saved = localStorage.getItem('portfolio.referenceCapital');
+		if (saved && Number(saved) > 0) referenceCapital = Number(saved);
+	});
+	$: if (typeof localStorage !== 'undefined' && referenceCapital > 0) {
+		localStorage.setItem('portfolio.referenceCapital', String(referenceCapital));
+	}
+	const fmtUsd = (fraction: number | null | undefined, digits = 2) => {
+		if (fraction === null || fraction === undefined || Number.isNaN(fraction)) return '—';
+		const usd = fraction * referenceCapital;
+		const abs = Math.abs(usd);
+		const shown = abs >= 1000 ? usd.toLocaleString(undefined, { maximumFractionDigits: 0 }) : usd.toFixed(digits);
+		return `${usd < 0 ? '−' : ''}$${shown.replace('-', '')}`;
+	};
+
+	// Plain-language "what happened" over the last ~24h of ticks.
+	$: last24 = (basket?.recent_ticks ?? []).filter(
+		(t) => Date.now() - new Date(t.t).getTime() < 24 * 3_600_000
+	);
+	$: day = last24.reduce(
+		(acc, t) => ({
+			funding: acc.funding + t.funding_pnl,
+			price: acc.price + t.price_pnl,
+			cost: acc.cost + t.cost,
+			rebalances: acc.rebalances + (t.rebalanced ? 1 : 0),
+		}),
+		{ funding: 0, price: 0, cost: 0, rebalances: 0 }
+	);
 </script>
 
 <svelte:head>
@@ -171,11 +261,23 @@
 		<div>
 			<h1 class="text-lg font-bold uppercase tracking-wider text-white">Portfolio</h1>
 			<p class="text-[11px] text-[#666]">
-				The book above the strategies: measured-risk allocation and basket products. Paper
-				sandboxes are never scaled — everything here proves itself virtually before touching
-				live sizing.
+				The book above the strategies: measured-risk allocation across your strategy team, and
+				basket products run directly at the portfolio level. Everything proves itself on paper
+				before it can touch real sizing.
 			</p>
 		</div>
+		<label class="flex items-center gap-2 text-[11px] text-[#666] shrink-0">
+			Show amounts as if running
+			<span class="flex items-center border border-[#333] bg-[#0a0a0a] px-2 py-1">
+				$<input
+					type="number"
+					bind:value={referenceCapital}
+					min="100"
+					step="1000"
+					class="w-24 bg-transparent text-right text-white outline-none"
+				/>
+			</span>
+		</label>
 	</div>
 
 	{#if error}
@@ -244,28 +346,42 @@
 					</div>
 				{/if}
 
+				<!-- plain-language day summary: the sentence a person actually wants -->
+				{#if last24.length > 0}
+					<div class="border border-[#1a2438] bg-[#050a12] px-3 py-2 text-[11px] text-[#9ab]">
+						<span class="font-bold text-white">Last 24h:</span>
+						collected <span class="text-emerald-400">{fmtUsd(day.funding)}</span> in funding,
+						<span class={day.price >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtUsd(day.price)}</span> from price moves,
+						<span class="text-red-300">{day.cost > 0 ? `−${fmtUsd(day.cost)}` : '$0.00'}</span> in costs
+						{#if day.rebalances > 0}· rebalanced {day.rebalances}×{/if}
+						<span class="text-[#556]"> (at ${referenceCapital.toLocaleString()} reference)</span>
+					</div>
+				{/if}
+
 				<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 text-center">
-					<div class="border border-[#222] bg-[#0a0a0a] p-2">
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Equity</div>
-						<div class="text-base font-bold text-white">{fmtNum(basket.equity, 5)}</div>
+					<div class="border border-[#222] bg-[#0a0a0a] p-2" title="The paper account's value at your reference capital. It started at exactly the reference amount.">
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Book value</div>
+						<div class="text-base font-bold text-white">{fmtUsd(basket.equity ?? 1)}</div>
 					</div>
 					<div class="border border-[#222] bg-[#0a0a0a] p-2">
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Total return</div>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Total P&L</div>
 						<div
 							class={`text-base font-bold ${(basket.total_return_pct ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
 						>
-							{fmtNum(basket.total_return_pct, 3)}%
+							{fmtUsd((basket.equity ?? 1) - 1)}
+							<span class="block text-[10px] font-normal text-[#666]">{fmtNum(basket.total_return_pct, 3)}%</span>
 						</div>
 					</div>
 					<div
 						class="border border-[#222] bg-[#0a0a0a] p-2"
-						title="Sum of −weight × current funding across the legs, annualized — what the book earns if rates and prices hold. The reason this basket exists."
+						title="What the book earns per year if funding rates and prices hold — the fees it collects for taking the unpopular side. The reason this basket exists."
 					>
-						<div class="text-[10px] uppercase tracking-wider text-[#666]">Expected carry /yr</div>
+						<div class="text-[10px] uppercase tracking-wider text-[#666]">Expected income /yr</div>
 						<div
 							class={`text-base font-bold ${(basket.expected_carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
 						>
-							{fmtPct(basket.expected_carry_annualized, 1)}
+							{fmtUsd(basket.expected_carry_annualized)}
+							<span class="block text-[10px] font-normal text-[#666]">{fmtPct(basket.expected_carry_annualized, 1)}</span>
 						</div>
 					</div>
 					<div class="border border-[#222] bg-[#0a0a0a] p-2">
@@ -325,21 +441,21 @@
 						{/if}
 					</div>
 					<div class="grid grid-cols-3 gap-2 text-center text-[11px]">
-						<div class="border border-[#222] bg-[#0a0a0a] p-2">
-							<div class="text-[#666]">Funding</div>
+						<div class="border border-[#222] bg-[#0a0a0a] p-2" title="Fees collected from (or paid to) the other side of the market — the income this basket exists to harvest. Should dominate.">
+							<div class="text-[#666]">Fees collected (funding)</div>
 							<div class={decomposition.funding >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-								{fmtNum(decomposition.funding, 6)}
+								{fmtUsd(decomposition.funding)}
 							</div>
 						</div>
-						<div class="border border-[#222] bg-[#0a0a0a] p-2">
-							<div class="text-[#666]">Price</div>
+						<div class="border border-[#222] bg-[#0a0a0a] p-2" title="Profit or loss from prices moving. The long and short sides mostly cancel — this should stay small relative to funding.">
+							<div class="text-[#666]">Price moves</div>
 							<div class={decomposition.price >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-								{fmtNum(decomposition.price, 6)}
+								{fmtUsd(decomposition.price)}
 							</div>
 						</div>
-						<div class="border border-[#222] bg-[#0a0a0a] p-2">
-							<div class="text-[#666]">Costs</div>
-							<div class="text-red-300">−{fmtNum(decomposition.cost, 6)}</div>
+						<div class="border border-[#222] bg-[#0a0a0a] p-2" title="Simulated trading fees + slippage paid at each rebalance.">
+							<div class="text-[#666]">Trading costs</div>
+							<div class="text-red-300">−{fmtUsd(decomposition.cost)}</div>
 						</div>
 					</div>
 				</div>
@@ -350,7 +466,7 @@
 					<div>
 						<div class="flex items-baseline justify-between mb-1">
 							<span class="text-[10px] uppercase tracking-wider text-emerald-500">Long (lowest funding)</span>
-							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · carry /yr</span>
+							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · earns /yr</span>
 						</div>
 						{#each longLegs as leg (leg.symbol)}
 							<div
@@ -363,10 +479,10 @@
 										{fmtPct(annualizeHourly(leg.funding_rate_hourly), 1)}
 									</span>
 									<span
-										class={`w-14 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
-										title="This leg's expected carry contribution, annualized"
+										class={`w-20 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+										title="What this leg earns per year at current rates, at your reference capital"
 									>
-										{fmtPct(leg.carry_annualized, 1)}
+										{leg.carry_annualized !== null ? fmtUsd(leg.carry_annualized) : '—'}
 									</span>
 								</span>
 							</div>
@@ -377,7 +493,7 @@
 					<div>
 						<div class="flex items-baseline justify-between mb-1">
 							<span class="text-[10px] uppercase tracking-wider text-red-500">Short (highest funding)</span>
-							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · carry /yr</span>
+							<span class="text-[9px] uppercase tracking-wider text-[#555]">weight · funding /yr · earns /yr</span>
 						</div>
 						{#each shortLegs as leg (leg.symbol)}
 							<div
@@ -390,10 +506,10 @@
 										{fmtPct(annualizeHourly(leg.funding_rate_hourly), 1)}
 									</span>
 									<span
-										class={`w-14 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
-										title="This leg's expected carry contribution, annualized"
+										class={`w-20 text-right ${(leg.carry_annualized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+										title="What this leg earns per year at current rates, at your reference capital"
 									>
-										{fmtPct(leg.carry_annualized, 1)}
+										{leg.carry_annualized !== null ? fmtUsd(leg.carry_annualized) : '—'}
 									</span>
 								</span>
 							</div>
@@ -423,15 +539,15 @@
 									{#each recentTicks as tick (tick.t)}
 										<tr class="border-b border-[#151515] text-[#999]">
 											<td class="py-1 pr-2">{fmtWhen(tick.t)}</td>
-											<td class="py-1 pr-2 text-right text-[#bbb]">{fmtNum(tick.equity, 5)}</td>
+											<td class="py-1 pr-2 text-right text-[#bbb]">{fmtUsd(tick.equity)}</td>
 											<td class={`py-1 pr-2 text-right ${tick.funding_pnl > 0 ? 'text-emerald-400' : tick.funding_pnl < 0 ? 'text-red-400' : 'text-[#555]'}`}>
-												{fmtPct(tick.funding_pnl, 4)}
+												{tick.funding_pnl !== 0 ? fmtUsd(tick.funding_pnl) : '—'}
 											</td>
 											<td class={`py-1 pr-2 text-right ${tick.price_pnl > 0 ? 'text-emerald-400' : tick.price_pnl < 0 ? 'text-red-400' : 'text-[#555]'}`}>
-												{fmtPct(tick.price_pnl, 4)}
+												{tick.price_pnl !== 0 ? fmtUsd(tick.price_pnl) : '—'}
 											</td>
 											<td class={`py-1 pr-2 text-right ${tick.cost > 0 ? 'text-red-300' : 'text-[#555]'}`}>
-												{tick.cost > 0 ? `−${fmtPct(tick.cost, 4)}` : '—'}
+												{tick.cost > 0 ? `−${fmtUsd(tick.cost)}` : '—'}
 											</td>
 											<td class="py-1 text-right">
 												{#if tick.rebalanced}
@@ -466,6 +582,118 @@
 				</button>
 				{#if confirmingReset}
 					<button class="text-[11px] text-[#666] hover:text-[#888]" on:click={() => (confirmingReset = false)}>cancel</button>
+				{/if}
+			</div>
+
+			<!-- ─────────────── live execution (real money, behind arming) ─────────────── -->
+			<div class={`border p-3 space-y-3 ${live?.armed ? 'border-red-800 bg-[#0a0505]' : 'border-[#222] bg-[#070707]'}`}>
+				<div class="flex items-center justify-between">
+					<div>
+						<h3 class="text-xs font-bold uppercase tracking-wider text-white">
+							Live execution
+							{#if live?.armed}
+								<span class="ml-2 text-[10px] px-2 py-0.5 border border-red-700 text-red-400">ARMED — ${Number(live.capital_usd ?? 0).toLocaleString()} in wallet “{live.wallet_label}”</span>
+							{:else}
+								<span class="ml-2 text-[10px] px-2 py-0.5 border border-[#333] text-[#666]">Not armed — paper only</span>
+							{/if}
+						</h3>
+						<p class="text-[11px] text-[#666]">
+							When armed, each tick mirrors the paper book into a dedicated wallet with real
+							orders: increases go through the liquidity guard, reductions are reduce-only,
+							every order is ceiling-checked and logged below. Losses are confined to that
+							wallet's capital.
+						</p>
+					</div>
+				</div>
+
+				{#if live?.armed}
+					{#if live.last_reconcile}
+						<div class="text-[11px] text-[#888]">
+							Last reconcile {fmtWhen(live.last_reconcile.t)}:
+							<span class="text-emerald-400">{live.last_reconcile.orders_ok} orders ok</span>
+							{#if live.last_reconcile.orders_failed > 0}
+								· <span class="text-red-400">{live.last_reconcile.orders_failed} failed</span>
+							{/if}
+							{#if live.last_reconcile.unlistable > 0}
+								· <span class="text-yellow-500">{live.last_reconcile.unlistable} leg(s) not listed on the venue</span>
+							{/if}
+						</div>
+					{/if}
+					<div class="flex items-center gap-2">
+						<button
+							class="border border-[#333] bg-[#111] px-3 py-1.5 text-xs text-[#aaa] hover:bg-[#1a1a1a] disabled:opacity-50"
+							on:click={() => doDisarm(false)}
+							disabled={disarmBusy}
+						>
+							Disarm (leave positions)
+						</button>
+						<button
+							class={`border px-3 py-1.5 text-xs disabled:opacity-50 ${confirmingFlatten ? 'border-red-700 bg-red-950 text-red-300' : 'border-red-900 bg-[#150808] text-red-400 hover:bg-[#1f0a0a]'}`}
+							on:click={() => doDisarm(true)}
+							disabled={disarmBusy}
+						>
+							{confirmingFlatten ? 'Click again: close ALL wallet positions' : 'Disarm + flatten'}
+						</button>
+						{#if confirmingFlatten}
+							<button class="text-[11px] text-[#666] hover:text-[#888]" on:click={() => (confirmingFlatten = false)}>cancel</button>
+						{/if}
+					</div>
+				{:else}
+					<div class="grid grid-cols-1 md:grid-cols-4 gap-2 items-end text-[11px]">
+						<label class="space-y-1">
+							<span class="text-[#666] uppercase text-[10px] tracking-wider">Dedicated wallet label</span>
+							<input
+								type="text"
+								bind:value={armWallet}
+								placeholder="e.g. basket"
+								class="w-full border border-[#333] bg-[#0a0a0a] px-2 py-1.5 text-white outline-none"
+							/>
+						</label>
+						<label class="space-y-1">
+							<span class="text-[#666] uppercase text-[10px] tracking-wider">Capital (USD)</span>
+							<input
+								type="number"
+								bind:value={armCapital}
+								min="50"
+								step="50"
+								class="w-full border border-[#333] bg-[#0a0a0a] px-2 py-1.5 text-white outline-none"
+							/>
+						</label>
+						<label class="space-y-1">
+							<span class="text-[#666] uppercase text-[10px] tracking-wider">Type GO LIVE to confirm</span>
+							<input
+								type="text"
+								bind:value={armPhrase}
+								placeholder="GO LIVE"
+								class="w-full border border-[#333] bg-[#0a0a0a] px-2 py-1.5 text-white outline-none"
+							/>
+						</label>
+						<button
+							class="border border-red-900 bg-[#150808] px-3 py-1.5 text-xs text-red-400 hover:bg-[#1f0a0a] disabled:opacity-40"
+							on:click={doArm}
+							disabled={armBusy || armPhrase.trim().toUpperCase() !== 'GO LIVE' || !armWallet.trim() || armCapital <= 0}
+						>
+							{armBusy ? 'Arming…' : 'ARM LIVE EXECUTION'}
+						</button>
+					</div>
+					<p class="text-[10px] text-[#555]">
+						Requires a registered named wallet with no other trades in it (Settings →
+						HyperLiquid → Wallets). Recommendation: don't arm until the paper book has weeks of
+						evidence and its funding share stays dominant.
+					</p>
+				{/if}
+
+				{#if (live?.ledger ?? []).length > 0}
+					<details class="text-[11px]">
+						<summary class="cursor-pointer text-[#666] hover:text-[#888] uppercase text-[10px] tracking-wider">Execution ledger ({(live?.ledger ?? []).length} recent)</summary>
+						<div class="mt-1 space-y-0.5 max-h-48 overflow-y-auto">
+							{#each live?.ledger ?? [] as entry}
+								<div class="text-[#777] font-mono text-[10px] border-b border-[#141414] py-0.5">
+									{JSON.stringify(entry)}
+								</div>
+							{/each}
+						</div>
+					</details>
 				{/if}
 			</div>
 		</div>
@@ -536,6 +764,36 @@
 						closes before they earn a measured multiplier. Everything sizes at the neutral 1.0
 						until then.
 					</div>
+				{/if}
+
+				{#if forwardBook && (forwardBook.active_days ?? 0) > 0}
+					<div class="space-y-1">
+						<div class="text-[10px] uppercase tracking-wider text-emerald-600">
+							Walk-forward book — the honest track record
+							<span class="normal-case text-[#557]">(each day weighted by multipliers published BEFORE it — out-of-sample since {forwardBook.since})</span>
+						</div>
+						<div class="grid grid-cols-3 gap-2 text-[11px] text-center">
+							<div class="border border-[#1c2b1c] bg-[#050805] p-2">
+								<div class="text-[#666]">Return</div>
+								<div class={(forwardBook.total_return ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+									{fmtUsd(forwardBook.total_return)} <span class="text-[#666]">({fmtPct(forwardBook.total_return)})</span>
+								</div>
+							</div>
+							<div class="border border-[#1c2b1c] bg-[#050805] p-2">
+								<div class="text-[#666]">Sharpe</div>
+								<div class="text-[#aaa]">{fmtNum(forwardBook.sharpe)}</div>
+							</div>
+							<div class="border border-[#1c2b1c] bg-[#050805] p-2">
+								<div class="text-[#666]">Max drawdown</div>
+								<div class="text-red-300">{fmtPct(forwardBook.max_drawdown)}</div>
+							</div>
+						</div>
+						{#if forwardCurve.length > 2}
+							<EquityChart data={forwardCurve} height={160} showDrawdown={false} />
+						{/if}
+					</div>
+				{:else if forwardBook?.note}
+					<div class="text-[11px] text-[#556]">{forwardBook.note}</div>
 				{/if}
 
 				{#if virtualBook?.weighted}

@@ -38,6 +38,15 @@ export interface PortfolioAllocationSnapshot {
 			flat_baseline?: PortfolioVirtualBookStats;
 			note?: string;
 		};
+		forward?: {
+			total_return?: number;
+			max_drawdown?: number;
+			sharpe?: number | null;
+			active_days?: number;
+			since?: string;
+			curve?: Array<{ t: string; equity: number }>;
+			note?: string;
+		};
 	};
 }
 
@@ -128,5 +137,45 @@ export async function resetPortfolioBasket(): Promise<{ ok: boolean }> {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ confirm: true }),
+	});
+}
+
+export interface BasketLiveStatus {
+	ok: boolean;
+	armed: boolean;
+	capital_usd?: number | null;
+	wallet_label?: string | null;
+	armed_at?: string | null;
+	disarmed_at?: string | null;
+	last_reconcile?: {
+		t: string;
+		orders_ok: number;
+		orders_failed: number;
+		unlistable: number;
+	} | null;
+	ledger?: Array<Record<string, unknown>>;
+}
+
+export async function getBasketLive(): Promise<BasketLiveStatus> {
+	return fetchApi('/api/portfolio/basket/live');
+}
+
+export async function armBasketLive(
+	confirm: string,
+	capitalUsd: number,
+	wallet: string
+): Promise<{ ok: boolean; arming: Record<string, unknown> }> {
+	return fetchApi('/api/portfolio/basket/golive', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ confirm, capital_usd: capitalUsd, wallet }),
+	});
+}
+
+export async function disarmBasketLive(flatten: boolean): Promise<{ ok: boolean }> {
+	return fetchApi('/api/portfolio/basket/disarm', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ flatten }),
 	});
 }
