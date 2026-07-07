@@ -89,6 +89,14 @@ def _funding_interval_hours(symbol: str) -> float:
     onto hourly bars unchanged. The panel contract is a PER-HOUR column, so
     the raw rate must be divided by its interval. Derive the interval from
     the raw history's median row spacing; fail conservative to 8h.
+
+    NOTE: this whole-file median is only the FALLBACK path — a single divisor
+    is silently wrong on files with mixed cadences (2026-07-07 incident: a
+    keepalive backfill flipped the measured cadence mid-day and per-8h rates
+    were accrued hourly, ~8x funding inflation plus a corrupted
+    cross-sectional ranking). build_panel now converts PER PRINT via
+    _per_hour_funding_series and only falls back here when the raw file is
+    unusable.
     """
     try:
         from forven.data import symbol_to_fs
@@ -105,6 +113,51 @@ def _funding_interval_hours(symbol: str) -> float:
         return float(hours) if 1 <= hours <= 24 else DEFAULT_FUNDING_INTERVAL_HOURS
     except Exception:
         return DEFAULT_FUNDING_INTERVAL_HOURS
+
+
+def _per_hour_funding_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series | None:
+    """Per-hour funding aligned to ``index``, converted PER PRINT.
+
+    A print at t is the rate for the interval ENDING at the next print, so
+    each rate is divided by ITS OWN interval (gap to the following print,
+    clamped to [1h, 24h]; the last print uses the file median). This stays
+    correct when a file carries mixed cadences — the failure mode a single
+    whole-file divisor cannot survive.
+    """
+    try:
+        from forven.data import symbol_to_fs
+        from forven.data_manager import FUNDING_DIR
+
+        path = FUNDING_DIR / symbol_to_fs(symbol) / "history.parquet"
+        if not path.exists():
+            return None
+        raw = pd.read_parquet(path)
+        if raw.empty or "timestamp" not in raw.columns or "funding_rate" not in raw.columns:
+            return None
+        frame = pd.DataFrame(
+            {
+                "ts": pd.to_datetime(raw["timestamp"], utc=True, errors="coerce"),
+                "rate": pd.to_numeric(raw["funding_rate"], errors="coerce"),
+            }
+        ).dropna()
+        if frame.empty:
+            return None
+        frame = frame.sort_values("ts").drop_duplicates("ts", keep="last")
+        hours = (frame["ts"].shift(-1) - frame["ts"]).dt.total_seconds() / 3600.0
+        median = float(hours.median()) if hours.notna().any() else DEFAULT_FUNDING_INTERVAL_HOURS
+        if not (1.0 <= median <= 24.0):
+            median = DEFAULT_FUNDING_INTERVAL_HOURS
+        hours = hours.fillna(median).clip(1.0, 24.0)
+        # Keep the tz-aware index (``.values`` would strip UTC and make the
+        # reindex against the tz-aware panel index raise).
+        per_hour = pd.Series(
+            (frame["rate"] / hours).values,
+            index=pd.DatetimeIndex(frame["ts"]).as_unit("ns"),
+        )
+        return per_hour.reindex(pd.DatetimeIndex(index).as_unit("ns"), method="ffill")
+    except Exception:
+        log.debug("per-print funding conversion failed for %s", symbol, exc_info=True)
+        return None
 
 
 def build_panel(
@@ -166,7 +219,12 @@ def build_panel(
         closes[sym] = enriched["close"]
         # Stored Binance funding is the per-SETTLEMENT rate ffilled hourly;
         # the panel contract (and every accrual downstream) is per-hour.
-        fundings[sym] = enriched["funding_rate"] / _funding_interval_hours(sym)
+        # Convert PER PRINT (each rate over its own interval) — a single
+        # whole-file divisor mis-scales every mixed-cadence file (2026-07-07).
+        per_hour = _per_hour_funding_series(sym, enriched.index)
+        if per_hour is None or per_hour.notna().sum() == 0:
+            per_hour = enriched["funding_rate"] / _funding_interval_hours(sym)
+        fundings[sym] = per_hour
         for col in extra_columns:
             if col in enriched.columns:
                 extras[col][sym] = enriched[col]

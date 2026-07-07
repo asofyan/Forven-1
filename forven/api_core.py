@@ -6167,16 +6167,25 @@ def _persist_backtest_result_row(
     if not normalized_strategy_id:
         raise ValueError("strategy_id is required")
 
+    from forven.data_provenance import stamp_data_fingerprint
     from forven.engine_provenance import stamp_engine_version
 
-    metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
-    config_json = json.dumps(stamp_engine_version(config), separators=(",", ":"), default=str)
     created_value = str(created_at or _now()).strip() or _now()
     start_value = str(start_date or "").strip() or None
     end_value = str(end_date or "").strip() or None
     result_type_value = str(result_type or "backtest").strip().lower() or "backtest"
     symbol_value = str(symbol or "").strip().upper()
     timeframe_value = str(timeframe or "").strip() or "1h"
+
+    metrics_json = json.dumps(metrics or {}, separators=(",", ":"), default=str)
+    # Provenance stamps: the ENGINE version that produced the numbers, and the
+    # DATA semantics they were scored on (per-stream cadence + scale). Either
+    # changing makes this artifact stale evidence (engine_provenance /
+    # data_provenance module docstrings).
+    stamped_config = stamp_data_fingerprint(
+        stamp_engine_version(config), symbol_value, timeframe_value
+    )
+    config_json = json.dumps(stamped_config, separators=(",", ":"), default=str)
 
     with get_db() as conn:
         conn.execute(
