@@ -15,6 +15,7 @@
 	import SettingsData from '$lib/components/settings/sections/SettingsData.svelte';
 	import SettingsLab from '$lib/components/settings/sections/SettingsLab.svelte';
 	import SettingsTrading from '$lib/components/settings/sections/SettingsTrading.svelte';
+	import SettingsPortfolio from '$lib/components/settings/sections/SettingsPortfolio.svelte';
 	import SettingsHyperliquid from '$lib/components/settings/sections/SettingsHyperliquid.svelte';
 	import SettingsNotifications from '$lib/components/settings/sections/SettingsNotifications.svelte';
 	import SettingsSystem from '$lib/components/settings/sections/SettingsSystem.svelte';
@@ -188,6 +189,8 @@
 					<SettingsLab {settings} />
 				{:else if activeArea === 'trading'}
 					<SettingsTrading {settings} />
+				{:else if activeArea === 'portfolio'}
+					<SettingsPortfolio {settings} />
 				{:else if activeArea === 'hyperliquid'}
 					<SettingsHyperliquid {settings} />
 				{:else if activeArea === 'notifications'}

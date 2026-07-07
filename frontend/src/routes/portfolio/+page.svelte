@@ -177,7 +177,7 @@
 						{basket?.enabled ? 'Ticking' : 'Disabled'}
 					</span>
 					<a
-						href="/settings#trading/risk.basket_funding_carry_enabled"
+						href="/settings#portfolio/risk.basket_funding_carry_enabled"
 						class="text-[10px] uppercase tracking-wider text-[#666] hover:text-[#888] transition-colors"
 						>Settings</a
 					>
@@ -340,7 +340,7 @@
 						{allocation?.live_sizing_enabled ? 'SIZING LIVE' : 'Not sizing live'}
 					</span>
 					<a
-						href="/settings#trading/risk.portfolio_allocator_enabled"
+						href="/settings#portfolio/risk.portfolio_allocator_enabled"
 						class="text-[10px] uppercase tracking-wider text-[#666] hover:text-[#888] transition-colors"
 						>Settings</a
 					>
