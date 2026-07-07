@@ -14,7 +14,6 @@ import pytest
 
 from forven.basket_lab import BasketPanel
 from forven.basket_runtime import (
-    BASKET_KV_KEY,
     _fresh_state,
     _target_weights,
     basket_summary,
@@ -263,7 +262,6 @@ def test_tick_captures_leg_funding_and_universe():
 
 def test_summary_exposes_carry_universe_and_cadence(forven_db, monkeypatch):
     from forven import basket_runtime
-    from forven.db import kv_set
 
     panel = _panel(end=pd.Timestamp.now(tz="UTC").floor("h"))
     monkeypatch.setattr(basket_runtime, "_load_settings",

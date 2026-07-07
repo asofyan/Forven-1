@@ -16,7 +16,6 @@ from datetime import timedelta
 
 from forven.db import get_db, kv_set
 from forven.portfolio_allocator import (
-    ALLOCATION_KV_KEY,
     _annualized_vol,
     _pearson,
     compute_portfolio_allocation,
