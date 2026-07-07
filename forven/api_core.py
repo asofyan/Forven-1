@@ -2650,6 +2650,11 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             ("portfolio_target_book_vol_pct", 0.0),
             ("portfolio_min_risk_multiplier", 0.25),
             ("portfolio_max_risk_multiplier", 2.0),
+            # PORT-LAYER-2: funding-carry basket (forven.basket_runtime).
+            ("basket_rebalance_hours", 24.0),
+            ("basket_n_legs", 5.0),
+            ("basket_gross_leverage", 1.0),
+            ("basket_universe_min_bars", 17520.0),
         ):
             if _pb_key in payload:
                 updates[_pb_key] = _coerce_float(payload.get(_pb_key), _coerce_float(updates.get(_pb_key), _pb_default))
@@ -2668,6 +2673,12 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["portfolio_allocator_live"] = _coerce_bool(
                 payload.get("portfolio_allocator_live"),
                 bool(updates.get("portfolio_allocator_live", False)),
+            )
+        # PORT-LAYER-2 toggle (forven.basket_runtime).
+        if "basket_funding_carry_enabled" in payload:
+            updates["basket_funding_carry_enabled"] = _coerce_bool(
+                payload.get("basket_funding_carry_enabled"),
+                bool(updates.get("basket_funding_carry_enabled", False)),
             )
         # EQ-BASIS-1: whether the master wallet counts toward the live equity
         # basis when direction books are enabled (forven.daemon).

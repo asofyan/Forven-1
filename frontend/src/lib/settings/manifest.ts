@@ -539,6 +539,83 @@ export const SETTINGS_MANIFEST: SettingsEntry[] = [
     deepLinkTo: '/risk',
   },
 
+  // PORT-LAYER-2: funding-carry basket — a forward-marked PAPER book running
+  // the Phase 0 validated carry strategy (short highest funding, long lowest,
+  // dollar-neutral). Never places orders; live basket execution is a later phase.
+  {
+    id: 'risk.basket_funding_carry_enabled',
+    label: 'Funding-carry basket (paper)',
+    default: false,
+    type: 'toggle',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'basket_funding_carry_enabled',
+    description:
+      'Run the funding-carry basket as a forward-marked paper book: hourly marks + funding accrual from the data lake, rebalances on its own cadence, PnL decomposed into price vs funding vs cost. Paper only — no orders are ever placed. The prove-it stage for the carry edge validated in research.',
+    usedBy: ['forven.basket_runtime', 'forven.scheduler'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.basket_rebalance_hours',
+    label: 'Basket rebalance cadence',
+    unit: 'h',
+    default: 24,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'basket_rebalance_hours',
+    description:
+      'Hours between basket rebalances. Research verdict: 24h keeps essentially all of the carry edge at one third the turnover cost of 8h.',
+    usedBy: ['forven.basket_runtime'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.basket_n_legs',
+    label: 'Basket legs per side',
+    default: 5,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'basket_n_legs',
+    description:
+      'Number of perps held on each side (long lowest-funding, short highest-funding). More legs diversifies idiosyncratic moves but dilutes the funding spread captured.',
+    usedBy: ['forven.basket_runtime'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.basket_gross_leverage',
+    label: 'Basket gross leverage',
+    unit: 'x',
+    default: 1.0,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'basket_gross_leverage',
+    description:
+      'Total gross exposure of the basket as a multiple of its equity (split equally across all legs, dollar-neutral). 1.0 = 50% long + 50% short.',
+    usedBy: ['forven.basket_runtime'],
+    deepLinkTo: '/risk',
+  },
+  {
+    id: 'risk.basket_universe_min_bars',
+    label: 'Basket universe min history',
+    unit: 'bars',
+    default: 17520,
+    type: 'number',
+    area: 'trading',
+    subsection: 'trading-risk-loss-limits',
+    backendSection: 'risk',
+    backendPath: 'basket_universe_min_bars',
+    description:
+      'Minimum 1h bars of lake history a perp needs to enter the basket universe. The default (2 years) mirrors the deep-universe rule the research verdict was validated on; lowering it admits younger listings the edge was not tested against.',
+    usedBy: ['forven.basket_runtime'],
+    deepLinkTo: '/risk',
+  },
+
   // Risk: failed-open retry brake (RETRY-STORM-1). A live open the exchange
   // rejects is re-attempted by the kernel every scan; these bound the retries.
   {

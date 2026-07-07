@@ -1,0 +1,354 @@
+"""PORT-LAYER-2: the funding-carry basket as a forward-marked paper book.
+
+basket_lab (Phase 0) proved the edge on history: short the highest-funding
+perps, long the lowest, dollar-neutral — Sharpe 1.09 in the 2024→now regime,
+PnL dominated by funding (7.4 vs 1.1 price), survives costs ×2, beats 20/20
+shuffled-rank placebos. This module runs that SAME strategy forward on live
+lake data as a virtual paper book — the prove-it stage between research and
+any live capital, exactly like a strategy's paper stage.
+
+Conventions mirror the validated simulator (basket_lab.run_basket) so forward
+results are comparable to the Phase 0 backtest:
+- weights are constant fractions between rebalances (constant-mix per tick:
+  each tick books w·(close/prev_mark − 1) and re-strikes marks — the same
+  approximation run_basket uses per bar);
+- funding accrues as −w·funding_rate·hours (per-hour rate column; a SHORT on
+  positive funding EARNS);
+- rebalances pay (fee+slippage) bps on traded |Δw|;
+- price PnL, funding PnL, and costs are decomposed cumulatively, so "is the
+  forward edge still carry, not beta" stays answerable at a glance.
+
+Honesty guards:
+- the tick refuses to mark on a stale lake (no bar within max_stale_hours) —
+  a frozen price is not a mark;
+- PAPER ONLY: nothing here places orders. Live basket execution is a later
+  phase behind its own arming, like every live pathway in this codebase.
+
+State persists in KV ``forven:portfolio:basket:funding_carry`` with a bounded
+tick history. All knobs are Settings-editable; the engine ships dark
+(``basket_funding_carry_enabled`` default False).
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from datetime import datetime, timedelta
+from typing import Any
+
+from forven.db import kv_get, kv_set_best_effort
+from forven.sim.clock import get_now
+
+log = logging.getLogger("forven.basket_runtime")
+
+BASKET_KV_KEY = "forven:portfolio:basket:funding_carry"
+
+DEFAULT_REBALANCE_HOURS = 24  # Phase 0: 24h keeps ~all edge at 1/3 the turnover
+DEFAULT_N_LEGS = 5
+DEFAULT_GROSS_LEVERAGE = 1.0
+DEFAULT_UNIVERSE_MIN_BARS = 17520  # mirror the validated deep-universe rule (2y of 1h)
+DEFAULT_MAX_STALE_HOURS = 3.0
+PANEL_TAIL_BARS = 24 * 14  # 14 days of 1h — plenty for marks + elapsed funding
+MAX_HISTORY_POINTS = 2400  # ~100 days of hourly ticks
+
+
+def _float_setting(settings: dict, key: str, default: float) -> float:
+    try:
+        raw = settings.get(key)
+        return float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _load_settings() -> dict:
+    try:
+        raw = kv_get("forven:settings", {})
+    except Exception:
+        raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def basket_enabled(settings: dict | None = None) -> bool:
+    settings = settings if settings is not None else _load_settings()
+    return str(settings.get("basket_funding_carry_enabled", False)).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _basket_config(settings: dict) -> dict:
+    fee_bps = max(_float_setting(settings, "backtest_fee_bps", 4.5), 0.0)
+    slippage_bps = max(_float_setting(settings, "backtest_slippage_bps", 2.0), 0.0)
+    return {
+        "rebalance_hours": max(_float_setting(settings, "basket_rebalance_hours", DEFAULT_REBALANCE_HOURS), 1.0),
+        "n_legs": max(int(_float_setting(settings, "basket_n_legs", DEFAULT_N_LEGS)), 1),
+        "gross_leverage": max(_float_setting(settings, "basket_gross_leverage", DEFAULT_GROSS_LEVERAGE), 0.01),
+        "universe_min_bars": max(int(_float_setting(settings, "basket_universe_min_bars", DEFAULT_UNIVERSE_MIN_BARS)), 720),
+        "trade_cost": (fee_bps + slippage_bps) / 10_000.0,
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
+    }
+
+
+def _fresh_state(now_iso: str) -> dict:
+    return {
+        "name": "funding_carry",
+        "created_at": now_iso,
+        "equity": 1.0,
+        "weights": {},
+        "marks": {},
+        "last_tick_at": None,
+        "last_rebalance_at": None,
+        "rebalances": 0,
+        "cum_price_pnl": 0.0,
+        "cum_funding_pnl": 0.0,
+        "cum_cost": 0.0,
+        "history": [],
+    }
+
+
+# ------------------------------------------------------------------ tick core
+
+
+def tick_basket(state: dict, panel, now: datetime, config: dict) -> tuple[dict, dict]:
+    """One forward tick against an already-built recent panel. Pure: returns
+    (new_state, report) and mutates nothing — persistence is the caller's job.
+
+    ``panel`` is a basket_lab.BasketPanel whose LAST row is the freshest bar.
+    """
+    state = {**state, "weights": dict(state.get("weights") or {}), "marks": dict(state.get("marks") or {}),
+             "history": list(state.get("history") or [])}
+    report: dict[str, Any] = {"ticked": False, "rebalanced": False, "skipped_reason": None}
+
+    if panel is None or not len(panel.index):
+        report["skipped_reason"] = "empty panel"
+        return state, report
+
+    last_bar_at = panel.index[-1].to_pydatetime()
+    staleness_hours = (now - last_bar_at).total_seconds() / 3600.0
+    if staleness_hours > float(config.get("max_stale_hours", DEFAULT_MAX_STALE_HOURS)):
+        report["skipped_reason"] = (
+            f"lake stale: freshest bar {last_bar_at.isoformat()} is "
+            f"{staleness_hours:.1f}h old — refusing to mark on a frozen price"
+        )
+        return state, report
+
+    closes = panel.close.iloc[-1]
+    now_iso = now.isoformat()
+
+    # --- mark-to-market the held weights since the previous tick
+    price_pnl = 0.0
+    funding_pnl = 0.0
+    if state["weights"]:
+        prev_tick_at = state.get("last_tick_at")
+        for symbol, weight in state["weights"].items():
+            current = closes.get(symbol)
+            prev_mark = state["marks"].get(symbol)
+            if current is None or not math.isfinite(float(current or float("nan"))):
+                continue  # symbol went dark this tick — mark carries at last value
+            current = float(current)
+            if prev_mark and float(prev_mark) > 0:
+                price_pnl += float(weight) * (current / float(prev_mark) - 1.0)
+            state["marks"][symbol] = current
+        funding_pnl = _accrue_funding(state["weights"], panel, prev_tick_at, now)
+        state["equity"] = float(state["equity"]) * (1.0 + price_pnl + funding_pnl)
+        state["cum_price_pnl"] = float(state.get("cum_price_pnl", 0.0)) + price_pnl
+        state["cum_funding_pnl"] = float(state.get("cum_funding_pnl", 0.0)) + funding_pnl
+
+    # --- rebalance when due (also the very first tick)
+    cost = 0.0
+    turnover = 0.0
+    due = _rebalance_due(state.get("last_rebalance_at"), now, config["rebalance_hours"])
+    if due:
+        target = _target_weights(panel, config)
+        old = state["weights"]
+        traded_symbols = set(old) | set(target)
+        turnover = sum(abs(float(target.get(s, 0.0)) - float(old.get(s, 0.0))) for s in traded_symbols)
+        cost = turnover * float(config["trade_cost"])
+        state["equity"] = float(state["equity"]) * (1.0 - cost)
+        state["cum_cost"] = float(state.get("cum_cost", 0.0)) + cost
+        state["weights"] = {s: w for s, w in target.items() if w != 0.0}
+        state["marks"] = {
+            s: float(closes[s]) for s in state["weights"]
+            if s in closes.index and math.isfinite(float(closes[s] or float("nan")))
+        }
+        state["last_rebalance_at"] = now_iso
+        state["rebalances"] = int(state.get("rebalances", 0)) + 1
+        report["rebalanced"] = True
+        report["turnover"] = round(turnover, 6)
+
+    state["last_tick_at"] = now_iso
+    state["history"].append({
+        "t": now_iso,
+        "equity": round(float(state["equity"]), 8),
+        "price_pnl": round(price_pnl, 8),
+        "funding_pnl": round(funding_pnl, 8),
+        "cost": round(cost, 8),
+        "rebalanced": bool(due),
+        "positions": len(state["weights"]),
+    })
+    if len(state["history"]) > MAX_HISTORY_POINTS:
+        state["history"] = state["history"][-MAX_HISTORY_POINTS:]
+
+    report.update({
+        "ticked": True,
+        "equity": round(float(state["equity"]), 8),
+        "price_pnl": round(price_pnl, 8),
+        "funding_pnl": round(funding_pnl, 8),
+        "cost": round(cost, 8),
+        "positions": len(state["weights"]),
+    })
+    return state, report
+
+
+def _accrue_funding(weights: dict, panel, prev_tick_iso: str | None, now: datetime) -> float:
+    """Funding accrued on held weights over the bars since the previous tick.
+
+    Sums −w·funding_rate·bar_hours across the elapsed panel bars — the exact
+    accrual run_basket books per bar. Falls back to zero when the window is
+    empty (first tick after a rebalance-only initialization)."""
+    if not weights:
+        return 0.0
+    try:
+        if prev_tick_iso:
+            since = datetime.fromisoformat(str(prev_tick_iso))
+        else:
+            return 0.0
+        window = panel.funding.loc[panel.funding.index > since]
+        window = window.loc[window.index <= now]
+        if window.empty:
+            return 0.0
+        total = 0.0
+        for symbol, weight in weights.items():
+            if symbol not in window.columns:
+                continue
+            rates = window[symbol].dropna()
+            if rates.empty:
+                continue
+            total += -float(weight) * float(rates.sum()) * float(panel.bar_hours)
+        return total
+    except Exception:
+        log.warning("basket funding accrual failed — booking 0 this tick", exc_info=True)
+        return 0.0
+
+
+def _rebalance_due(last_rebalance_iso: str | None, now: datetime, rebalance_hours: float) -> bool:
+    if not last_rebalance_iso:
+        return True
+    try:
+        last = datetime.fromisoformat(str(last_rebalance_iso))
+    except ValueError:
+        return True
+    return now - last >= timedelta(hours=float(rebalance_hours)) - timedelta(minutes=5)
+
+
+def _target_weights(panel, config: dict) -> dict[str, float]:
+    """FundingCarryBasket's rule on the freshest bar: long the lowest-funding
+    legs, short the highest, dollar-neutral per-leg fractions."""
+    scores = panel.funding.iloc[-1]
+    eligible = scores.notna() & panel.close.iloc[-1].notna()
+    scores = scores[eligible]
+    n_legs = min(int(config["n_legs"]), len(scores) // 2)
+    if n_legs <= 0:
+        return {}
+    per_leg = float(config["gross_leverage"]) / (2.0 * n_legs)
+    ranked = scores.sort_values()
+    target: dict[str, float] = {}
+    for symbol in ranked.index[:n_legs]:
+        target[str(symbol)] = per_leg
+    for symbol in ranked.index[-n_legs:]:
+        target[str(symbol)] = -per_leg
+    return target
+
+
+# ------------------------------------------------------------ persisted entry
+
+
+def run_basket_tick(force: bool = False) -> dict | None:
+    """Load the universe, tick the basket, persist. The scheduler entry point.
+
+    No-op unless ``basket_funding_carry_enabled`` (or ``force``). Fail-soft:
+    any internal error logs and returns None without corrupting stored state.
+    """
+    settings = _load_settings()
+    if not force and not basket_enabled(settings):
+        return None
+    try:
+        from forven.basket_lab import build_panel, deep_universe_symbols
+
+        config = _basket_config(settings)
+        symbols = deep_universe_symbols(min_bars=config["universe_min_bars"])
+        if not symbols:
+            log.warning("basket tick: no universe symbols meet min_bars=%s", config["universe_min_bars"])
+            return None
+        panel = build_panel(symbols, tail_bars=PANEL_TAIL_BARS)
+        now = get_now()
+        state = kv_get(BASKET_KV_KEY, None)
+        if not isinstance(state, dict) or not state:
+            state = _fresh_state(now.isoformat())
+        new_state, report = tick_basket(state, panel, now, config)
+        if report.get("ticked"):
+            kv_set_best_effort(BASKET_KV_KEY, new_state)
+            log.info(
+                "basket tick: equity=%.6f price=%.6f funding=%.6f cost=%.6f positions=%d%s",
+                report["equity"], report["price_pnl"], report["funding_pnl"],
+                report["cost"], report["positions"],
+                " REBALANCED" if report.get("rebalanced") else "",
+            )
+        else:
+            log.warning("basket tick skipped: %s", report.get("skipped_reason"))
+        return report
+    except Exception:
+        log.warning("basket tick failed", exc_info=True)
+        return None
+
+
+def get_basket_state() -> dict | None:
+    try:
+        state = kv_get(BASKET_KV_KEY, None)
+    except Exception:
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def reset_basket_state() -> bool:
+    """Operator reset: clears the paper book so it re-initializes next tick."""
+    try:
+        kv_set_best_effort(BASKET_KV_KEY, {})
+        return True
+    except Exception:
+        return False
+
+
+def basket_summary() -> dict:
+    """Compact view for the API: headline stats + a decimated equity curve."""
+    state = get_basket_state()
+    settings = _load_settings()
+    if not state:
+        return {"exists": False, "enabled": basket_enabled(settings)}
+    history = state.get("history") or []
+    curve = [{"t": p["t"], "equity": p["equity"]} for p in history]
+    if len(curve) > 400:
+        step = len(curve) / 400.0
+        curve = [curve[int(i * step)] for i in range(400)] + [curve[-1]]
+    equity = float(state.get("equity", 1.0))
+    return {
+        "exists": True,
+        "enabled": basket_enabled(settings),
+        "name": state.get("name"),
+        "created_at": state.get("created_at"),
+        "last_tick_at": state.get("last_tick_at"),
+        "last_rebalance_at": state.get("last_rebalance_at"),
+        "rebalances": state.get("rebalances", 0),
+        "equity": round(equity, 6),
+        "total_return_pct": round((equity - 1.0) * 100.0, 4),
+        "pnl_decomposition": {
+            "price": round(float(state.get("cum_price_pnl", 0.0)), 6),
+            "funding": round(float(state.get("cum_funding_pnl", 0.0)), 6),
+            "cost": round(float(state.get("cum_cost", 0.0)), 6),
+        },
+        "positions": {
+            "count": len(state.get("weights") or {}),
+            "weights": state.get("weights") or {},
+        },
+        "equity_curve": curve,
+    }

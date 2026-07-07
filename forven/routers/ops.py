@@ -53,6 +53,31 @@ def post_portfolio_allocation_refresh():
     return {"ok": snapshot is not None, "snapshot": snapshot}
 
 
+# PORT-LAYER-2: funding-carry basket forward paper book. GET reads the state;
+# POST /tick forces a tick (sync def: builds the lake panel, seconds not ms —
+# threadpool, never the request loop); POST /reset clears the paper book.
+@router.get("/api/portfolio/basket")
+def get_portfolio_basket():
+    from forven.basket_runtime import basket_summary
+
+    return {"ok": True, **basket_summary()}
+
+
+@router.post("/api/portfolio/basket/tick")
+def post_portfolio_basket_tick():
+    from forven.basket_runtime import run_basket_tick
+
+    report = run_basket_tick(force=True)
+    return {"ok": report is not None, "report": report}
+
+
+@router.post("/api/portfolio/basket/reset")
+def post_portfolio_basket_reset(body: ConfirmBody):
+    from forven.basket_runtime import reset_basket_state
+
+    return {"ok": reset_basket_state()}
+
+
 @router.post("/api/system/stop")
 def stop_system():
     return control_plane_ops.stop_system()

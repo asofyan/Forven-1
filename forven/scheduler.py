@@ -44,6 +44,7 @@ _DEFAULT_JOB_IDS = {
     "forven-regime-update",
     "forven-regime-gate-mtm",
     "forven-portfolio-allocation",
+    "forven-basket-funding-carry",
     "forven-slippage-monitor",
     "forven-scanner-signal",
     "forven-scanner-hourly",
@@ -1509,6 +1510,16 @@ async def run_job(job: dict) -> tuple[str, str | None]:
             snapshot = await _run_sync_job(refresh_portfolio_allocation)
             if snapshot is None:
                 return "ok", "allocator disabled or refresh skipped"
+            return "ok", None
+
+        # PORT-LAYER-2: funding-carry basket forward paper tick. Internally
+        # flag-gated (no-op unless basket_funding_carry_enabled) and fail-soft;
+        # marks/accrues hourly, rebalances on its own cadence (default 24h).
+        if kind == "basket_funding_carry_tick":
+            from forven.basket_runtime import run_basket_tick
+            report = await _run_sync_job(run_basket_tick)
+            if report is None:
+                return "ok", "basket disabled or tick skipped"
             return "ok", None
 
         # Strategy decay tracker — auto-demote degraded paper/deployed strategies
@@ -3163,6 +3174,18 @@ def seed_forven_jobs():
         command="portfolio-allocation",
         timezone_str="UTC",
         payload={"kind": "portfolio_allocation_refresh"},
+    )
+
+    # PORT-LAYER-2: hourly funding-carry basket forward paper tick. No-op
+    # unless basket_funding_carry_enabled; rebalances on its own cadence.
+    add_job(
+        job_id="forven-basket-funding-carry",
+        name="Funding-Carry Basket Paper Tick",
+        schedule_type="interval",
+        schedule_expr="3600000",
+        command="basket-funding-carry",
+        timezone_str="UTC",
+        payload={"kind": "basket_funding_carry_tick"},
     )
 
     # 5. Regime + Market Pot refresh — every 4 hours
