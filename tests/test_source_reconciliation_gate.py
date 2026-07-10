@@ -200,6 +200,17 @@ def test_gate_missing_blocks_when_block_when_missing(forven_db):
     assert "pending" in reason
 
 
+def test_gate_missing_blocks_by_default_when_setting_is_omitted(forven_db):
+    _seed_strategy()
+    settings = _settings()
+    del settings["data_engine_settings"]["source_reconciliation"]["block_when_missing"]
+
+    ok, reason = _evaluate_source_divergence_gate("S-DIV", settings)
+
+    assert ok is False
+    assert "pending" in reason
+
+
 def test_gate_blocks_high_divergence(forven_db):
     _seed_strategy()
     _seed_divergence("BTC/USDT", "1h", status="ok", max_pct=5.0)
@@ -232,6 +243,19 @@ def test_gate_stale_payload_fails_open(forven_db):
     # Stale -> treated as missing -> fail-open (does NOT block despite 9% > 2%).
     assert ok is True
     assert "stale" in reason
+
+
+def test_gate_unparseable_timestamp_blocks_when_missing_is_strict(forven_db):
+    _seed_strategy()
+    _seed_divergence("BTC/USDT", "1h", status="ok", max_pct=0.3, checked_at="not-a-time")
+
+    ok, reason = _evaluate_source_divergence_gate(
+        "S-DIV",
+        _settings(block_when_missing=True),
+    )
+
+    assert ok is False
+    assert "unparseable timestamp" in reason
 
 
 def test_reason_code_divergence():
