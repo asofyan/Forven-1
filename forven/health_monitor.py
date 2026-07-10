@@ -181,6 +181,20 @@ class HealthState:
     def record_alert(self, alert: HealthAlert) -> None:
         self._alerts.appendleft(alert)
 
+    def dismiss_alerts(self, component: str, severity: Severity | None = None) -> None:
+        """Remove unresolved alerts for a component, optionally filtered by severity.
+
+        Used when a component recovers to GREEN so stale CRITICAL/WARNING alerts
+        don't linger in the feed indefinitely.
+        """
+        remaining: deque[HealthAlert] = deque(maxlen=HEALTH_MAX_ALERTS)
+        for a in self._alerts:
+            if a.component == component:
+                if severity is None or a.severity == severity:
+                    continue  # dismiss this alert
+            remaining.append(a)
+        self._alerts = remaining
+
     def mark_notified(self, key: str) -> None:
         """Record that a Discord notification was sent for dedup tracking."""
         self._last_alerted[key] = datetime.now(timezone.utc)
@@ -930,6 +944,10 @@ def _dispatch_alerts(
         # State improved — recovery
         if new_state == State.GREEN and old_state in (State.AMBER, State.RED):
             state.clear_warn(name)
+            # Dismiss outstanding CRITICAL/WARNING alerts for this component
+            # so a recovered service doesn't keep showing stale red alerts.
+            for sev in (Severity.CRITICAL, Severity.WARNING):
+                state.dismiss_alerts(name, severity=sev)
             dedupe_key = f"{base_key}:recovery"
             alert = HealthAlert(
                 severity=Severity.INFO,

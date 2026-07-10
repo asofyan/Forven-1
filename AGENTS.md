@@ -147,6 +147,151 @@ Important:
 
 ---
 
+## Operational Setup (this machine)
+
+Backend berjalan sebagai **systemd service** — jangan di-start manual via CLI:
+
+```
+# Service files
+/etc/systemd/system/forven-backend.service   # port 8004 (BUKAN 8003)
+/etc/systemd/system/forven-frontend.service
+
+# Management
+sudo systemctl status forven-backend
+sudo systemctl restart forven-backend
+sudo journalctl -u forven-backend -n 50 --no-pager   # logs
+```
+
+### Environment & Auth
+
+```
+# .env file
+/home/hms/forven/.env
+
+# API keys (untuk forven.agent)
+FORVEN_API_URL=http://127.0.0.1:8004
+FORVEN_API_KEY=92ec5b339a6a980a8c3d6dc31b237ac4e9572a520921ce454fb5bf049839d7c0
+FORVEN_OPERATOR_KEY=295dc8d02f34f301b6456ae19f4b5b02e8bddc815b124729c020d57dba573566
+
+# Database
+/home/hms/.forven/forven.db  (SQLite)
+```
+
+### Invoke forven.agent (dengan auth)
+
+```bash
+cd /home/hms/forven
+FORVEN_API_URL=http://127.0.0.1:8004 \
+  FORVEN_API_KEY=92ec5b339a6a980a8c3d6dc31b237ac4e9572a520921ce454fb5bf049839d7c0 \
+  FORVEN_OPERATOR_KEY=295dc8d02f34f301b6456ae19f4b5b02e8bddc815b124729c020d57dba573566 \
+  .venv/bin/python -m forven.agent <command>
+```
+
+Atau set env vars dulu:
+```bash
+export FORVEN_API_URL=http://127.0.0.1:8004
+export FORVEN_API_KEY=92ec5b339a6a980a8c3d6dc31b237ac4e9572a520921ce454fb5bf049839d7c0
+export FORVEN_OPERATOR_KEY=295dc8d02f34f301b6456ae19f4b5b02e8bddc815b124729c020d57dba573566
+export PATH=/home/hms/forven/.venv/bin:$PATH
+```
+
+---
+
+## Strategy Development — Practical Knowledge
+
+### Available Datasets (BTC/USDT)
+
+| ID | Timeframe | Bars | Period |
+|----|-----------|------|--------|
+| dataset-0 | 15m | 70,079 | 2024-07-06 → 2026-07-06 |
+| dataset-2 | 1h | 17,519 | 2024-07-06 → 2026-07-06 |
+| dataset-3 | 4h | 4,379 | 2024-07-06 → 2026-07-06 |
+
+Juga ETH/USDT dan SOL/USDT di timeframe yg sama.
+
+### Cara bikin strategi yang benar
+
+1. **Extend `DonchianStrategy`** (builtin) atau `BaseStrategy` — pastikan punya BOTH `generate_signal()` dan `generate_signals()`
+2. **Vectorized path wajib** — `generate_signals` return `(entry_series: pd.Series, exit_series: pd.Series)`
+3. **Lookahead-safe** — gunakan `.shift(1)` pada channel/indicator (lihat `forven/strategies/builtin/donchian.py` `donchian_bands()`)
+4. **Simpan di** `forven/strategies/custom/`
+5. **TYPE_NAME unik** setiap kali registrasi (tidak bisa re-register type yg sama)
+6. **Register** → `forven.agent register --file /abs/path/strat.py`
+7. **Backtest** → `forven.agent backtest --strategy SXXXXX --dataset BTC/USDT-1h --compact`
+
+### Gate Requirements (quick_screen)
+
+| Metric | Bar | Target |
+|--------|-----|--------|
+| Total Trades | ≥ 35 total (IS 20 + OOS 15) | — |
+| PF | ≥ 1.05 | aim 1.3+ |
+| Sharpe | [0, 5] | — |
+| MaxDD | < 30% | — |
+| Robustness | ≥ 50 | — |
+
+### Lessons learned dari H00293 (BTC Donchian)
+
+- **Semua 47+ BTC donchian strategies archived/rejected** — zero paper
+- **Hanya SOL donchian yang survive** (S00718, S00828, S00950 di paper)
+- BTC 1h/4h microstructure: Donchian breakout terlalu jarang, ADX filter bikin makin jarang
+- Donchian period 20 lebih baik dari 40 (lebih banyak sinyal)
+- SOL punya karakteristik high-chop, slow-trending yang cocok untuk Donchian
+
+### Pre-built families yang tersedia
+
+```
+dictionary_family = {
+  bb_fade, bb_squeeze, bollinger, donchian, ema_cross, funding,
+  inside_bar, keltner, macd, orb, parabolic_sar, regime_filtered,
+  rsi_momentum, stochastic, supertrend, vwap_pullback, williams_r
+}
+```
+
+Parameter kanonikal per family bisa dicek via:
+```
+forven.agent context --out /tmp/ctx.json
+# lalu lihat canonical_params
+```
+
+---
+
+## Hypothesis System
+
+- Status: `proposed` → `researching` → `proven`/`disproven`
+- Tiap hypothesis punya **spawn limit** untuk child strategies (H00293 sudah penuh)
+- Gunakan hypothesis_id yg masih punya quota
+- Cek hypothesis:
+  ```bash
+  sqlite3 /home/hms/.forven/forven.db "SELECT id, display_id, title, status FROM hypotheses ORDER BY created_at DESC"
+  ```
+
+---
+
+## Perintah forven.agent lengkap
+
+```bash
+# Cek
+health                          # status backend
+context --out .tmp/ctx.json     # context lengkap
+strategy SXXXXX                 # detail strategi
+gate-report SXXXXX              # status gate
+list --status paper             # daftar strategi berdasarkan status
+result <result_id>              # full backtest result
+
+# Lifecycle
+register --file /abs/path/strat.py
+backtest --strategy SXXXXX --dataset BTC/USDT-1h --compact
+optimize --strategy SXXXXX --dataset BTC/USDT-1h --n-trials 30
+promote --strategy SXXXXX --to gauntlet --from quick_screen
+enqueue --file /abs/path/strat.py --dataset BTC/USDT-1h
+
+# Polling
+wait-paper --strategies SXXXXX,SYYYYY --timeout 1800
+status SXXXXX,SYYYYY
+```
+
+---
+
 ## Important Patterns To Follow
 
 1. **Adding a new backend endpoint**
