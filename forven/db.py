@@ -3601,7 +3601,10 @@ def kv_get(key: str, default=None):
     if row:
         raw_value = row["value"]
         if isinstance(raw_value, (str, bytes, bytearray)):
-            payload = json.loads(raw_value)
+            try:
+                payload = json.loads(raw_value)
+            except (json.JSONDecodeError, ValueError):
+                payload = raw_value
         else:
             payload = raw_value
         if key == "forven:settings:secrets" and isinstance(payload, dict):

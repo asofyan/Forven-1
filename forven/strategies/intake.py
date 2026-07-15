@@ -666,6 +666,7 @@ def register_custom_strategy_file(
     """
     from forven.strategies import registry
     from forven.strategies.certification import certify_execution_strategy
+    from forven.strategies.stub_detector import detect_generate_signal_stub
     from forven.db import create_strategy_container, get_db, log_activity
     from forven.ai_dropzone_sessions import (
         record_strategy_in_session,
@@ -822,6 +823,22 @@ def register_custom_strategy_file(
         log.warning(
             "Targeted intake: execution smoke test failed for %s (type=%s) — registering as research_only: %s",
             modname, type_name, crash_reason,
+        )
+
+    # GATE C2: generate_signal() stub probe. The live scanner calls
+    # generate_signal() per-bar; if it's a no-op stub (Signal.from_condition(False,…))
+    # the strategy will NEVER produce an entry signal in paper trading — even
+    # though backtests and charts (via generate_signals()) show arrows and trades.
+    # HARD-REJECT: this is never a valid research-only candidate; the file must be
+    # rewritten with a real per-bar implementation before it can be registered.
+    stub_reason = detect_generate_signal_stub(Path(source_ref))
+    if stub_reason:
+        raise ValueError(
+            f"{file_name}: generate_signal() is a no-op stub. "
+            f"The live scanner calls this method per-bar — a stub means 0 trades "
+            f"in paper forever, even though charts show entry arrows. "
+            f"Rewrite generate_signal() with real per-bar logic that mirrors "
+            f"generate_signals(). Detail: {stub_reason}"
         )
 
     # GATE D: data-availability probe. A strategy that reads enrichment feed

@@ -159,6 +159,10 @@ _LAST_MARK_WATCH = [0.0]
 # the one-shot transition tick. Throttled so an unfillable position can't hot-loop.
 KILL_REFLATTEN_INTERVAL_SECONDS = 60
 _LAST_KILL_REFLATTEN = [0.0]
+# Stub detector: minimum seconds between scans of custom/ for generate_signal() stubs
+# that would silently cause 0 paper trades. 1800s = 30 min.
+STUB_CHECK_INTERVAL_SECONDS = 1800
+_LAST_STUB_CHECK = [0.0]
 # Last-known-good per-account equity, used to ride out a transient sub-account
 # read that returns 0/fails so the books-aggregate can't fake a drawdown and
 # trip the kill-switch on a glitch (keyed by lowercased address; master="__master__").
@@ -1398,6 +1402,27 @@ def _book_aware_account_value(testnet: bool = True) -> dict | None:
         return None
 
 
+def _check_custom_stubs():
+    """Scan custom/ strategy directory for generate_signal() stubs.
+
+    A stub is a no-op implementation that always returns Signal(False), which
+    causes 0 trades in paper trading. Logs a warning for each stub found so
+    operators can fix them before strategies waste days in paper.
+    """
+    from forven.strategies.stub_detector import scan_custom_directory
+
+    findings = scan_custom_directory()
+    if findings:
+        log.warning(
+            "Stub check: %d custom strategy file(s) have no-op generate_signal() "
+            "stubs — these will produce 0 trades in paper trading",
+            len(findings),
+        )
+        for fname, reason in findings:
+            log.warning("  Stub: %s — %s", fname, reason)
+    return {"stubs_found": len(findings), "files": [f[0] for f in findings]}
+
+
 def _check_liquidation_distances() -> dict:
     """H7: warn the operator when any OPEN position drifts toward liquidation.
 
@@ -1723,6 +1748,18 @@ async def _run_tick(state: dict, prices: dict[str, float], source: str, last_rec
             if isinstance(positions_snapshot, dict):
                 state["exchange_positions"] = positions_snapshot
                 state["exchange_positions_synced_at"] = _iso_now()
+        except Exception:
+            pass
+
+    # Stub detector: periodic scan of custom/ strategy files for generate_signal()
+    # stubs that silently cause 0-trade paper failures. Warns on every stub found
+    # so operators notice before strategies silently waste days in paper.
+    if now - _LAST_STUB_CHECK[0] >= STUB_CHECK_INTERVAL_SECONDS:
+        _LAST_STUB_CHECK[0] = now
+        try:
+            await _to_thread_with_timeout(
+                "daemon.stub_check", 30.0, _check_custom_stubs,
+            )
         except Exception:
             pass
 

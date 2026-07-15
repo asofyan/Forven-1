@@ -546,10 +546,16 @@ def _tool_register_strategy(params: dict) -> str:
     # Targeted intake must import/register the just-written file before a full
     # custom discovery pass. If discovery sees it first, TYPE_NAME is already in
     # the runtime map and targeted DB registration rejects it as a duplicate.
+    #
+    # NOTE: DO NOT call reset() here — register_custom_strategy_file() already
+    # limits itself to builtins via discover(include_custom=False), so no other
+    # custom types are affected. Calling reset() nukes _TYPE_MAP for ALL types
+    # (including builtins like donchian/ema_cross) creating a vulnerability window
+    # where the live scanner sees "runtime type not registered" for every paper
+    # strategy, permanently blocking kernel execution until the next restart.
     try:
-        from forven.strategies.registry import reset, discover, _TYPE_MAP
+        from forven.strategies.registry import discover, _TYPE_MAP
         from forven.strategies.intake import register_custom_strategy_file
-        reset()
 
         registration = register_custom_strategy_file(
             file_path=filepath,

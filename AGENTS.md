@@ -219,6 +219,295 @@ Juga ETH/USDT dan SOL/USDT di timeframe yg sama.
 6. **Register** → `forven.agent register --file /abs/path/strat.py`
 7. **Backtest** → `forven.agent backtest --strategy SXXXXX --dataset BTC/USDT-1h --compact`
 
+---
+
+## Strategy Creation Recipes (AI Agent Quick Reference)
+
+Gunakan section ini untuk membuat, backtest, dan mendaftarkan strategi ke pipeline tanpa perlu eksplorasi ulang.
+
+### Strategy File Template (lengkap)
+
+```python
+# forven/strategies/custom/<nama_file>.py
+"""Deskripsi singkat strategi."""
+import pandas as pd
+from forven.strategies.base import BaseStrategy, Signal
+
+TYPE_NAME = "nama_unik_snake_case"  # ← wajib unik global, ganti tiap iterasi
+
+class NamaStrategi(BaseStrategy):
+
+    @property
+    def name(self) -> str:
+        return f"Nama Human-Readable ({self.asset})"
+
+    @property
+    def asset(self) -> str:
+        return self.params.get("_asset", "BTC")
+
+    @property
+    def strategy_type(self) -> str:
+        return TYPE_NAME
+
+    @property
+    def default_params(self) -> dict:
+        return {
+            "period": 20,
+            "threshold": 0.5,
+            "leverage": 3.0,
+        }
+
+    @property
+    def compatible_regimes(self) -> set[str]:
+        return {"TREND_UP", "TREND_DOWN", "RANGE_BOUND"}
+
+    # ── Per-bar logic (single step) ──
+    # 🔴 WAJIB: implementasi nyata, BUKAN stub `Signal.from_condition(False, ...)`.
+    # Scanner live panggil ini — stub = 0 trade di paper selamanya.
+    # Gunakan helper/indikator yg sama dgn generate_signals(), evaluasi bar terakhir.
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        period = int(self.params.get("period", 20))
+        if len(df) < period + 2:
+            return Signal(entry_signal=False, exit_signal=False, price=0.0)
+
+        # ... logika entry/exit per bar ...
+        curr_close = float(df["close"].iloc[-1])
+
+        return Signal(
+            entry_signal=False,   # True jika entry
+            exit_signal=False,    # True jika exit
+            price=round(curr_close, 4),
+            direction="long",
+            confidence=0.0,
+        )
+
+    # ── Vectorized logic (wajib untuk performa) ──
+    def generate_signals(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        period = int(self.params.get("period", 20))
+        close = df["close"]
+
+        # CONTOH: breakout di atas rolling high sebelumnya (lookahead-safe)
+        upper = df["high"].rolling(period).max().shift(1)  # ← .shift(1) wajib
+        entry = close > upper
+        exit_ = pd.Series(False, index=df.index)
+
+        return entry.fillna(False), exit_.fillna(False)
+
+    def parameter_space(self) -> dict:
+        return {"period": (10, 50, 5), "threshold": (0.1, 0.9, 0.2)}
+
+
+# ── Module exports (wajib) ──
+STRATEGY_CLASS = NamaStrategi
+```
+
+### Aturan Kritis (harus dipatuhi)
+
+| # | Aturan | Konsekuensi jika dilanggar |
+|---|--------|---------------------------|
+| 1 | `TYPE_NAME` snake_case, unik global | Re-register type yang sudah ada → ditolak |
+| 2 | `.shift(1)` pada semua indikator/rolling window | Lookahead → strategy di-reject di registration |
+| 3 | Implementasi BOTH `generate_signal()` DAN `generate_signals()` | Tanpa vectorized → O(N²), bisa timeout |
+| 3b | 🔴 **`generate_signal()` HARUS implementasi nyata, BUKAN stub `Signal.from_condition(False, ...)`**. Scanner live panggil `generate_signal()` per-bar; stub = 0 trade selamanya di paper. Lihat section "PITFALL" di bawah. | Chart muncul panah buy tapi tidak ada eksekusi trade — 0 trade selamanya |
+| 4 | Return `(pd.Series bool, pd.Series bool)` dari `generate_signals()` | Tipe salah → error runtime |
+| 5 | Jangan taruh `stop_loss_pct` / `risk_pct` di `default_params` | Engine yang handle risk management |
+| 6 | Set `compatible_regimes` (minimal 1) | Kosong → engine force-exit tiap posisi |
+| 7 | File di `forven/strategies/custom/` | Registry hanya scan builtin/ dan custom/ |
+| 8 | Export `TYPE_NAME` dan `STRATEGY_CLASS` di level module | Registry tidak bisa load tanpa ini |
+| 9 | Banned imports: `os`, `subprocess`, `socket`, `eval`, library `ta` | AST security scan reject |
+| 10 | Ganti `TYPE_NAME` setiap ubah `default_params` | Re-register tanpa rename tidak refresh snapshot |
+
+### Recipe A: CLI (forven.agent)
+
+```bash
+# Setup env
+export FORVEN_API_URL=http://127.0.0.1:8004
+export FORVEN_API_KEY=92ec5b339a6a980a8c3d6dc31b237ac4e9572a520921ce454fb5bf049839d7c0
+export FORVEN_OPERATOR_KEY=295dc8d02f34f301b6456ae19f4b5b02e8bddc815b124729c020d57dba573566
+export PATH=/home/hms/forven/.venv/bin:$PATH
+
+# 1. Register
+python -m forven.agent register --file /home/hms/forven/forven/strategies/custom/nama_file.py
+# Output: {"strategy_id": "S02550", ...}
+
+# 2. Backtest (compact = ringkasan, tanpa compact = full result)
+SID="S02550"
+python -m forven.agent backtest --strategy $SID --dataset BTC/USDT-1h --compact
+
+# 3. Cek gate readiness
+python -m forven.agent gate-report $SID
+
+# 4. Promote ke gauntlet (jika quick_screen pass)
+python -m forven.agent promote --strategy $SID --to gauntlet --from quick_screen
+
+# 5. One-shot pipeline (register → backtest → screen → promote otomatis)
+python -m forven.agent enqueue --file /home/hms/forven/forven/strategies/custom/nama_file.py --dataset BTC/USDT-1h
+
+# 6. Tunggu sampai paper (background worker yang proses)
+python -m forven.agent wait-paper --strategies $SID --timeout 1800
+
+# Utils
+python -m forven.agent list --status paper          # cek strategi di paper
+python -m forven.agent list --status gauntlet       # cek strategi di gauntlet
+python -m forven.agent strategy $SID                # detail satu strategi
+python -m forven.agent status $SID                  # status lifecycle
+python -m forven.agent context --out /tmp/ctx.json  # datasets, families, template
+```
+
+### Recipe B: ForvenAgentClient (Python)
+
+```python
+from forven.agent import ForvenAgentClient
+
+fc = ForvenAgentClient()  # baca FORVEN_API_URL, FORVEN_API_KEY dari env
+
+# Register → dapat strategy_id
+reg = fc.register_file("/home/hms/forven/forven/strategies/custom/nama_file.py")
+sid = reg["strategy_id"]  # "S02550"
+
+# Backtest
+result = fc.run_backtest(sid, "BTC/USDT-1h", compact=True)
+# result = {"in_sample": {...}, "out_of_sample": {...}}
+
+# Optional: optimasi parameter
+opt = fc.run_optimization(sid, "BTC/USDT-1h", n_trials=30)
+
+# Quick screen check
+screen = ForvenAgentClient.quick_screen(result)
+if screen["pass"]:
+    fc.promote(sid, "gauntlet", from_status="quick_screen")
+
+# One-shot full pipeline
+verdict = fc.enqueue_candidate("/home/hms/forven/forven/strategies/custom/nama_file.py", "BTC/USDT-1h")
+if verdict.get("enqueued"):
+    final = fc.wait_for_paper([sid], timeout=2400)
+
+# Session-based (group strategies)
+session = fc.create_session(label="hunt-btc-meanrev", objective="BTC mean reversion hunting")
+fc.register_file("/path/to/strat.py", session_id=session["id"])
+```
+
+### Recipe C: REST API (curl)
+
+```bash
+BASE="http://127.0.0.1:8004"
+
+# Register
+curl -sS -X POST "$BASE/api/strategies/intake/register-file" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: 92ec5b339a6a980a8c3d6dc31b237ac4e9572a520921ce454fb5bf049839d7c0" \
+  -d '{"file_path": "/home/hms/forven/forven/strategies/custom/nama_file.py"}'
+
+# Backtest
+curl -sS -X POST "$BASE/api/backtesting/run" \
+  -H "Content-Type: application/json" \
+  -d '{"strategy_id": "S02550", "dataset_id": "BTC/USDT-1h"}'
+
+# Cek hasil backtest
+curl -sS "$BASE/api/results?strategy=S02550&limit=5"
+
+# Cek readiness untuk promotion
+curl -sS "$BASE/api/lifecycle/strategies/S02550/readiness"
+
+# Promote
+curl -sS -X POST "$BASE/api/strategies/S02550/promote" \
+  -H "Content-Type: application/json" \
+  -d '{"to_status": "gauntlet", "from_status": "quick_screen"}'
+
+# List strategi by status
+curl -sS "$BASE/api/strategies?status=paper"
+
+# Health
+curl -sS "$BASE/api/health"
+```
+
+### Lifecycle Pipeline
+
+```
+register_file() ──→ quick_screen ──→ gauntlet ──→ paper ──→ deployed
+                        │                              │
+                    (backtest +                  (12-step Advancer:
+                     pre-screen)                  cost_stress, deflated Sharpe,
+                                                  param jitter, walk-forward,
+                                                  8 other gates)
+```
+
+**Gate thresholds (quick_screen):**
+
+| Metric | Minimum | Target |
+|--------|---------|--------|
+| Profit Factor | ≥ 1.05 | ≥ 1.3 |
+| Sharpe | [0, 5] | ~1.7 OOS |
+| Max Drawdown | < 30% | — |
+| IS Trades | ≥ 20 | — |
+| OOS Trades | ≥ 15 | — |
+| Robustness | ≥ 50 | — |
+
+### 🔴 PITFALL: `generate_signal()` Stub — Penyebab #1 Custom Strategy 0 Trade di Paper
+
+**Ini adalah bug paling mematikan dan paling sulit dideteksi.**
+
+Live scanner memanggil `generate_signal()` (per-bar scalar), BUKAN `generate_signals()` (vectorized).
+Chart frontend menggunakan `generate_signals()` via kernel replay — jadi panah buy TETAP MUNCUL di chart
+meskipun live execution tidak pernah menyentuh kode entry.
+
+**Gejala:**
+- ✅ Chart frontend muncul panah entry/exit (dari `generate_signals()`)
+- ✅ Backtest menghasilkan trade (dari `generate_signals()`)
+- ❌ Paper trading TIDAK PERNAH entry — 0 trade selamanya
+- ❌ Scanner log: `entry=-` setiap siklus
+- ❌ `scanner_signal_results`: `matched=0, block_reason=no_signal`
+
+**Penyebab — STUB:**
+```python
+# ❌ JANGAN PERNAH TULIS INI! Live execution tidak akan pernah entry
+def generate_signal(self, df: pd.DataFrame) -> Signal:
+    return Signal.from_condition(False, df=df, direction="long", confidence=0.0)
+```
+
+**Perbaikan — implementasi nyata:**
+```python
+# ✅ Gunakan helper yg sama dgn generate_signals(), evaluasi bar terakhir
+def generate_signal(self, df: pd.DataFrame) -> Signal:
+    p = self.params if getattr(self, 'params', None) else self.default_params
+    period = int(p.get("period", 20))
+    if len(df) < period + 2:
+        return Signal(entry_signal=False, exit_signal=False, price=0.0)
+
+    # ... hitung indikator (EMA, MACD, RSI, Bollinger, dsb) ...
+    # ... evaluasi kondisi entry/exit pada bar terakhir ...
+    curr_close = float(df["close"].iloc[-1])
+    return Signal(
+        entry_signal=entry_condition_met,
+        exit_signal=exit_condition_met,
+        price=round(curr_close, 4),
+        direction="long",
+        confidence=0.8 if entry_condition_met else 0.0,
+    )
+```
+
+**Cara deteksi:** 
+```bash
+grep -l "Signal.from_condition(False" forven/strategies/custom/*.py
+# Setiap file yang muncul = BUG, harus diperbaiki sebelum register
+```
+
+### Signal Dataclass Reference
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Signal:
+    entry_signal: bool = False
+    exit_signal: bool = False
+    price: float = 0.0
+    direction: str = "long"        # "long" | "short"
+    confidence: float = 0.0
+    indicators: dict = field(default_factory=dict)
+    regime_tag: str | None = None
+```
+
 ### Gate Requirements (quick_screen)
 
 | Metric | Bar | Target |

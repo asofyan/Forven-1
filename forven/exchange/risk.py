@@ -822,6 +822,12 @@ _PORTFOLIO_BUDGET_DEFAULTS = {
     "live_hard_max_per_trade_risk_pct": 2.0,
     "live_hard_max_order_notional_pct": 100.0,
     "live_max_book_notional_pct": 100.0,
+    # PAPER-1: cap on total paper risk_pct for the same asset+direction across
+    # ALL strategies — prevents N strategies from piling into the same trade,
+    # each believing it's the only one (paper per-strategy isolation bug).
+    # Budget is in risk_pct (fraction of paper portfolio), analogous to
+    # live_max_total_open_risk_pct but per-asset-direction.
+    "paper_max_asset_risk_pct": 10.0,
 }
 # Risk fallback for a live row with no recorded stop (should not exist — live
 # opens are refused without one; adopted/recovered rows are the edge case).
@@ -1585,6 +1591,41 @@ def can_open(
                             )
             except Exception as _pb_exc:
                 return False, 0.0, f"Portfolio budget check failed ({_pb_exc}) — refusing the live open (fail closed)."
+
+        # PAPER-1 (coarse gate): cross-strategy paper budget — prevents N
+        # strategies from piling into the same asset+direction on the same
+        # signal, each believing it's the only position (paper's per-strategy
+        # isolation means can_open sees zero existing positions for each
+        # strategy individually). NOT gated by enforce_risk_caps — this is a
+        # guardrail in the same class as PORT-1, not a sizing cap.
+        if is_paper_scope:
+            try:
+                if bool(settings.get("paper_cross_strategy_budget_enabled", True)):
+                    # Count ALL paper positions for this asset+direction across
+                    # every strategy — the per-strategy scoped `positions` view
+                    # above deliberately isolates, so we use the raw all_positions.
+                    same_asset_dir_risk = 0.0
+                    same_asset_dir_count = 0
+                    for pos in all_positions.values():
+                        if _position_execution_type(pos) not in _PAPER_EXECUTION_TYPES:
+                            continue
+                        if (str(pos.get("asset") or "").strip().upper() == asset
+                                and str(pos.get("direction") or "").strip().lower() == direction):
+                            same_asset_dir_risk += _coerce_non_negative_float(pos.get("risk_pct")) or 0.0
+                            same_asset_dir_count += 1
+                    paper_asset_budget = _budget_pct_setting(settings, "paper_max_asset_risk_pct") / 100.0
+                    if same_asset_dir_risk + (risk_pct or 0.0) > paper_asset_budget:
+                        return False, 0.0, (
+                            f"Paper cross-strategy budget exhausted for {asset} {direction}: "
+                            f"{same_asset_dir_risk:.1%} already at risk across "
+                            f"{same_asset_dir_count} paper position(s) — cap "
+                            f"{_budget_pct_setting(settings, 'paper_max_asset_risk_pct'):g}%. "
+                            "Close a position or raise paper_max_asset_risk_pct in Settings."
+                        )
+            except Exception as _paper_exc:
+                # A transient gate-read error must not wedge paper management —
+                # paper is a sandbox and there is no real capital at risk.
+                log.warning("Paper cross-strategy budget check failed (%s) — allowing open (fail open for paper sandbox)", _paper_exc)
 
         cooldown_after_loss_hours = _get_cooldown_after_loss_hours(settings)
         cooling_down, cooldown_reason = _is_strategy_in_loss_cooldown(strategy, cooldown_after_loss_hours)
