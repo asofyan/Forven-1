@@ -31,11 +31,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 from forven.regime import RANGE_BOUND
 from forven.strategies import sizing as _sizing
 from forven.strategies.base import DirectionalSignals  # noqa: F401  (re-exported for callers)
+
+
+@dataclass(frozen=True)
+class FundingContext:
+    """Per-bar perp funding series threaded into :func:`simulate` (opt-in).
+
+    ``rates`` is a numpy array aligned 1:1 with the simulated frame's bars (the merged
+    ``funding_rate`` column; NaN where a bar had no rate). ``hours_per_bar`` scales the
+    per-bar rate to the bar's holding interval (funding accrues hourly). Supplied only by
+    the backtest funding path; the scanner and every parity test leave it None so the
+    kernel stays byte-identically price-only and funding is owned by the post-walk pass.
+    """
+
+    rates: "np.ndarray"
+    hours_per_bar: float
 
 
 def _trade_direction_sign(direction: str) -> float:
@@ -57,14 +73,30 @@ def _compute_atr_series(df: "pd.DataFrame", period: int = 14) -> "pd.Series":
 
 
 def round_trip_drag(fee_bps: float, slippage_bps: float, leverage: float) -> float:
-    """Per-equity round-trip cost (fees + slippage, paid on the leveraged notional)
-    subtracted from gross before sizing. The ONE definition used everywhere."""
+    """Round-trip cost at unchanged price, as a fraction of account equity.
+
+    This remains the public cost-rate helper.  At trade finalization the exit leg is
+    scaled by ``exit_price / entry_price`` so costs are charged on the actual exit
+    notional rather than assuming both legs have the entry notional.
+    """
     return (
         2.0
         * (max(float(fee_bps or 0.0), 0.0) + max(float(slippage_bps or 0.0), 0.0))
         / 10000.0
         * max(float(leverage), 0.0)
     )
+
+
+def _trade_drag(round_trip_cost_at_entry: float, entry_price: float, exit_price: float) -> float:
+    """Return exact two-leg drag for a fixed-unit position.
+
+    Half of ``round_trip_cost_at_entry`` is the entry leg.  The other half is the
+    exit leg and changes with the position's notional value.
+    """
+    if entry_price <= 0:
+        return max(float(round_trip_cost_at_entry or 0.0), 0.0)
+    exit_notional_ratio = max(float(exit_price or 0.0), 0.0) / entry_price
+    return max(float(round_trip_cost_at_entry or 0.0), 0.0) * 0.5 * (1.0 + exit_notional_ratio)
 
 
 def cost_breakdown_usd(
@@ -76,6 +108,7 @@ def cost_breakdown_usd(
     slippage_bps: float,
     funding_gain_pct: float = 0.0,
     net_pnl_usd: float | None = None,
+    exit_notional_ratio: float = 1.0,
 ) -> dict:
     """Itemize, in dollars, the costs :func:`round_trip_drag` already charged inside
     a kernel trade's net ``pnl_pct`` — for persistence into the trade's signal_data
@@ -93,20 +126,24 @@ def cost_breakdown_usd(
         * max(float(leverage or 0.0), 0.0)
         * max(float(size_fraction or 0.0), 0.0)
     )
-    leg_fee = (max(float(fee_bps or 0.0), 0.0) / 10000.0) * notional
-    slippage_usd = 2.0 * (max(float(slippage_bps or 0.0), 0.0) / 10000.0) * notional
+    exit_ratio = max(float(exit_notional_ratio or 0.0), 0.0)
+    entry_fee = (max(float(fee_bps or 0.0), 0.0) / 10000.0) * notional
+    exit_fee = entry_fee * exit_ratio
+    entry_slippage = (max(float(slippage_bps or 0.0), 0.0) / 10000.0) * notional
+    exit_slippage = entry_slippage * exit_ratio
+    slippage_usd = entry_slippage + exit_slippage
     funding_usd = -float(funding_gain_pct or 0.0) * max(float(equity_at_entry or 0.0), 0.0)
     breakdown = {
         "fee_bps": max(float(fee_bps or 0.0), 0.0),
-        "entry_fee_usd": round(leg_fee, 6),
-        "exit_fee_usd": round(leg_fee, 6),
-        "total_fees_usd": round(2.0 * leg_fee, 6),
+        "entry_fee_usd": round(entry_fee, 6),
+        "exit_fee_usd": round(exit_fee, 6),
+        "total_fees_usd": round(entry_fee + exit_fee, 6),
         "slippage_usd": round(slippage_usd, 6),
         "funding_usd": round(funding_usd, 6),
     }
     if net_pnl_usd is not None:
         breakdown["gross_pnl_usd"] = round(
-            float(net_pnl_usd) + 2.0 * leg_fee + slippage_usd + funding_usd, 6
+            float(net_pnl_usd) + entry_fee + exit_fee + slippage_usd + funding_usd, 6
         )
     return breakdown
 
@@ -143,6 +180,47 @@ class KernelResult:
     pending_entries: dict[str, dict] = field(default_factory=dict)
     pending_exits: dict[str, dict] = field(default_factory=dict)
     ec: dict | None = None
+    # The funding context :func:`simulate` ran with (None = price-only). Exposed so the
+    # backtest's force-close applies funding to the end-of-data trade with the same
+    # series/alignment the walk used, keeping the single-application invariant intact.
+    funding: "FundingContext | None" = None
+
+
+def _accrue_funding_gross(
+    funding: "FundingContext | None",
+    direction: str,
+    entry_bar: int,
+    exit_idx: int,
+    leverage: float,
+) -> tuple[float | None, bool]:
+    """Pre-size, leveraged funding return for a position held over [entry_bar, exit_idx).
+
+    Returns ``(funding_gross, complete)`` where ``funding_gross`` is the equity-fraction
+    funding term at UNIT size (positive = credit received, negative = paid) and
+    ``complete`` is False if any held bar lacked a funding rate. Returns ``(None, ...)``
+    when no funding context is supplied (the default — kernel stays price-only, and the
+    post-walk :func:`backtest._apply_funding_to_trades` owns funding as before).
+
+    Sign/scale mirror ``_apply_funding_to_trades`` EXACTLY except it stops before the
+    ``* size_fraction`` step (that is applied by the caller), so the two never diverge:
+    ``funding_pnl = -sign * Σfunding_rate * hours * leverage`` (pre-size).
+    """
+    if funding is None:
+        return None, True
+    rates = funding.rates
+    n = len(rates)
+    lo = max(int(entry_bar), 0)
+    hi = min(int(exit_idx), n)
+    if hi <= lo:
+        # Zero-bar hold accrues no funding — trivially complete (mirrors the
+        # bars_held<=0 branch in _apply_funding_to_trades).
+        return 0.0, True
+    window = rates[lo:hi]
+    complete = not bool(np.isnan(window).any())
+    funding_sum = float(np.nansum(window))
+    sign = _trade_direction_sign(direction)
+    funding_gross = -sign * funding_sum * funding.hours_per_bar * max(float(leverage), 0.0)
+    return funding_gross, complete
 
 
 def finalize(
@@ -159,19 +237,37 @@ def finalize(
     leverage: float,
     trade_mode: str,
     open_at_end: bool = False,
+    funding: "FundingContext | None" = None,
 ) -> None:
     """Append one realized trade (and its pre-size gross to the kelly evidence list).
 
     Shared by :func:`simulate`'s in-loop exits and the backtest's end-of-data
     force-close so the math is defined exactly once.
+
+    When ``funding`` is supplied (opt-in; default None), the position's perp funding is
+    accrued INSIDE the walk: the pre-size funding return is folded into ``gross`` (so the
+    kelly evidence series ``closed_gross`` is funding-aware — the whole point) and the
+    size-scaled funding into ``pnl_pct`` (so the kernel's own trade PnL is funding-aware
+    too). The trade is stamped ``_funding_from_kernel`` so the post-walk
+    ``_apply_funding_to_trades`` SKIPS it — funding is applied exactly once.
     """
     entry_price = float(at["entry_price"])
     if entry_price <= 0:
         return
     sign = _trade_direction_sign(direction)
-    gross = ((exit_price - entry_price) / entry_price) * sign * leverage - round_trip_drag
-    closed_gross.append(gross)  # pre-size, for kelly evidence
+    drag = _trade_drag(round_trip_drag, entry_price, float(exit_price))
+    gross = ((exit_price - entry_price) / entry_price) * sign * leverage - drag
     size_fraction = float(at.get("size_fraction", 1.0))
+
+    funding_gross, funding_complete = _accrue_funding_gross(
+        funding, direction, int(at["entry_bar"]), int(exit_idx), leverage
+    )
+    if funding_gross is not None:
+        # Fold funding into the pre-size gross BEFORE the kelly-evidence append so
+        # Kelly learns from the funding-adjusted return (fixes the high-funding
+        # size-up bias); the trade's net pnl then carries the size-scaled leg.
+        gross = gross + funding_gross
+    closed_gross.append(gross)  # pre-size, for kelly evidence (funding-aware when supplied)
     pnl_pct = gross * size_fraction
     trade = {
         "entry_bar": int(at["entry_bar"]),
@@ -188,8 +284,17 @@ def finalize(
         # Full-precision fraction (the display field above is rounded to 4dp); the
         # post-hoc funding pass reads this so its leg is scaled identically to price PnL.
         "size_fraction_raw": size_fraction,
+        "leverage": float(leverage),
+        "cost_drag_pct": round(float(drag * size_fraction), 8),
         "exit_reason": exit_reason,
     }
+    if funding_gross is not None:
+        # Kernel-applied funding: stamp the same fields _apply_funding_to_trades would,
+        # and mark it so that post-walk pass skips this trade (single-application invariant).
+        trade["funding_cost_pct"] = round(float(funding_gross * size_fraction), 6)
+        trade["funding_applied"] = True
+        trade["funding_complete"] = bool(funding_complete)
+        trade["_funding_from_kernel"] = True
     if open_at_end:
         trade["open_at_end"] = True
     if at.get("regime") is not None:
@@ -210,12 +315,13 @@ def simulate(
     ec: dict,
     initial_capital: float,
     intrabar_resolver=None,
+    funding: "FundingContext | None" = None,
 ) -> KernelResult:
     """Walk the bars and produce closed trades + still-open positions (no force-close).
 
-    Entries fill at the NEXT bar's open (no lookahead). Stops are evaluated intrabar
-    against each subsequent bar's high/low; a position entered on bar *i* is first
-    stop-checked on bar *i+1*. Per-trade ``size_fraction`` scales price PnL.
+    Entries fill at the NEXT bar's open (no lookahead). Protective orders are active
+    immediately after that fill, so the entry bar's remaining high/low can trigger a
+    stop, target, or liquidation. Per-trade ``size_fraction`` scales price PnL.
 
     ``intrabar_resolver`` (optional): when a bar touches BOTH the stop and the
     take-profit, the ordering is ambiguous from OHLC alone and the kernel
@@ -225,6 +331,11 @@ def simulate(
     returns ``"stop"`` / ``"tp"`` / ``None`` (None = stay pessimistic). It is
     consulted ONLY in the both-touched case, so single-touch bars are
     byte-identical with the resolver on or off.
+
+    ``funding`` (optional): a :class:`FundingContext` of the per-bar funding series.
+    When supplied, each trade's funding is accrued at finalize (folded into the kelly
+    evidence AND the trade's net PnL) and the post-walk pass skips it — see
+    :func:`finalize`. Default None ⇒ price-only kernel (byte-identical to pre-v5).
     """
     opens = df["open"].astype(float).values
     highs = df["high"].astype(float).values
@@ -236,6 +347,13 @@ def simulate(
     closed_gross: list[float] = []  # gross (pre-size) returns of closed trades, for kelly
 
     lev = max(float(leverage), 1e-9)
+    maintenance_margin_ratio = 0.005
+
+    # Running realized equity, compounded from each closed trade's net pnl_pct. Only
+    # ``fixed``-mode sizing reads it (true fixed-DOLLAR notional: the target dollar amount
+    # divided by the account value AT ENTRY, so a growing account deploys a shrinking
+    # fraction). Other modes ignore current_equity, so this is inert for them.
+    realized_equity = [max(float(initial_capital), 0.0)]
 
     def _entry_stop_dist_pct(entry_idx: int, entry_price: float) -> float | None:
         atr_value = (
@@ -249,7 +367,20 @@ def simulate(
         return _sizing.size_fraction(
             ec, stop_dist_pct, leverage=lev,
             initial_capital=initial_capital, closed_gross=closed_gross,
+            current_equity=realized_equity[0],
         )
+
+    def _finalize(at, direction, exit_price, exit_idx, exit_time, exit_reason, *, open_at_end=False):
+        """Finalize a trade AND advance the running equity by its net return, so a
+        later fixed-mode entry sizes off the up-to-date account value."""
+        before = len(trades)
+        finalize(
+            trades, closed_gross, at, direction, exit_price, exit_idx, exit_time, exit_reason,
+            round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode,
+            open_at_end=open_at_end, funding=funding,
+        )
+        if len(trades) > before:
+            realized_equity[0] = max(0.0, realized_equity[0] * (1.0 + float(trades[-1]["pnl_pct"])))
 
     for idx in range(max(int(warmup), 0) + 1, len(df)):
         signal_idx = idx - 1
@@ -294,6 +425,16 @@ def simulate(
                 else:
                     eff_stop = max(eff_stop, trail_level) if direction == "long" else min(eff_stop, trail_level)
             tp = at.get("target_price")
+            liq = at.get("liquidation_price")
+
+            # A gap beyond liquidation is terminal at the opening mark.  Otherwise a
+            # nearer resting stop is allowed to fill before the farther liquidation
+            # level as price moves intrabar.
+            if exit_price is None and liq is not None:
+                if direction == "long" and fill_price <= liq:
+                    exit_price, exit_reason = fill_price, "liquidation"
+                elif direction == "short" and fill_price >= liq:
+                    exit_price, exit_reason = fill_price, "liquidation"
 
             # Both-touched arbitration: when THIS bar touches the stop AND the
             # take-profit, OHLC alone can't order them — default is stop-first
@@ -320,6 +461,12 @@ def simulate(
                     exit_price = max(fill_price, eff_stop)
                     exit_reason = "trailing_stop" if (at.get("trail_pct") and (at.get("stop_price") is None or eff_stop < at["stop_price"])) else "stop_loss"
 
+            if exit_price is None and liq is not None:
+                if direction == "long" and bar_low <= liq:
+                    exit_price, exit_reason = liq, "liquidation"
+                elif direction == "short" and bar_high >= liq:
+                    exit_price, exit_reason = liq, "liquidation"
+
             if exit_price is None and tp is not None:
                 # Take-profit is a resting limit; model it conservatively as filling
                 # AT the target even on a gap-through (never crediting the more
@@ -330,40 +477,114 @@ def simulate(
                     exit_price, exit_reason = (tp, "take_profit")
 
             if exit_price is not None:
-                finalize(trades, closed_gross, at, direction, exit_price, idx, current_time, exit_reason,
-                         round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode)
+                _finalize(at, direction, exit_price, idx, current_time, exit_reason)
                 active_trades[direction] = None
             elif at.get("trail_pct"):
                 # Still open — ratchet the trailing peak with THIS bar for the next bar.
                 at["extreme"] = max(at["extreme"], bar_high) if direction == "long" else min(at["extreme"], bar_low)
 
-        # (2) Signal-driven entries (fill at this bar's open).
+        # (2) Signal-driven entries (fill at this bar's open).  All legs share one
+        # account allocation.  Simultaneous hedged entries are scaled pro-rata so
+        # iteration order cannot give either side preferential capital.
+        entry_candidates: list[tuple[str, float | None, float]] = []
         for direction in allowed_modes:
             entry_series = signals.long_entries if direction == "long" else signals.short_entries
             if active_trades.get(direction) is not None or not bool(entry_series.iloc[signal_idx]):
                 continue
-            sign = _trade_direction_sign(direction)
             # Size/stop off the ATR through the LAST CLOSED bar (signal_idx = idx-1).
             # Using atr_vals[idx] would read the entry bar's own (not-yet-realized)
             # high/low/close at the open where the fill happens — a forward-looking read.
             stop_dist_pct = _entry_stop_dist_pct(signal_idx, fill_price)
+            entry_candidates.append((direction, stop_dist_pct, _size_fraction(stop_dist_pct)))
+
+        active_fraction = sum(
+            max(float(at.get("size_fraction", 0.0)), 0.0)
+            for at in active_trades.values()
+            if at is not None
+        )
+        available_fraction = max(0.0, 1.0 - active_fraction)
+        requested_fraction = sum(max(candidate[2], 0.0) for candidate in entry_candidates)
+        allocation_scale = (
+            min(1.0, available_fraction / requested_fraction)
+            if requested_fraction > 0.0
+            else 0.0
+        )
+
+        for direction, stop_dist_pct, requested_size in entry_candidates:
+            size_fraction = max(float(requested_size), 0.0) * allocation_scale
+            if size_fraction <= 0.0:
+                continue
+            sign = _trade_direction_sign(direction)
             stop_price = None
             if stop_dist_pct is not None and (ec["stop_loss_pct"] is not None or ec["sizing_mode"] == "atr"):
                 stop_price = fill_price * (1.0 - sign * stop_dist_pct)
             target_price = None
             if ec["take_profit_pct"] is not None:
                 target_price = fill_price * (1.0 + sign * ec["take_profit_pct"] / 100.0)
-            active_trades[direction] = {
+            liquidation_price = None
+            if lev > 1.0:
+                liquidation_move = (1.0 - maintenance_margin_ratio) / lev
+                liquidation_price = fill_price * (1.0 - sign * liquidation_move)
+            at = {
                 "entry_bar": idx,
                 "entry_price": fill_price,
                 "entry_time": current_time,
                 "regime": regimes.iloc[signal_idx] if regimes is not None and len(regimes) > signal_idx else RANGE_BOUND,
-                "size_fraction": _size_fraction(stop_dist_pct),
+                "size_fraction": size_fraction,
                 "stop_price": stop_price,
                 "target_price": target_price,
+                "liquidation_price": liquidation_price,
                 "trail_pct": (ec["trailing_stop_pct"] / 100.0) if ec["trailing_stop_pct"] is not None else None,
                 "extreme": fill_price,
             }
+            active_trades[direction] = at
+
+            # The fill occurs at the first tick of this bar.  Resting protection is
+            # therefore exposed to the remaining intrabar path immediately.
+            exit_price: float | None = None
+            exit_reason = ""
+            liq = at.get("liquidation_price")
+            if liq is not None:
+                if direction == "long" and fill_price <= liq:
+                    exit_price, exit_reason = fill_price, "liquidation"
+                elif direction == "short" and fill_price >= liq:
+                    exit_price, exit_reason = fill_price, "liquidation"
+
+            stop_touched = (
+                stop_price is not None
+                and ((bar_low <= stop_price) if direction == "long" else (bar_high >= stop_price))
+            )
+            tp_touched = (
+                target_price is not None
+                and ((bar_high >= target_price) if direction == "long" else (bar_low <= target_price))
+            )
+            if exit_price is None and stop_touched and tp_touched and intrabar_resolver is not None:
+                try:
+                    first = intrabar_resolver(
+                        df.index[idx], direction, float(stop_price), float(target_price)
+                    )
+                except Exception:
+                    first = None
+                if first == "tp":
+                    exit_price, exit_reason = float(target_price), "take_profit"
+
+            if exit_price is None and stop_touched:
+                exit_price = min(fill_price, float(stop_price)) if direction == "long" else max(fill_price, float(stop_price))
+                exit_reason = "stop_loss"
+
+            if exit_price is None and liq is not None:
+                liq_touched = (bar_low <= liq) if direction == "long" else (bar_high >= liq)
+                if liq_touched:
+                    exit_price, exit_reason = float(liq), "liquidation"
+
+            if exit_price is None and tp_touched:
+                exit_price, exit_reason = float(target_price), "take_profit"
+
+            if exit_price is not None:
+                _finalize(at, direction, exit_price, idx, current_time, exit_reason)
+                active_trades[direction] = None
+            elif at.get("trail_pct"):
+                at["extreme"] = max(fill_price, bar_high) if direction == "long" else min(fill_price, bar_low)
 
     # (3) Pending open-tick decisions for the NEXT (forming) bar. The main loop consumes
     # signals only up to signal_idx = len(df)-2 — the LAST bar's signal decides an order
@@ -414,7 +635,7 @@ def simulate(
     open_positions = {direction: at for direction, at in active_trades.items() if at is not None}
     return KernelResult(
         closed_trades=trades, open_positions=open_positions, closed_gross=closed_gross,
-        pending_entries=pending_entries, pending_exits=pending_exits, ec=ec,
+        pending_entries=pending_entries, pending_exits=pending_exits, ec=ec, funding=funding,
     )
 
 
@@ -425,10 +646,15 @@ def force_close(
     leverage: float,
     round_trip_drag: float,
     trade_mode: str,
+    funding: "FundingContext | None" = None,
 ) -> list[dict]:
     """Append a synthetic close at the final bar's close for every still-open position
     (the backtest's end-of-data accounting). Mutates and returns ``res.closed_trades``.
-    The scanner does NOT call this — it leaves the position live."""
+    The scanner does NOT call this — it leaves the position live.
+
+    ``funding`` mirrors :func:`simulate`: when supplied, the end-of-data close accrues
+    its funding inside the kernel and is stamped so the post-walk pass skips it. Default
+    None keeps the price-only convention (the scanner never calls this)."""
     trades = res.closed_trades
     final_idx = len(df) - 1
     final_close = float(df["close"].iloc[final_idx]) if len(df) else 0.0
@@ -438,6 +664,7 @@ def force_close(
             continue
         finalize(
             trades, res.closed_gross, at, direction, final_close, final_idx, final_time, "signal",
-            round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode, open_at_end=True,
+            round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode,
+            open_at_end=True, funding=funding,
         )
     return trades

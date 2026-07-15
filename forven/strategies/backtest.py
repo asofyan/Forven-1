@@ -24,6 +24,8 @@ import importlib
 
 import logging
 
+import math
+
 
 import os
 
@@ -59,7 +61,16 @@ import pandas as pd
 from forven.db import create_strategy_container, get_db, init_db, next_container_id
 
 
-from forven.regime import HIGH_VOL, RANGE_BOUND, TREND_DOWN, TREND_UP, _classify, resolve_regime_gate
+from forven.regime import (
+    HIGH_VOL,
+    RANGE_BOUND,
+    TREND_DOWN,
+    TREND_UP,
+    _classify,
+    regime_atr_ratio_at,
+    regime_atr_ratio_series,
+    resolve_regime_gate,
+)
 
 
 from forven.scanner import (
@@ -366,17 +377,22 @@ def _isolated_backtest_worker(
             trade_mode=trade_mode,
             execution_controls=execution_controls, initial_capital=initial_capital,
             asset=asset, resolved_timeframe=resolved_timeframe,
+            include_funding=include_funding,
         )
     except Exception as e:
         return {"error": f"Indicator execution failed during in-sample: {_describe_signal_walk_error(e)}"}
 
     if include_funding:
+        # Kernel-path trades were already funded in-walk (funding-aware kelly) and are
+        # skipped here; legacy/slow-path trades are funded now — single application either way.
         is_trades, _ = _apply_funding_to_trades(is_trades, is_df, leverage, resolved_timeframe)
 
+    is_equity_curve = _build_equity_curve_from_trades(is_trades, is_df, initial_capital)
     is_metrics = compute_metrics(
         is_trades, len(is_df), timeframe=resolved_timeframe,
         start_date=is_df.index[0].isoformat(), end_date=is_df.index[-1].isoformat(),
         trade_mode=trade_mode,
+        equity_curve=is_equity_curve,
     )
 
     try:
@@ -388,6 +404,7 @@ def _isolated_backtest_worker(
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
                 asset=asset, resolved_timeframe=resolved_timeframe,
+                include_funding=include_funding,
             ),
             oos_start_timestamp,
         )
@@ -397,12 +414,24 @@ def _isolated_backtest_worker(
     if include_funding:
         # entry_bar indexes into oos_context_df (the warmup-padded slice the walk
         # ran on), not oos_df, so funding must be looked up against that frame.
+        # Kernel-funded trades are skipped inside _apply_funding_to_trades (single application).
         oos_trades, _ = _apply_funding_to_trades(oos_trades, oos_context_df, leverage, resolved_timeframe)
 
+    oos_equity_curve = _build_equity_curve_from_trades(
+        oos_trades,
+        oos_context_df,
+        initial_capital,
+    )
+    oos_equity_curve = [
+        point
+        for point in oos_equity_curve
+        if pd.to_datetime(point.get("timestamp"), utc=True, errors="coerce") >= oos_start_timestamp
+    ]
     oos_metrics = compute_metrics(
         oos_trades, len(oos_df), timeframe=resolved_timeframe,
         start_date=oos_df.index[0].isoformat(), end_date=oos_df.index[-1].isoformat(),
         trade_mode=trade_mode,
+        equity_curve=oos_equity_curve,
     )
 
     return {
@@ -410,6 +439,8 @@ def _isolated_backtest_worker(
         "is_metrics": is_metrics,
         "oos_trades": oos_trades,
         "oos_metrics": oos_metrics,
+        "is_equity_curve": is_equity_curve,
+        "oos_equity_curve": oos_equity_curve,
     }
 
 
@@ -432,6 +463,9 @@ def _isolated_walk_forward_worker(
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
     asset: str | None = None,
+    cv_method: str = "expanding",
+    purge_gap: int = 0,
+    embargo_pct: float = 0.0,
 ) -> dict:
     """Run walk-forward splits in an isolated child process.
 
@@ -442,97 +476,150 @@ def _isolated_walk_forward_worker(
     """
     strategy_obj = None
     checker = SIGNAL_CHECKERS.get(family_strategy_type)
-    # Load only the registry slice this walk-forward needs: built-in strategies skip
-    # the ~12s custom-module import+AST-scan that full discover() pays on every spawn.
-    cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
-    if cls:
-        try:
-            strategy_obj = cls(strategy_id, params)
-        except Exception as e:
-            return {"error": f"Failed to instantiate strategy: {e}"}
+    from forven.strategies.sandbox_proxy import SandboxOnlyStrategy, is_sandbox_only_type
 
-    if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
-        return {"error": f"Unknown strategy type: {original_strategy_type}"}
+    if is_sandbox_only_type(original_strategy_type):
+        # Untrusted-origin (imported) strategy: NEVER resolve/instantiate its real
+        # class in this process. Build the non-executing proxy — run_strategy_execution
+        # force-routes its signal generation to the locked-down sandbox worker. Same
+        # branch as _isolated_backtest_worker; its absence here made every sandbox
+        # strategy's persisted walk-forward error "Unknown strategy type" once the
+        # robustness path resolved the namespaced runtime_type (S06895, 2026-07-12).
+        strategy_obj = SandboxOnlyStrategy(strategy_id, params, runtime_type=original_strategy_type)
+        checker = None
+    else:
+        # Load only the registry slice this walk-forward needs: built-in strategies skip
+        # the ~12s custom-module import+AST-scan that full discover() pays on every spawn.
+        cls = _resolve_worker_strategy_class(original_strategy_type, family_strategy_type)
+        if cls:
+            try:
+                strategy_obj = cls(strategy_id, params)
+            except Exception as e:
+                return {"error": f"Failed to instantiate strategy: {e}"}
 
-    split_size = len(df) // resolved_n_splits
+        if strategy_obj is None and not checker and family_strategy_type not in _VECTORIZABLE_TYPES:
+            return {"error": f"Unknown strategy type: {original_strategy_type}"}
+
     splits = []
     all_oos_trades = []
+    all_oos_curves: list[list[dict]] = []
+
+    n_rows = len(df)
+    initial_train_bars = max(
+        int(n_rows * resolved_in_sample_pct),
+        warmup + _MIN_WALK_FORWARD_EVAL_BARS,
+    )
+    purge_bars = max(int(purge_gap), 0)
+    provisional_test = max((n_rows - initial_train_bars) // max(resolved_n_splits, 1), 1)
+    embargo_bars = max(int(math.ceil(provisional_test * max(float(embargo_pct), 0.0))), 0)
+    available_for_tests = (
+        n_rows
+        - initial_train_bars
+        - resolved_n_splits * purge_bars
+        - max(resolved_n_splits - 1, 0) * embargo_bars
+    )
+    test_bars = available_for_tests // max(resolved_n_splits, 1)
+
+    if test_bars < _MIN_WALK_FORWARD_EVAL_BARS:
+        return {
+            "error": (
+                "walk-forward produced no evaluable folds after purge/embargo: "
+                f"{test_bars} OOS bars per fold (< {_MIN_WALK_FORWARD_EVAL_BARS})"
+            )
+        }
+
+    method = str(cv_method or "expanding").strip().lower()
+    rolling = method in {"rolling", "rolling_origin", "rolling-window", "rolling_window"}
 
     for i in range(resolved_n_splits):
-        start = i * split_size
-        end = min(start + split_size, len(df))
-        window = df.iloc[start:end].copy()
-
-        if len(window) < warmup + 20:
+        train_end = initial_train_bars + i * (test_bars + purge_bars + embargo_bars)
+        test_start = train_end + purge_bars
+        test_end = min(test_start + test_bars, n_rows)
+        train_start = max(0, train_end - initial_train_bars) if rolling else 0
+        train_window = df.iloc[train_start:train_end].copy()
+        if len(train_window) < warmup + _MIN_WALK_FORWARD_EVAL_BARS:
             continue
-
-        split_point = int(len(window) * resolved_in_sample_pct)
-        oos_bars = len(window) - split_point
-        if split_point < warmup + _MIN_WALK_FORWARD_EVAL_BARS:
-            continue
+        oos_bars = test_end - test_start
         if oos_bars < _MIN_WALK_FORWARD_EVAL_BARS:
             continue
 
         try:
             is_trades = _run_signal_walk(
-                checker, window.iloc[:split_point], params, warmup, leverage,
+                checker, train_window, params, warmup, leverage,
                 strategy_obj, strategy_type=family_strategy_type,
                 fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                 trade_mode=trade_mode,
                 execution_controls=execution_controls, initial_capital=initial_capital,
                 asset=asset, resolved_timeframe=resolved_timeframe,
+                include_funding=include_funding,
             )
             if include_funding:
                 is_trades, _ = _apply_funding_to_trades(
-                    is_trades, window.iloc[:split_point], leverage, resolved_timeframe
+                    is_trades, train_window, leverage, resolved_timeframe
                 )
+            is_curve = _build_equity_curve_from_trades(is_trades, train_window, initial_capital)
             is_metrics = compute_metrics(
                 is_trades,
-                split_point,
+                len(train_window),
                 timeframe=resolved_timeframe,
                 trade_mode=trade_mode,
+                equity_curve=is_curve,
             )
         except Exception as e:
             return {"error": f"Walk-forward IS execution failed on split {i+1}: {e}"}
 
-        oos_start = max(split_point - warmup, 0)
-        oos_boundary = window.index[split_point]
+        context_start = max(train_start, test_start - warmup)
+        oos_context = df.iloc[context_start:test_end]
+        oos_boundary = df.index[test_start]
         try:
             oos_trades = _filter_trades_from_start(
                 _run_signal_walk(
-                    checker, window.iloc[oos_start:], params, warmup, leverage,
+                    checker, oos_context, params, warmup, leverage,
                     strategy_obj, strategy_type=family_strategy_type,
                     fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
                     trade_mode=trade_mode,
                     execution_controls=execution_controls, initial_capital=initial_capital,
                     asset=asset, resolved_timeframe=resolved_timeframe,
+                    include_funding=include_funding,
                 ),
                 oos_boundary,
             )
             if include_funding:
                 oos_trades, _ = _apply_funding_to_trades(
-                    oos_trades, window.iloc[oos_start:], leverage, resolved_timeframe
+                    oos_trades, oos_context, leverage, resolved_timeframe
                 )
+            oos_curve = _build_equity_curve_from_trades(oos_trades, oos_context, initial_capital)
+            oos_curve = [
+                point
+                for point in oos_curve
+                if pd.to_datetime(point.get("timestamp"), utc=True, errors="coerce") >= oos_boundary
+            ]
             oos_metrics = compute_metrics(
                 oos_trades, oos_bars, timeframe=resolved_timeframe,
-                start_date=oos_boundary.isoformat(), end_date=window.index[-1].isoformat(),
+                start_date=oos_boundary.isoformat(), end_date=df.index[test_end - 1].isoformat(),
                 trade_mode=trade_mode,
+                equity_curve=oos_curve,
             )
         except Exception as e:
             return {"error": f"Walk-forward OOS execution failed on split {i+1}: {e}"}
 
         all_oos_trades.extend(oos_trades)
+        all_oos_curves.append(oos_curve)
         # P25-3: Per-fold sample-size and coverage in validation artifacts
         splits.append({
             "split": i + 1,
-            "bars": len(window),
-            "is_bars": split_point,
+            "bars": len(train_window) + oos_bars,
+            "is_bars": len(train_window),
             "oos_bars": oos_bars,
-            "is_pct": round(split_point / max(len(window), 1), 3),
+            "purge_bars": purge_bars,
+            "embargo_bars": embargo_bars,
+            "cv_method": "rolling" if rolling else "expanding",
+            "is_pct": round(len(train_window) / max(len(train_window) + oos_bars, 1), 3),
             "date_range": {
-                "start": window.index[0].isoformat() if len(window) > 0 else None,
+                "start": train_window.index[0].isoformat() if len(train_window) > 0 else None,
+                "train_end": train_window.index[-1].isoformat() if len(train_window) > 0 else None,
                 "split_at": oos_boundary.isoformat(),
-                "end": window.index[-1].isoformat() if len(window) > 0 else None,
+                "end": df.index[test_end - 1].isoformat(),
             },
             "in_sample": {"trades": len(is_trades), **is_metrics},
             "out_of_sample": {"trades": len(oos_trades), **oos_metrics},
@@ -548,7 +635,14 @@ def _isolated_walk_forward_worker(
             "fold count (each fold needs >= warmup+min-eval in-sample bars). Use a longer "
             "window or fewer folds."
         )}
-    return {"splits": splits, "all_oos_trades": all_oos_trades}
+    return {
+        "splits": splits,
+        "all_oos_trades": all_oos_trades,
+        "all_oos_curves": all_oos_curves,
+        "cv_method": "rolling" if rolling else "expanding",
+        "purge_bars": purge_bars,
+        "embargo_bars": embargo_bars,
+    }
 
 
 
@@ -1746,16 +1840,26 @@ def _sync_strategy_metrics_and_promote_if_eligible(
             if integrity_anomalies:
                 metrics[DATA_QUALITY_FLAGS_KEY] = integrity_anomalies
 
-            conn.execute(
+            updated = conn.execute(
 
 
-                "UPDATE strategies SET metrics = ?, updated_at = ? WHERE id = ?",
+                """UPDATE strategies
+                   SET metrics = ?, updated_at = ?
+                   WHERE id = ?
+                     AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
+                         ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
 
 
                 (json.dumps(metrics), datetime.now(timezone.utc).isoformat(), strategy_id),
 
 
             )
+            if updated.rowcount != 1:
+                log.info(
+                    "metrics locked: %s entered an operator-owned stage during backtest sync",
+                    strategy_id,
+                )
+                return
 
 
     except Exception as exc:
@@ -5848,16 +5952,11 @@ def _precompute_regimes(df: pd.DataFrame) -> pd.Series:
     h, low_p, c = df["high"], df["low"], df["close"]
 
 
-    tr = pd.concat([(h - low_p), (h - c.shift()).abs(), (low_p - c.shift()).abs()], axis=1).max(axis=1)
-
-
-    atr_current = tr.rolling(14).mean()
-
-
-    atr_avg = tr.rolling(44).mean().shift(14)
-
-
-    atr_ratio = (atr_current / atr_avg.clip(lower=1e-9)).fillna(1.0)
+    # v5: shared regime ATR-ratio baseline (14-bar recent vs 30-bar lagged) so a bar
+    # classifies to the SAME regime here, in robustness, and in the live detector. The
+    # signal-walk previously used a 44-bar baseline (the odd one out) — see
+    # forven.regime.regime_atr_ratio_series.
+    atr_ratio = regime_atr_ratio_series(h, low_p, c).fillna(1.0)
 
 
 
@@ -6423,6 +6522,30 @@ def _hours_per_bar(timeframe: str) -> float:
     return 1.0
 
 
+def _build_funding_context(
+    df: "pd.DataFrame",
+    leverage: float,
+    timeframe: str | None,
+) -> "_kernel.FundingContext | None":
+    """Build the per-bar funding series the kernel accrues in-walk (funding-aware kelly).
+
+    Returns None when the frame carries no ``funding_rate`` column, so the kernel stays
+    price-only and the caller's post-walk :func:`_apply_funding_to_trades` still marks the
+    result funding-incomplete (unchanged behaviour). When present, the ``rates`` array is
+    the raw per-bar funding rate (NaN preserved so a missing bar surfaces as
+    funding-incomplete, exactly like the post-walk pass's window.isna() check).
+
+    Sign/scale are applied inside the kernel's ``_accrue_funding_gross`` to mirror
+    :func:`_apply_funding_to_trades` bit-for-bit (verified by
+    tests/test_funding_kelly_single_application).
+    """
+    if df is None or "funding_rate" not in getattr(df, "columns", []):
+        return None
+    rates = df["funding_rate"].to_numpy(dtype=float)  # NaN preserved for incomplete bars
+    hours = _hours_per_bar(str(timeframe or "1h"))
+    return _kernel.FundingContext(rates=rates, hours_per_bar=float(hours))
+
+
 def _apply_funding_to_trades(
     trades: list[dict],
     df: "pd.DataFrame",
@@ -6459,6 +6582,13 @@ def _apply_funding_to_trades(
     lev = max(float(leverage), 0.0)
     all_complete = True
     for t in trades:
+        # SINGLE-APPLICATION INVARIANT: a trade the kernel already funded in-walk carries
+        # ``_funding_from_kernel``. Never re-apply funding to it — just honor its stamped
+        # completeness so the aggregate all_complete flag stays correct.
+        if t.get("_funding_from_kernel"):
+            if not bool(t.get("funding_complete", True)):
+                all_complete = False
+            continue
         entry_bar = max(int(t.get("entry_bar", 0)), 0)
         bars_held = max(int(t.get("bars_held", 0)), 0)
         if bars_held <= 0:
@@ -6704,6 +6834,22 @@ def _run_directional_signal_series_with_controls(
     high/low; a position entered on bar *i* is first stop-checked on bar *i+1*.
     Per-trade ``size_fraction`` scales both price PnL and (downstream) funding.
     """
+    # Kept as a compatibility entry point for tests and older callers.  Execution
+    # semantics live exclusively in execution_kernel; maintaining a second loop here
+    # previously let correctness fixes drift between paper and backtest.
+    return _run_controls_via_kernel(
+        df,
+        signals,
+        warmup,
+        leverage,
+        regimes=regimes,
+        round_trip_drag=round_trip_drag,
+        trade_mode=trade_mode,
+        allowed_modes=allowed_modes,
+        ec=ec,
+        initial_capital=initial_capital,
+    )
+
     opens = df["open"].astype(float).values
     highs = df["high"].astype(float).values
     lows = df["low"].astype(float).values
@@ -7369,10 +7515,18 @@ def run_strategy_execution(
     strategy_type: str | None = None,
     symbol: str | None = None,
     timeframe: str | None = None,
+    include_funding: bool = False,
 ) -> "_kernel.KernelResult | None":
     """The ONE signals→regime-mask→kernel pipeline, shared by the backtest's
     vectorized walk and the live/paper scanner so paper reproduces the backtest by
     SHARING this code rather than re-implementing it.
+
+    ``include_funding`` (backtest opt-in; default False): when True and the frame carries
+    a ``funding_rate`` column, the kernel accrues perp funding INSIDE the walk (so kelly
+    evidence is funding-aware and each trade's PnL carries funding), and every kernel trade
+    is stamped so the post-walk :func:`_apply_funding_to_trades` skips it — funding is
+    applied exactly once. The scanner leaves it False and applies funding post-walk on the
+    returned trades as before, so its behaviour is unchanged.
 
     Resolves the strategy's vectorized signals (``generate_signals``), applies the
     regime gate, resolves the execution profile (or the default 1% fraction sizing),
@@ -7473,11 +7627,16 @@ def run_strategy_execution(
     intrabar_resolver = None
     if symbol and timeframe and str(timeframe) != "1m" and _intrabar_resolution_enabled():
         intrabar_resolver = _build_intrabar_resolver(symbol, str(timeframe), d.index)
+    # Fund the kernel walk in-line (backtest opt-in) so kelly sizing sees funding-adjusted
+    # returns instead of price-only ones (which biased high-funding strategies to size UP).
+    # Built from THIS frame (d) so the per-bar array aligns positionally with the walk; the
+    # scanner passes include_funding=False and keeps its post-walk funding pass.
+    funding_context = _build_funding_context(d, leverage, timeframe) if include_funding else None
     return _kernel.simulate(
         d, signals, warmup, leverage,
         regimes=regime_series, round_trip_drag=drag, trade_mode=trade_mode,
         allowed_modes=_allowed_modes_for(trade_mode), ec=ec, initial_capital=initial_capital,
-        intrabar_resolver=intrabar_resolver,
+        intrabar_resolver=intrabar_resolver, funding=funding_context,
     )
 
 
@@ -8026,7 +8185,7 @@ def backtest_strategy(
     if not isinstance(leverage, (int, float)) or isinstance(leverage, bool) or not np.isfinite(leverage) or leverage <= 0:
         raise ValueError(f"backtest_strategy: leverage must be a positive finite number, got {leverage!r}")
 
-    from forven.api_core import get_settings
+    from forven.api_core import _timeframe_to_minutes, get_settings
 
 
     settings = get_settings()
@@ -8171,43 +8330,8 @@ def backtest_strategy(
         duration_days = int(settings.get("backtest_duration_days", 730))
 
 
-        # Approximate bars based on timeframe
-
-
-        if resolved_timeframe == "1h":
-
-
-            bars = duration_days * 24
-
-
-        elif resolved_timeframe == "1d":
-
-
-            bars = duration_days
-
-
-        elif resolved_timeframe == "15m":
-
-
-            bars = duration_days * 24 * 4
-
-
-        elif resolved_timeframe == "5m":
-
-
-            bars = duration_days * 24 * 12
-
-
-        elif resolved_timeframe == "1m":
-
-
-            bars = duration_days * 24 * 60
-
-
-        else:
-
-
-            bars = duration_days * 24 # Fallback to hourly
+        minutes_per_bar = max(int(_timeframe_to_minutes(resolved_timeframe)), 1)
+        bars = max(1, math.ceil(duration_days * 24 * 60 / minutes_per_bar))
 
 
     
@@ -8496,10 +8620,16 @@ def backtest_strategy(
         _avail = evaluate_data_availability(
             original_strategy_type, asset, resolved_timeframe, strategy_id=strategy_id
         )
-    except Exception as _avail_exc:  # defensive: never let the guard brick a backtest
-        log.warning("data-availability precheck raised (skipping): %s", _avail_exc)
-        _avail = None
-    if _avail is not None and _avail.blocked:
+    except Exception as _avail_exc:  # defensive: an unknown feed set cannot certify input
+        from forven.strategies.data_availability import DataAvailabilityResult
+
+        log.warning("data-availability precheck raised (failing closed): %s", _avail_exc)
+        _avail = DataAvailabilityResult(
+            ok=False,
+            blocked=True,
+            error=f"Cannot verify data availability for {strategy_id}: {_avail_exc}",
+        )
+    if _avail.blocked:
         log.warning("Data availability BLOCK for %s: %s", strategy_id, _avail.error)
         return {
             "error": _avail.error,
@@ -8916,7 +9046,11 @@ def backtest_strategy(
     # autonomous/paper pipeline passes None → the historical 10k default.
 
 
-    equity_curve = _build_equity_curve_from_trades(oos_trades, oos_df, resolved_initial_capital)
+    equity_curve = worker_result.get("oos_equity_curve") or _build_equity_curve_from_trades(
+        oos_trades,
+        oos_df,
+        resolved_initial_capital,
+    )
 
 
     benchmark_curve = _build_buy_and_hold_curve(oos_df, resolved_initial_capital)
@@ -9348,7 +9482,10 @@ def _downsample_curve(curve: list[dict], max_points: int = 2000) -> list[dict]:
         return list(curve) if isinstance(curve, list) else []
     kept: list[dict] = [curve[0]]
     for i in range(1, len(curve)):
-        if curve[i].get("equity") != curve[i - 1].get("equity"):
+        if (
+            curve[i].get("equity") != curve[i - 1].get("equity")
+            or curve[i].get("drawdown_equity") != curve[i - 1].get("drawdown_equity")
+        ):
             if kept[-1] is not curve[i - 1]:
                 kept.append(curve[i - 1])
             kept.append(curve[i])
@@ -9363,7 +9500,7 @@ def _downsample_curve(curve: list[dict], max_points: int = 2000) -> list[dict]:
     return kept
 
 
-def _build_equity_curve_from_trades(
+def _build_closed_trade_equity_curve(
 
 
     trades: list[dict],
@@ -9455,6 +9592,167 @@ def _build_equity_curve_from_trades(
 
 
 
+
+    return curve
+
+
+def _build_equity_curve_from_trades(
+    trades: list[dict],
+    df: "pd.DataFrame",
+    initial_capital: float = 10000.0,
+) -> list[dict]:
+    """Build a mark-to-market ledger for one shared portfolio.
+
+    Realized PnL is additive in dollars against each leg's entry-equity base. Open
+    positions are marked on every close, and ``drawdown_equity`` records the adverse
+    intrabar mark used by the drawdown calculation.
+    """
+    if df is None or df.empty:
+        return []
+
+    capital = max(float(initial_capital), 0.0)
+    index = pd.DatetimeIndex(pd.to_datetime(df.index, utc=True, errors="coerce"))
+
+    def _bar_position(raw: object) -> int | None:
+        try:
+            ts = pd.to_datetime(raw, utc=True, errors="raise")
+        except Exception:
+            return None
+        matches = np.flatnonzero(index == ts)
+        return int(matches[0]) if len(matches) else None
+
+    records: list[dict] = []
+    for sequence, raw_trade in enumerate(trades or []):
+        if not isinstance(raw_trade, dict):
+            continue
+        entry_i = _bar_position(raw_trade.get("entry_time"))
+        exit_i = _bar_position(raw_trade.get("exit_time"))
+        try:
+            entry_price = float(raw_trade.get("entry_price"))
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if entry_i is None or exit_i is None or entry_price <= 0 or exit_i < entry_i:
+            continue
+        records.append(
+            {
+                "id": sequence,
+                "trade": raw_trade,
+                "entry_i": entry_i,
+                "exit_i": exit_i,
+                "entry_price": entry_price,
+                "base_equity": None,
+            }
+        )
+
+    # Compatibility for synthetic callers that only provide pnl_pct. Returns sharing
+    # an exit timestamp are one additive portfolio event, not sequential leg growth.
+    if not records and trades:
+        exit_map: dict[str, float] = {}
+        for trade in trades:
+            exit_ts = trade.get("exit_time") if isinstance(trade, dict) else None
+            if exit_ts:
+                key = str(exit_ts)
+                exit_map[key] = exit_map.get(key, 0.0) + float(trade.get("pnl_pct", 0.0))
+        equity = capital
+        curve: list[dict] = []
+        for ts in df.index:
+            equity = max(0.0, equity * (1.0 + exit_map.get(str(ts), 0.0)))
+            curve.append(
+                {
+                    "timestamp": str(ts),
+                    "equity": round(equity, 2),
+                    "drawdown_equity": round(equity, 2),
+                    "initial_equity": capital,
+                }
+            )
+        return curve
+
+    entries: dict[int, list[dict]] = {}
+    exits: dict[int, list[dict]] = {}
+    for record in records:
+        entries.setdefault(record["entry_i"], []).append(record)
+        exits.setdefault(record["exit_i"], []).append(record)
+
+    realized_equity = capital
+    active: dict[int, dict] = {}
+    curve: list[dict] = []
+
+    def _mark_pnl(record: dict, price: float) -> float:
+        trade = record["trade"]
+        sign = -1.0 if str(trade.get("direction") or "long").lower() == "short" else 1.0
+        leverage = max(float(trade.get("leverage", 1.0) or 1.0), 0.0)
+        size = max(
+            float(trade.get("size_fraction_raw", trade.get("size_fraction", 1.0)) or 0.0),
+            0.0,
+        )
+        price_return = ((float(price) - record["entry_price"]) / record["entry_price"]) * sign
+        return float(record["base_equity"] or 0.0) * price_return * leverage * size
+
+    for i, ts in enumerate(df.index):
+        # Signal/time exits fill at the open and release capital before a same-open entry.
+        opening_exits = [
+            record
+            for record in exits.get(i, [])
+            if record["entry_i"] < i
+            and str(record["trade"].get("exit_reason") or "") in {"signal", "time_stop"}
+        ]
+        for record in opening_exits:
+            realized_equity = max(
+                0.0,
+                realized_equity
+                + float(record["base_equity"] or 0.0)
+                * float(record["trade"].get("pnl_pct", 0.0) or 0.0),
+            )
+            active.pop(record["id"], None)
+
+        # Simultaneous entries size from the same pre-entry account value.
+        entry_base = realized_equity
+        for record in entries.get(i, []):
+            record["base_equity"] = entry_base
+            active[record["id"]] = record
+
+        bar_low = float(df["low"].iloc[i])
+        bar_high = float(df["high"].iloc[i])
+        worst_equity = realized_equity
+        for record in active.values():
+            trade = record["trade"]
+            direction = str(trade.get("direction") or "long").lower()
+            adverse = bar_high if direction == "short" else bar_low
+            # A stop/liquidation ends exposure at its fill. The later part of that
+            # candle cannot create an additional phantom loss.
+            if record["exit_i"] == i and str(trade.get("exit_reason") or "") in {
+                "stop_loss",
+                "trailing_stop",
+                "liquidation",
+            }:
+                adverse = float(trade.get("exit_price", adverse) or adverse)
+            worst_equity += _mark_pnl(record, adverse)
+
+        for record in exits.get(i, []):
+            if record in opening_exits:
+                continue
+            realized_equity = max(
+                0.0,
+                realized_equity
+                + float(record["base_equity"] or 0.0)
+                * float(record["trade"].get("pnl_pct", 0.0) or 0.0),
+            )
+            active.pop(record["id"], None)
+
+        close_price = float(df["close"].iloc[i])
+        marked_equity = max(
+            0.0,
+            realized_equity + sum(_mark_pnl(record, close_price) for record in active.values()),
+        )
+        worst_equity = max(0.0, min(worst_equity, marked_equity))
+        curve.append(
+            {
+                "timestamp": str(ts),
+                "equity": round(marked_equity, 2),
+                "drawdown_equity": round(worst_equity, 2),
+                "initial_equity": capital,
+            }
+        )
 
     return curve
 
@@ -9573,13 +9871,22 @@ def compute_metrics(
     symbol: str | None = None,
 
 
+    equity_curve: list[dict] | None = None,
+
+
 ) -> dict:
 
 
     """Compute performance metrics from a list of trades."""
 
 
-    metrics = _compute_basic_metrics(trades, total_bars, timeframe=timeframe, symbol=symbol)
+    metrics = _compute_basic_metrics(
+        trades,
+        total_bars,
+        timeframe=timeframe,
+        symbol=symbol,
+        equity_curve=equity_curve,
+    )
 
 
     backtest_months = _compute_backtest_months(start_date, end_date, total_bars, timeframe=timeframe)
@@ -9665,7 +9972,14 @@ def compute_metrics(
 
 
 
-def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: str = "1h", symbol: str | None = None) -> dict:
+def _compute_basic_metrics(
+    trades: list[dict],
+    total_bars: int,
+    *,
+    timeframe: str = "1h",
+    symbol: str | None = None,
+    equity_curve: list[dict] | None = None,
+) -> dict:
 
 
     """Compute base performance metrics from a list of trades."""
@@ -9699,6 +10013,12 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
 
 
             "sortino": 0,
+
+
+            "trade_sharpe": 0,
+
+
+            "trade_sortino": 0,
 
 
             "max_drawdown_pct": 0,
@@ -9746,55 +10066,41 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
 
 
 
-    # Build an equity curve from per-trade returns instead of summing percentages.
-
-
-    # Summation can create impossible states (e.g., drawdown > 100%).
-
-
-    equity = 1.0
-
-
-    peak_equity = 1.0
-
-
-    max_drawdown = 0.0
-
-
-    for pnl in pnls:
-
-
-        growth = max(0.0, 1.0 + float(pnl))
-
-
-        equity *= growth
-
-
-        if equity > peak_equity:
-
-
-            peak_equity = equity
-
-
-        if peak_equity > 0:
-
-
-            drawdown = 1.0 - (equity / peak_equity)
-
-
-            if drawdown > max_drawdown:
-
-
-                max_drawdown = drawdown
-
-
-
-
-
-    total_return = equity - 1.0
-
-
-    max_drawdown = max(0.0, min(1.0, float(max_drawdown)))
+    ledger_points = [
+        point
+        for point in (equity_curve or [])
+        if isinstance(point, dict) and point.get("equity") is not None
+    ]
+    if ledger_points:
+        initial_equity = float(
+            ledger_points[0].get("initial_equity")
+            or ledger_points[0].get("equity")
+            or 0.0
+        )
+        peak_equity = max(initial_equity, 0.0)
+        max_drawdown = 0.0
+        for point in ledger_points:
+            marked = max(float(point.get("equity") or 0.0), 0.0)
+            peak_equity = max(peak_equity, marked)
+            trough = max(float(point.get("drawdown_equity", marked) or 0.0), 0.0)
+            if peak_equity > 0.0:
+                max_drawdown = max(max_drawdown, 1.0 - trough / peak_equity)
+        final_equity = max(float(ledger_points[-1].get("equity") or 0.0), 0.0)
+        total_return = (final_equity / initial_equity - 1.0) if initial_equity > 0.0 else 0.0
+        max_drawdown = max(0.0, min(1.0, float(max_drawdown)))
+    else:
+        # Compatibility fallback for metric-only callers with no candle ledger.
+        equity = 1.0
+        peak_equity = 1.0
+        max_drawdown = 0.0
+        for pnl in pnls:
+            growth = max(0.0, 1.0 + float(pnl))
+            equity *= growth
+            peak_equity = max(peak_equity, equity)
+            if peak_equity > 0:
+                max_drawdown = max(max_drawdown, 1.0 - (equity / peak_equity))
+        total_return = equity - 1.0
+        max_drawdown = max(0.0, min(1.0, float(max_drawdown)))
 
 
     win_rate = len(wins) / len(pnls) if pnls else 0
@@ -9818,10 +10124,15 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
         bars_per_year = _BARS_PER_YEAR.get(timeframe, 8760)
 
 
+    # --- Trade-based (EVENT) Sharpe/Sortino ----------------------------------------
+    # mean/std of PER-TRADE pnls, annualized by sqrt(trades_per_year). Preserved as
+    # trade_sharpe/trade_sortino (some diagnostics/DSR want the event series). When an
+    # equity curve is available the bar-level CALENDAR Sharpe below supersedes these as
+    # the primary `sharpe`/`sortino`; otherwise the event value stays `sharpe`.
     mean_return = 0.0
 
 
-    sharpe = 0.0
+    trade_sharpe = 0.0
 
 
     if len(pnls) > 1:
@@ -9839,10 +10150,10 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
         if std_return > _RATIO_EPSILON:
 
 
-            sharpe = (mean_return / std_return) * np.sqrt(trades_per_year)
+            trade_sharpe = (mean_return / std_return) * np.sqrt(trades_per_year)
 
 
-    sharpe = _clamp_ratio(sharpe)
+    trade_sharpe = _clamp_ratio(trade_sharpe)
 
 
     # Sharpe is annualized via sqrt(trades_per_year); on a short window with
@@ -9855,10 +10166,10 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
 
 
 
-    # Sortino ratio (only penalizes downside deviation)
+    # Sortino ratio (only penalizes downside deviation) — trade-based (EVENT) form.
 
 
-    sortino = 0.0
+    trade_sortino = 0.0
 
 
     if len(pnls) > 1:
@@ -9878,10 +10189,42 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
         if downside_std > _RATIO_EPSILON:
 
 
-            sortino = (mean_return / downside_std) * np.sqrt(trades_per_year)
+            trade_sortino = (mean_return / downside_std) * np.sqrt(trades_per_year)
 
 
-    sortino = _clamp_ratio(sortino)
+    trade_sortino = _clamp_ratio(trade_sortino)
+
+
+    # --- Bar-level (CALENDAR) Sharpe/Sortino from the MTM equity curve --------------
+    # v5: when an equity curve is available, compute Sharpe/Sortino from per-BAR returns
+    # of consecutive curve equity points, annualized by sqrt(bars_per_year). This is a
+    # calendar Sharpe: FLAT bars (no open position, equity unchanged → return 0) are part
+    # of the return series by design, so a sparse-trading strategy's bar-Sharpe is
+    # typically LOWER than its event Sharpe (the flat bars dilute the mean and shrink the
+    # std). It is comparable across trade cadences, unlike the event Sharpe. The
+    # trade-based values are preserved as trade_sharpe/trade_sortino below.
+    bar_sharpe: float | None = None
+    bar_sortino: float | None = None
+    if ledger_points and len(ledger_points) > 2:
+        eq = np.array([max(float(p.get("equity") or 0.0), 0.0) for p in ledger_points], dtype=float)
+        prev = eq[:-1]
+        # Per-bar simple return; guard bars where prior equity is ~0 (ruin) → 0 return so
+        # a wiped-out curve doesn't inject spurious ±inf into the series.
+        bar_returns = np.where(prev > _RATIO_EPSILON, (eq[1:] - prev) / np.where(prev > 0.0, prev, 1.0), 0.0)
+        if bar_returns.size >= 2:
+            bmean = float(np.mean(bar_returns))
+            bstd = float(np.std(bar_returns))
+            ann = float(np.sqrt(bars_per_year))
+            # Division-by-zero guard for an all-flat (or single-value) curve.
+            bar_sharpe = _clamp_ratio((bmean / bstd) * ann) if bstd > _RATIO_EPSILON else 0.0
+            downside_b = np.minimum(bar_returns, 0.0)
+            bdown = float(np.sqrt(np.sum(downside_b ** 2) / bar_returns.size))
+            bar_sortino = _clamp_ratio((bmean / bdown) * ann) if bdown > _RATIO_EPSILON else 0.0
+
+    # Primary metrics: bar-level calendar values when a curve exists, else the trade-based
+    # (event) values (legacy fallback path — nothing breaks for metric-only callers).
+    sharpe = bar_sharpe if bar_sharpe is not None else trade_sharpe
+    sortino = bar_sortino if bar_sortino is not None else trade_sortino
 
 
 
@@ -9955,6 +10298,15 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
 
 
         "sortino": round(float(sortino), 3),
+
+
+        # Trade-based (event) Sharpe/Sortino preserved for diagnostics/DSR — equals
+        # `sharpe`/`sortino` on the legacy no-curve path, differs when the bar-level
+        # calendar value is primary. See the bar-level block above.
+        "trade_sharpe": round(float(trade_sharpe), 3),
+
+
+        "trade_sortino": round(float(trade_sortino), 3),
 
 
         "max_drawdown_pct": round(float(max_drawdown), 5),
@@ -10151,7 +10503,10 @@ def _annualized_return(total_return_pct: float, months: float) -> float:
         return (total_return_pct / months) * 12.0
 
 
-    return growth ** (12.0 / months) - 1.0
+    exponent = math.log(growth) * (12.0 / months)
+    # Short-window CAGR is already flagged unreliable by compute_metrics. Keep the
+    # diagnostic finite so a valid backtest cannot crash persistence/JSON encoding.
+    return math.exp(min(exponent, math.log(1_000_001.0))) - 1.0
 
 
 
@@ -10238,37 +10593,10 @@ def _detect_entry_regime(window) -> str:
 
 
 
-        tr = np.maximum.reduce([
-
-
-            (high - low).to_numpy(),
-
-
-            (high - close.shift()).abs().to_numpy(),
-
-
-            (low - close.shift()).abs().to_numpy(),
-
-
-        ])
-
-
-        atr_current = float(np.nanmean(tr[-14:]))
-
-
-        if len(tr) > 44:
-
-
-            atr_avg = float(np.nanmean(tr[-44:-14]))
-
-
-        else:
-
-
-            atr_avg = atr_current
-
-
-        atr_ratio = atr_current / atr_avg if atr_avg > 0 else 1.0
+        # v5: shared regime ATR-ratio baseline (14-bar recent vs 30-bar lagged) so a bar
+        # classifies identically here, in the signal-walk, and in the live detector.
+        # See forven.regime.regime_atr_ratio_at.
+        atr_ratio = regime_atr_ratio_at(high, low, close, default=1.0)
 
 
 
@@ -10349,20 +10677,21 @@ def walk_forward(
     execution_controls: dict | None = None,
     initial_capital: float = 10000.0,
 
+    as_of: str | None = None,
+
 
 ) -> dict:
 
 
-    """Walk-forward analysis â€” splits data into in-sample/out-of-sample windows.
+    """Chronological rolling-origin validation for a fixed parameter set.
 
 
 
 
 
-    Validates that strategy performance holds on unseen data. Each split trains
-
-
-    (evaluates) on in_sample_pct of the window, then tests on the remainder.
+    Expanding/rolling training prefixes are separated from each future test slice
+    by the configured purge gap and embargo. This function does not fit parameters;
+    the optimizer performs selection on a disjoint earlier window before calling it.
 
 
 
@@ -10551,27 +10880,44 @@ def walk_forward(
         # here so every WFA caller (gauntlet run_walk_forward passes no window) honors it.
         duration_days = stage_backtest_duration_days("walk_forward", settings)
         minutes_per_bar = max(_timeframe_to_minutes(resolved_timeframe), 1)
-        total_bars = (duration_days * 24 * 60) // minutes_per_bar
+        if start_date or end_date:
+            # A DATED window (the gauntlet passes the optimizer's validation
+            # window) sizes by the SPAN: the loader slices by the dates, so a
+            # stage-days bar count is unrelated to the data actually loaded —
+            # it made the pre-load floor read a 3-year 1d span as "365 requested
+            # bars" and error before loading. The post-load len(df) check stays
+            # authoritative for what the lake really returned.
+            try:
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                def _parse_wfa_date(value: object) -> _dt | None:
+                    text = str(value or "").strip()
+                    if not text:
+                        return None
+                    parsed = _dt.fromisoformat(text.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=_tz.utc)
+                    return parsed
+
+                span_start = _parse_wfa_date(start_date)
+                span_end = _parse_wfa_date(end_date) or _dt.now(_tz.utc)
+                if span_start is not None and span_end > span_start:
+                    span_days = (span_end - span_start).total_seconds() / 86400.0
+                    total_bars = max(int(span_days * 24 * 60) // minutes_per_bar, 1)
+                else:
+                    total_bars = (duration_days * 24 * 60) // minutes_per_bar
+            except Exception:  # noqa: BLE001 — unparseable dates fall back to stage days
+                total_bars = (duration_days * 24 * 60) // minutes_per_bar
+        else:
+            total_bars = (duration_days * 24 * 60) // minutes_per_bar
 
 
     
 
 
-    resolved_total_bars = max(int(total_bars), 420)
-
-    # Cap total bars for walk-forward to prevent excessive computation.
-    # For sub-hourly timeframes on large date ranges, the bar count can
-    # explode (e.g. 5m over 2 years ≈ 210K bars).  The bar-by-bar slow
-    # path is O(n) per split so 50K bars keeps runtime reasonable.
-    _WFA_MAX_BARS = 50_000
-    if resolved_total_bars > _WFA_MAX_BARS:
-        log.warning(
-            "Walk-forward capping bars from %d to %d for %s (%s)",
-            resolved_total_bars, _WFA_MAX_BARS, strategy_id, resolved_timeframe,
-        )
-        resolved_total_bars = _WFA_MAX_BARS
-
     # P25-1: WFA knobs from pipeline config (versioned, explicit), with settings fallback.
+    # Resolved BEFORE the minimum-bars gate — the window sizing below needs them.
     try:
         from forven.policy import load_pipeline_config as _load_wfa_config
         wfa_cfg = _load_wfa_config().get("walk_forward", {})
@@ -10588,12 +10934,20 @@ def walk_forward(
         else settings.get("walkforward_folds", wfa_cfg.get("n_folds", 5))
     )
 
+    resolved_total_bars = int(total_bars)
+
     # Trade-frequency-aware window floor (S05925): a defaulted window must give
     # every OOS fold a judgeable trade sample (wfa_min_fold_trades), or the fold
     # pass rate degenerates to coin flips — the stage calendar window handed a
     # ~3-trades/month 4h strategy folds of 1-3 OOS trades. Raise (never shrink)
     # the defaulted window to the recommendation; explicit caller windows are
     # untouched. The resolver caps itself at the same _WFA_MAX_BARS ceiling.
+    #
+    # This sizing MUST run before the minimum-bars gate below: at 1d the stage
+    # calendar window is bars==days, so a 365-day default is 365 bars — the old
+    # order returned "need 420+" before the lift could size 1d to its multi-year
+    # window, making every 1d strategy structurally un-promotable (2026-07-11:
+    # all five persisted "365 bars requested" WFA failures were 1d).
     if window_defaulted:
         try:
             from forven.wfa_window import recommended_wfa_window
@@ -10615,6 +10969,30 @@ def walk_forward(
                 resolved_total_bars = _rec_bars
         except Exception as exc:  # noqa: BLE001 — sizing must never break the run
             log.warning("WFA window recommendation failed for %s: %s", strategy_id, exc)
+        # Belt-and-braces: even if the recommender fails open, a DEFAULTED window
+        # is lifted to the fold floor rather than erroring — only explicit caller
+        # windows may fail the minimum-bars gate.
+        if resolved_total_bars < 420:
+            log.info(
+                "WFA window lifted to the 420-bar fold floor for %s (%s, was %d)",
+                strategy_id, resolved_timeframe, resolved_total_bars,
+            )
+            resolved_total_bars = 420
+
+    if resolved_total_bars < 420:
+        return {"error": f"Insufficient data for walk-forward: {int(resolved_total_bars)} bars requested (need 420+)"}
+
+    # Cap total bars for walk-forward to prevent excessive computation.
+    # For sub-hourly timeframes on large date ranges, the bar count can
+    # explode (e.g. 5m over 2 years ≈ 210K bars).  The bar-by-bar slow
+    # path is O(n) per split so 50K bars keeps runtime reasonable.
+    _WFA_MAX_BARS = 50_000
+    if resolved_total_bars > _WFA_MAX_BARS:
+        log.warning(
+            "Walk-forward capping bars from %d to %d for %s (%s)",
+            resolved_total_bars, _WFA_MAX_BARS, strategy_id, resolved_timeframe,
+        )
+        resolved_total_bars = _WFA_MAX_BARS
 
     resolved_fee_bps = float(
         fee_bps if fee_bps is not None
@@ -10629,7 +11007,21 @@ def walk_forward(
     resolved_include_funding = bool(settings.get("backtest_include_funding", True))
     # Normalize the execution profile ONCE; None preserves the byte-identical
     # legacy full-notional path, so strategies without a profile never re-baseline.
-    normalized_ec = _normalize_execution_controls(execution_controls)
+    normalized_ec = _normalize_execution_controls(
+        execution_controls or execution_controls_from_params(params)
+    )
+    resolved_cv_method = str(
+        settings.get("walkforward_cv_method", wfa_cfg.get("cv_method", "expanding"))
+        or "expanding"
+    )
+    resolved_purge_gap = max(
+        0,
+        int(settings.get("walkforward_purge_gap", wfa_cfg.get("purge_gap", 0)) or 0),
+    )
+    resolved_embargo_pct = max(
+        0.0,
+        float(settings.get("walkforward_embargo_pct", wfa_cfg.get("embargo_pct", 0.0)) or 0.0),
+    )
 
     # P25-1: Log resolved WFA config for auditability
     log.info(
@@ -10714,6 +11106,8 @@ def walk_forward(
 
         warmup_bars=210,
 
+        as_of=as_of,
+
 
     )
 
@@ -10739,7 +11133,7 @@ def walk_forward(
     # ... (lookback check)
 
 
-    split_size = len(df) // resolved_n_splits
+    split_size = max(int(len(df) * resolved_in_sample_pct), 230)
 
 
     # ...
@@ -10769,7 +11163,7 @@ def walk_forward(
     # Check against split size since each window needs enough data
 
 
-    split_size = len(df) // resolved_n_splits
+    split_size = max(int(len(df) * resolved_in_sample_pct), 230)
 
 
     if max_lookback >= split_size:
@@ -10782,7 +11176,8 @@ def walk_forward(
 
 
     warmup = 210
-    regime_gate = True  # walk_forward always uses regime gating
+    # Validate the same signal/execution semantics deployed by the paper scanner.
+    regime_gate = False
 
     # ---- Process-isolated execution ----
     if _should_use_process_isolation():
@@ -10817,6 +11212,9 @@ def walk_forward(
                 normalized_ec,
                 float(initial_capital),
                 asset,
+                resolved_cv_method,
+                resolved_purge_gap,
+                resolved_embargo_pct,
             )
             try:
                 worker_result = future.result(timeout=walk_forward_timeout)
@@ -10854,6 +11252,9 @@ def walk_forward(
             normalized_ec,
             float(initial_capital),
             asset,
+            resolved_cv_method,
+            resolved_purge_gap,
+            resolved_embargo_pct,
         )
 
     if "error" in worker_result:
@@ -10868,6 +11269,7 @@ def walk_forward(
 
     splits = worker_result["splits"]
     all_oos_trades = worker_result["all_oos_trades"]
+    all_oos_curves = worker_result.get("all_oos_curves") or []
 
 
 
@@ -10880,11 +11282,33 @@ def walk_forward(
     oos_total_bars = sum(int(s.get("oos_bars", 0) or 0) for s in splits) or resolved_total_bars
 
 
+    chained_oos_curve: list[dict] = []
+    chained_capital = float(initial_capital)
+    for fold_curve in all_oos_curves:
+        if not isinstance(fold_curve, list) or not fold_curve:
+            continue
+        fold_initial = float(fold_curve[0].get("initial_equity") or initial_capital)
+        if fold_initial <= 0:
+            continue
+        for point in fold_curve:
+            equity_ratio = float(point.get("equity") or 0.0) / fold_initial
+            trough_ratio = float(point.get("drawdown_equity", point.get("equity")) or 0.0) / fold_initial
+            chained_oos_curve.append(
+                {
+                    "timestamp": point.get("timestamp"),
+                    "equity": chained_capital * equity_ratio,
+                    "drawdown_equity": chained_capital * trough_ratio,
+                    "initial_equity": float(initial_capital),
+                }
+            )
+        chained_capital = float(chained_oos_curve[-1]["equity"])
+
     agg_oos = compute_metrics(
         all_oos_trades,
         oos_total_bars,
         timeframe=resolved_timeframe,
         trade_mode=resolved_trade_mode,
+        equity_curve=chained_oos_curve or None,
     )
 
 
@@ -10964,6 +11388,14 @@ def walk_forward(
 
 
         "end_date": df.index[-1].isoformat() if len(df) else end_date,
+
+        "cv_method": worker_result.get("cv_method", resolved_cv_method),
+
+        "purge_bars": worker_result.get("purge_bars", resolved_purge_gap),
+
+        "embargo_bars": worker_result.get("embargo_bars", 0),
+
+        "as_of": as_of,
 
 
     }
@@ -11080,10 +11512,17 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
 
                      asset: str | None = None,
 
-                     resolved_timeframe: str | None = None) -> list[dict]:
+                     resolved_timeframe: str | None = None,
+
+                     include_funding: bool = False) -> list[dict]:
 
 
     """Run signal checker across a dataframe window and collect trades.
+
+    ``include_funding`` (backtest opt-in): when True, the kernel path accrues perp funding
+    IN-WALK (funding-aware kelly evidence) and stamps each trade so the caller's post-walk
+    ``_apply_funding_to_trades`` skips it. The legacy/slow paths don't fund in-walk, so the
+    post-walk pass still funds their trades. The scanner never sets this.
 
 
 
@@ -11115,6 +11554,7 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             trade_mode=trade_mode, execution_controls=execution_controls,
             initial_capital=initial_capital, strategy_type=strategy_type,
             symbol=asset, timeframe=resolved_timeframe,
+            include_funding=include_funding,
         )
     except RuntimeError as exc:
         if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):
@@ -11125,6 +11565,9 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
             _kernel_result, df, leverage=leverage,
             round_trip_drag=_kernel.round_trip_drag(fee_bps, slippage_bps, leverage),
             trade_mode=trade_mode,
+            # Same funding context the walk ran with (None when include_funding is off or
+            # the frame has no funding_rate), so the end-of-data close funds consistently.
+            funding=_kernel_result.funding,
         )
 
 
@@ -11785,16 +12228,32 @@ def save_backtest_results(results: dict):
             # Update existing strategy or insert new one
 
 
-            existing = conn.execute("SELECT id FROM strategies WHERE id = ?", (strat_id,)).fetchone()
+            existing = conn.execute(
+                "SELECT id, stage, status FROM strategies WHERE id = ?",
+                (strat_id,),
+            ).fetchone()
 
 
             if existing:
+                from forven.brain import stage_is_param_locked
 
+                existing_stage = existing["stage"] or existing["status"]
+                if stage_is_param_locked(existing_stage):
+                    log.info(
+                        "metrics locked: %s at %s; bulk backtest save skipped",
+                        strat_id,
+                        existing_stage,
+                    )
+                    continue
 
                 conn.execute(
 
 
-                    "UPDATE strategies SET metrics = ?, updated_at = ? WHERE id = ?",
+                    """UPDATE strategies
+                       SET metrics = ?, updated_at = ?
+                       WHERE id = ?
+                         AND LOWER(TRIM(COALESCE(stage, status, ''))) NOT IN
+                             ('paper', 'paper_trading', 'live_graduated', 'deployed')""",
 
 
                     (json.dumps(metrics), now, strat_id),

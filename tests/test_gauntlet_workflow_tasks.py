@@ -227,21 +227,38 @@ def test_validation_optimization_uses_best_sweep_timeframe(forven_db, monkeypatc
     workflow = create_or_get_workflow(strategy_id=strategy_id, created_by="pytest", settings_snapshot=build_settings_snapshot())
     detail = get_workflow_detail(workflow["id"])
     opt_step = next(step for step in detail["steps"] if step["step_key"] == "validation_optimization")
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+    from forven.gauntlet.tasks import _workflow_as_of
+
     with get_db() as conn:
+        strategy_params = __import__("json").loads(
+            conn.execute("SELECT params FROM strategies WHERE id = ?", (strategy_id,)).fetchone()["params"]
+        )
+        current_config = __import__("json").dumps(
+            {
+                "engine_version": BACKTEST_ENGINE_VERSION,
+                "params": strategy_params,
+                "as_of": _workflow_as_of(workflow),
+            }
+        )
         conn.execute(
             """
             INSERT INTO backtest_results (
                 result_id, strategy_id, result_type, symbol, timeframe, metrics_json, config_json, created_at
             )
             VALUES
-              ('BT-1H', ?, 'backtest', 'BTC/USDT', '1h', ?, '{}', '2026-04-23T00:00:00+00:00'),
-              ('BT-4H', ?, 'backtest', 'BTC/USDT', '4h', ?, '{}', '2026-04-23T00:01:00+00:00')
+              ('BT-1H', ?, 'backtest', 'BTC/USDT', '1h', ?, ?, ?),
+              ('BT-4H', ?, 'backtest', 'BTC/USDT', '4h', ?, ?, ?)
             """,
             (
                 strategy_id,
                 '{"sharpe_ratio": 0.4, "total_trades": 10}',
+                current_config,
+                workflow["created_at"],
                 strategy_id,
                 '{"sharpe_ratio": 1.8, "total_trades": 20}',
+                current_config,
+                workflow["created_at"],
             ),
         )
 
@@ -275,21 +292,35 @@ def test_quick_screen_gate_rescues_strategy_on_best_timeframe(forven_db):
     )
     detail = get_workflow_detail(workflow["id"])
     gate_step = next(s for s in detail["steps"] if s["step_key"] == "quick_screen_gate")
+    from forven.engine_provenance import BACKTEST_ENGINE_VERSION
+    from forven.gauntlet.tasks import _workflow_as_of
 
     # 1h: only 8 trades -> rejected by the brain's min-trades guardrail. 4h: 35 trades
     # with a healthy edge -> passes. best-of-N must pick 4h (higher sharpe-first score).
     with get_db() as conn:
+        strategy_params = __import__("json").loads(
+            conn.execute("SELECT params FROM strategies WHERE id = ?", (strategy_id,)).fetchone()["params"]
+        )
+        current_config = __import__("json").dumps(
+            {
+                "engine_version": BACKTEST_ENGINE_VERSION,
+                "params": strategy_params,
+                "as_of": _workflow_as_of(workflow),
+            }
+        )
         conn.execute(
             """
             INSERT INTO backtest_results
                 (result_id, strategy_id, result_type, symbol, timeframe, metrics_json, config_json, created_at)
             VALUES
-              ('BT-1H', ?, 'backtest', 'BTC/USDT', '1h', ?, '{}', '2026-04-23T00:00:00+00:00'),
-              ('BT-4H', ?, 'backtest', 'BTC/USDT', '4h', ?, '{}', '2026-04-23T00:01:00+00:00')
+              ('BT-1H', ?, 'backtest', 'BTC/USDT', '1h', ?, ?, ?),
+              ('BT-4H', ?, 'backtest', 'BTC/USDT', '4h', ?, ?, ?)
             """,
             (
                 strategy_id, '{"sharpe_ratio": 0.2, "total_trades": 8, "profit_factor": 1.05, "win_rate": 0.5}',
+                current_config, workflow["created_at"],
                 strategy_id, '{"sharpe_ratio": 1.4, "total_trades": 35, "profit_factor": 1.6, "win_rate": 0.55}',
+                current_config, workflow["created_at"],
             ),
         )
 
@@ -479,6 +510,10 @@ def test_paper_promotion_gate_uses_unified_status_and_transition(forven_db, monk
         return {"from": "gauntlet", "to": "paper"}
 
     monkeypatch.setattr("forven.gauntlet.tasks._transition_to_paper", _fake_transition)
+    monkeypatch.setattr(
+        "forven.gauntlet.tasks._select_and_persist_execution_profile",
+        lambda *_args, **_kwargs: {"skipped": True, "reason": "covered separately"},
+    )
     gate_step = next(item for item in detail["steps"] if item["step_key"] == "paper_promotion_gate")
 
     from forven.gauntlet.tasks import run_paper_promotion_gate
@@ -488,3 +523,143 @@ def test_paper_promotion_gate_uses_unified_status_and_transition(forven_db, monk
     assert outcome["status"] == "passed"
     assert seen["strategy_id"] == strategy_id
     assert seen["target_stage"] == "paper"
+
+
+def test_run_walk_forward_drops_undersized_validation_window(forven_db, monkeypatch):
+    """The optimizer's validation window is an anti-leak holdout sized for its own
+    internal WFA; when it spans fewer than the 420-bar fold floor at the strategy's
+    timeframe, run_walk_forward must fall back to the windowless full-history path
+    instead of submitting a window that structurally cannot fold ('109 bars
+    requested (need 420+)', S06895's fourth run, 2026-07-12)."""
+    from datetime import datetime, timedelta, timezone
+
+    from forven.db import get_db
+    from forven.gauntlet import tasks as gtasks
+
+    sid = "S-WFWIN1"
+    now = datetime.now(timezone.utc)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, params, metrics, "
+            "status, owner, stage, stage_changed_at, created_at, updated_at) "
+            "VALUES (?, ?, 'rsi_momentum', 'BTC/USDT', '4h', '{}', '{}', 'gauntlet', 'brain', "
+            "'gauntlet', ?, ?, ?)",
+            (sid, sid, now.isoformat(), now.isoformat(), now.isoformat()),
+        )
+        conn.commit()
+
+    captured: dict = {}
+
+    def _fake_run_wf(body):
+        captured["start"] = body.start_date
+        captured["end"] = body.end_date
+        return {
+            "verdict": "PASS",
+            "splits": [
+                {"out_of_sample": {"sharpe": 1.0, "total_trades": 12}} for _ in range(5)
+            ],
+            "aggregate_oos": {"sharpe": 0.9, "total_trades": 60},
+        }
+
+    monkeypatch.setattr(gtasks, "_run_walk_forward", _fake_run_wf)
+    # ~18 days at 4h = ~109 bars — far below the 420-bar fold floor.
+    small_window = {
+        "start": (now - timedelta(days=18)).isoformat(),
+        "end": now.isoformat(),
+    }
+    monkeypatch.setattr(
+        gtasks, "_workflow_optimization_windows", lambda _wf: ({}, small_window)
+    )
+
+    workflow = {"id": "gw-test-wfwin", "strategy_id": sid, "settings_snapshot_json": "{}"}
+    outcome = gtasks.run_walk_forward(workflow, {"step_key": "walk_forward"})
+
+    assert captured.get("start") is None and captured.get("end") is None, (
+        f"undersized window must be dropped, got {captured}"
+    )
+    assert outcome["status"] == "passed"
+
+    # A window that DOES support folds is forwarded untouched.
+    big_window = {
+        "start": (now - timedelta(days=200)).isoformat(),
+        "end": now.isoformat(),
+    }
+    monkeypatch.setattr(
+        gtasks, "_workflow_optimization_windows", lambda _wf: ({}, big_window)
+    )
+    gtasks.run_walk_forward(workflow, {"step_key": "walk_forward"})
+    assert captured.get("start") == big_window["start"]
+
+
+def test_confirmation_backfills_canonical_metrics_when_blob_lacks_trade_count(forven_db, monkeypatch):
+    """When the strategy blob carries no performance metrics (the quick-screen
+    gate deliberately skips persisting a degeneracy-skipped declared-TF slice),
+    the confirmation backtest must promote its post-optimization metrics as the
+    canonical blob — otherwise the paper gate fails closed with 'no trade-count
+    metric' despite a fully green pipeline (S06895, 2026-07-12). Robustness
+    bookkeeping already on the blob survives; rows with existing performance
+    metrics are untouched."""
+    import json as _j
+    from datetime import datetime, timezone
+
+    from forven.db import get_db
+    from forven.gauntlet import tasks as gtasks
+
+    now = datetime.now(timezone.utc).isoformat()
+    sid = "S-CONFBF1"
+    rob_only = {"composite_robustness_score": 95.85, "robustness_tests_passed": 5}
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, params, metrics, "
+            "status, owner, stage, stage_changed_at, created_at, updated_at) "
+            "VALUES (?, ?, 'rsi_momentum', 'BTC/USDT', '4h', '{}', ?, 'gauntlet', 'brain', "
+            "'gauntlet', ?, ?, ?)",
+            (sid, sid, _j.dumps(rob_only), now, now, now),
+        )
+        conn.commit()
+
+    conf_metrics = {
+        "total_trades": 42,
+        "sharpe": 1.2,
+        "total_return_pct": 8.0,
+        "in_sample": {"total_trades": 33},
+        "out_of_sample": {"total_trades": 9},
+    }
+    monkeypatch.setattr(
+        gtasks, "_submit_backtest",
+        lambda body, **_k: {"result_id": "bt-conf-1", "metrics": conf_metrics},
+    )
+    monkeypatch.setattr(gtasks, "_latest_step_output", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        gtasks, "_workflow_optimization_windows", lambda _wf: ({}, {})
+    )
+
+    workflow = {"id": "gw-confbf", "strategy_id": sid, "settings_snapshot_json": "{}"}
+    outcome = gtasks.run_confirmation_backtest(workflow, {"step_key": "confirmation_backtest"})
+    assert outcome["status"] == "passed"
+
+    with get_db() as conn:
+        row = conn.execute("SELECT metrics FROM strategies WHERE id = ?", (sid,)).fetchone()
+    blob = _j.loads(row["metrics"] or "{}")
+    assert blob.get("total_trades") == 42, "confirmation metrics must be backfilled"
+    assert blob.get("composite_robustness_score") == 95.85, (
+        "robustness bookkeeping must survive the backfill"
+    )
+
+    # A row that already has performance metrics is untouched.
+    sid2 = "S-CONFBF2"
+    existing = {"total_trades": 77, "sharpe": 0.5}
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO strategies (id, name, type, symbol, timeframe, params, metrics, "
+            "status, owner, stage, stage_changed_at, created_at, updated_at) "
+            "VALUES (?, ?, 'rsi_momentum', 'BTC/USDT', '4h', '{}', ?, 'gauntlet', 'brain', "
+            "'gauntlet', ?, ?, ?)",
+            (sid2, sid2, _j.dumps(existing), now, now, now),
+        )
+        conn.commit()
+    workflow2 = {"id": "gw-confbf2", "strategy_id": sid2, "settings_snapshot_json": "{}"}
+    gtasks.run_confirmation_backtest(workflow2, {"step_key": "confirmation_backtest"})
+    with get_db() as conn:
+        row2 = conn.execute("SELECT metrics FROM strategies WHERE id = ?", (sid2,)).fetchone()
+    assert _j.loads(row2["metrics"])["total_trades"] == 77

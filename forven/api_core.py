@@ -1,4 +1,5 @@
-﻿import json
+﻿import copy
+import json
 import math
 import os
 import re
@@ -43,6 +44,7 @@ from forven.db import (
     get_db,
     kv_get,
     kv_set,
+    kv_set_many,
     _now,
     log_activity,
     normalize_agent_visibility,
@@ -1674,6 +1676,19 @@ _SETTINGS_SECRET_STORAGE_KEY = "forven:settings:secrets"
 _SETTINGS_API_KEYS_STORAGE_KEY = "forven:settings:api-keys"
 _SETTINGS_PIPELINE_STORAGE_KEY = "forven:pipeline:settings"
 
+# Serializes the FULL read->apply->diff->audit->save sequence of a settings
+# mutation. Settings are the control plane (trading mode, risk caps, gate
+# thresholds); a mutation loads the current blob, mutates it, diffs old-vs-new
+# for the audit log, and writes several KV keys. Two concurrent PUTs without
+# serialization race that read-modify-write: one edit is lost entirely and the
+# audit diff can attribute one request's changes to the other's actor. A
+# process-level lock (single-process app, uvicorn workers=1) makes each mutation
+# atomic against every other mutation so both edits land and each audit entry
+# reflects exactly its own request. Held only around the in-memory
+# apply+diff+persist critical section — post-save side-effect hooks (scheduler
+# overrides, daemon-state cleanup) run outside it.
+_SETTINGS_MUTATION_LOCK = threading.RLock()
+
 # Single source of truth for the default backtest window (calendar days). This ONE
 # setting governs every automatic backtest that doesn't carry an explicit start/end:
 # quick-screen, gauntlet timeframe-sweep/optimization/confirmation, walk-forward,
@@ -2195,20 +2210,24 @@ def resolve_strategy_query_limit(status: str | None, requested_limit: object = N
     return bounded_limit
 
 
-def _sync_pipeline_wip_cap_kv(payload: dict) -> None:
+def _pipeline_wip_cap_kv_items(payload: dict) -> dict:
+    """Compute the ``pipeline:wip_cap:*`` KV entries a payload implies (no write)."""
+    items: dict = {}
     for stage, stage_config in _PIPELINE_STAGE_WIP_CAPS.items():
         mode_key = str(stage_config["mode_key"])
         cap_key = str(stage_config["cap_key"])
         if _normalize_pipeline_wip_cap_mode(payload.get(mode_key)) == "unlimited":
-            kv_set(f"pipeline:wip_cap:{stage}", "unlimited")
+            items[f"pipeline:wip_cap:{stage}"] = "unlimited"
         else:
-            kv_set(
-                f"pipeline:wip_cap:{stage}",
-                _normalize_pipeline_wip_cap_value(
-                    payload.get(cap_key),
-                    int(stage_config["default"]),
-                ),
+            items[f"pipeline:wip_cap:{stage}"] = _normalize_pipeline_wip_cap_value(
+                payload.get(cap_key),
+                int(stage_config["default"]),
             )
+    return items
+
+
+def _sync_pipeline_wip_cap_kv(payload: dict) -> None:
+    kv_set_many(_pipeline_wip_cap_kv_items(payload))
 
 
 def _normalize_agent_model_key(raw: str) -> str | None:
@@ -2331,14 +2350,19 @@ def _load_settings_secrets() -> dict:
     return secrets
 
 
-def _save_settings_secrets(payload: dict) -> None:
+def _encrypt_settings_secrets(payload: dict) -> dict:
+    """Encrypt a plaintext secrets dict into its at-rest KV form (no write)."""
     encrypted: dict = {}
     for key, value in payload.items():
         if isinstance(value, str):
             encrypted[key] = encrypt_secret(value.strip()) if value.strip() else ""
         else:
             encrypted[key] = value
-    kv_set(_SETTINGS_SECRET_STORAGE_KEY, encrypted)
+    return encrypted
+
+
+def _save_settings_secrets(payload: dict) -> None:
+    kv_set(_SETTINGS_SECRET_STORAGE_KEY, _encrypt_settings_secrets(payload))
 
 
 def _load_settings_payload() -> dict:
@@ -2462,12 +2486,27 @@ _NOTIF_TOGGLE_PREF_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _apply_settings_section(section: str, payload: dict) -> dict:
+def _apply_settings_section(section: str, payload: dict, actor: str = "ui") -> dict:
+    """Apply a settings-section edit and persist it atomically.
+
+    The whole load -> mutate -> diff -> audit -> persist sequence must run
+    under ``_SETTINGS_MUTATION_LOCK`` (the endpoint acquires it). Within one
+    call every touched KV key — the encrypted secrets blob and the main
+    settings blob, audit entry included — is written in a SINGLE transaction
+    via ``kv_set_many`` so a crash can never split them. The audit diff is
+    computed here (against the ``old`` snapshot taken before mutation) and
+    attributed to ``actor``, so with the lock held each entry reflects exactly
+    its own request's changes.
+    """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="settings payload must be an object")
 
     updates = _load_settings_payload()
     secrets = _load_settings_secrets()
+    # Snapshot the pre-mutation blob for the audit diff. `updates` is mutated in
+    # place below, so a shallow copy would alias nested dicts and diff to
+    # nothing; deep-copy to capture the true "from" values.
+    old_snapshot = copy.deepcopy(updates)
 
     section = str(section or "").strip().lower()
     if section in {"pipeline", "api-keys", "test-discord", "reset"}:
@@ -2542,17 +2581,25 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             if requested == "live" and is_beta_build():
                 log.warning("refusing trading_mode=live in beta build; coercing to paper")
                 requested = "paper"
-            updates["trading_mode"] = requested
             # CFG-1: the visible 'Trading mode' select must actually arm/disarm the
             # engine. The execution path reads config.get_execution_mode()
             # (config.json execution_mode), NOT this KV key, so without this the
             # control was a no-op and the dashboard could misreport live vs paper.
-            # Keep them in sync; wrapped so a beta-build refusal can't 500 the save.
+            # MODE-SPLIT-1: enforcement is the gatekeeper — persist this KV
+            # mirror only AFTER set_execution_mode accepts. Previously a
+            # refused 'live' was stored anyway, so Settings displayed live
+            # while the runtime stayed paper. A refusal is a loud 400 the
+            # save bar surfaces, never a silently-divergent stored value.
             try:
                 from forven.config import set_execution_mode
                 set_execution_mode(requested)
             except Exception as exc:
-                log.warning("could not sync execution_mode to trading_mode=%s: %s", requested, exc)
+                log.warning("refusing to persist trading_mode=%s: %s", requested, exc)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"trading_mode '{requested}' was not applied: {exc}",
+                ) from exc
+            updates["trading_mode"] = requested
 
     elif section == "initial-capital":
         if "initial_capital" in payload:
@@ -3261,11 +3308,27 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
         updates["discord_bot_token_configured"] = False
         updates["discord_bot_token_source"] = "none"
 
-    _save_settings_secrets(secrets)
-
     updates["updated_at"] = _now()
 
-    _save_settings_payload(updates)
+    # Compute the audit diff against the pre-mutation snapshot and fold the
+    # audit_log into the SAME blob we persist. `old_snapshot` carries the prior
+    # audit_log (in _AUDIT_IGNORE_KEYS, so it never self-diffs); append this
+    # request's entries onto it before writing.
+    entries = _diff_settings_section(section, old_snapshot, updates, actor=actor)
+    if entries:
+        updates["audit_log"] = _append_settings_audit(
+            old_snapshot.get("audit_log") or [], entries
+        )
+
+    # Persist the encrypted secrets blob AND the main settings blob (audit
+    # entry included) in ONE transaction: a crash between them can no longer
+    # leave enforcement diverged from display. Replaces the two separate
+    # _save_settings_secrets / _save_settings_payload calls that used to run
+    # here and the third blob save the endpoint did after appending audit.
+    kv_set_many({
+        _SETTINGS_SECRET_STORAGE_KEY: _encrypt_settings_secrets(secrets),
+        _SETTINGS_STORAGE_KEY: updates,
+    })
 
     if section == "bot-operations":
         try:
@@ -3574,6 +3637,7 @@ class OptimizationSubmitBody(BaseModel):
     execution_profile: dict | None = None
     execution_parameter_ranges: dict | None = None
     lifecycle_id: str | None = None
+    as_of: str | None = Field(default=None, max_length=64)
 
 
 StrategyPromoteBody = lifecycle_service.StrategyPromoteBody
@@ -6501,7 +6565,6 @@ def _find_null_setting_leaves(value, prefix: str = "") -> list[str]:
 
 
 def put_pipeline_settings(body: PipelineSettingsUpdateBody):
-    payload = _load_pipeline_settings_payload()
     updates = body.updates or {}
     if not isinstance(updates, dict):
         raise HTTPException(status_code=400, detail="updates must be an object")
@@ -6520,25 +6583,40 @@ def put_pipeline_settings(body: PipelineSettingsUpdateBody):
                 + " — enter a value or revert the field before saving"
             ),
         )
-    threshold_updates = {key: value for key, value in updates.items() if key in _PIPELINE_THRESHOLD_SETTING_KEYS}
-    flat_updates = {key: value for key, value in updates.items() if key not in _PIPELINE_THRESHOLD_SETTING_KEYS}
-    if threshold_updates:
-        from forven.policy import load_pipeline_config, save_pipeline_config
+    # Serialize the whole load->merge->save against every other settings
+    # mutation so a concurrent pipeline (or section) save can't race the
+    # read-modify-write and lose an edit.
+    with _SETTINGS_MUTATION_LOCK:
+        payload = _load_pipeline_settings_payload()
+        threshold_updates = {key: value for key, value in updates.items() if key in _PIPELINE_THRESHOLD_SETTING_KEYS}
+        flat_updates = {key: value for key, value in updates.items() if key not in _PIPELINE_THRESHOLD_SETTING_KEYS}
+        if threshold_updates:
+            from forven.policy import load_pipeline_config, save_pipeline_config
 
-        policy_config = load_pipeline_config()
-        for key, value in threshold_updates.items():
-            if isinstance(value, dict) and isinstance(policy_config.get(key), dict):
-                policy_config[key] = {**policy_config[key], **value}
-            else:
-                policy_config[key] = value
-        save_pipeline_config(policy_config)
-    payload.update(flat_updates)
-    _normalize_pipeline_wip_cap_payload(payload)
-    _normalize_graveyard_strategy_limit_payload(payload)
-    payload["created_by"] = str(body.actor or "manual") or "manual"
-    payload["created_at"] = _now()
-    _save_pipeline_settings_payload(payload)
-    _sync_pipeline_wip_cap_kv(payload)
+            policy_config = load_pipeline_config()
+            for key, value in threshold_updates.items():
+                if isinstance(value, dict) and isinstance(policy_config.get(key), dict):
+                    policy_config[key] = {**policy_config[key], **value}
+                else:
+                    policy_config[key] = value
+            # forven:pipeline_thresholds lives in policy.py and opens its own
+            # write; it stays a distinct KV key from the pipeline payload +
+            # WIP-cap mirror. The lock serializes it against the payload write
+            # below; a crash between them leaves the thresholds updated but the
+            # display payload stale (never a torn payload+mirror).
+            save_pipeline_config(policy_config)
+        payload.update(flat_updates)
+        _normalize_pipeline_wip_cap_payload(payload)
+        _normalize_graveyard_strategy_limit_payload(payload)
+        payload["created_by"] = str(body.actor or "manual") or "manual"
+        payload["created_at"] = _now()
+        # Write the pipeline payload AND its WIP-cap KV mirror in ONE
+        # transaction so the display blob and the enforced per-stage caps can
+        # never diverge on a crash between them.
+        kv_set_many({
+            _SETTINGS_PIPELINE_STORAGE_KEY: payload,
+            **_pipeline_wip_cap_kv_items(payload),
+        })
     return payload
 
 
@@ -6719,14 +6797,14 @@ def get_settings_audit_log(limit: int = 5) -> list[dict]:
 
 
 def put_settings_section(section: str, payload: dict):
-    old = _load_settings_payload()
-    result = _apply_settings_section(section, payload)
-    new = _load_settings_payload()
-    entries = _diff_settings_section(section, old, new, actor="ui")
-    if entries:
-        new["audit_log"] = _append_settings_audit(new.get("audit_log") or [], entries)
-        _save_settings_payload(new)
-    return result
+    # Serialize the entire read->apply->diff->audit->save sequence so two
+    # concurrent section saves can't race the read-modify-write (losing one
+    # edit) or cross-attribute the audit diff. _apply_settings_section computes
+    # the audit entries against its own pre-mutation snapshot and persists the
+    # secrets + main blob (audit included) in ONE atomic transaction, so there
+    # is no longer a second re-read/diff/save out here.
+    with _SETTINGS_MUTATION_LOCK:
+        return _apply_settings_section(section, payload, actor="ui")
 
 
 def get_settings_discord_audit(send_probe: bool = False):
@@ -9405,9 +9483,19 @@ def _resolve_backtest_context_from_results(
 
 
 def _normalize_strategy_type(value: object) -> str | None:
-    normalized = str(value or "").strip().lower()
-    if not normalized:
+    raw = str(value or "").strip()
+    if not raw:
         return None
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+    # Namespaced sandbox types are exact worker-registry keys: case-sensitive and
+    # never family-aliased. Lowercasing one breaks the worker lookup for a
+    # mixed-case imported module (silent 0-signal runs), and the family alias /
+    # *_orb collapse below would execute the WRONG builtin class for an imported
+    # strategy whose module name ends in a family token.
+    if is_sandbox_only_type(raw):
+        return raw
+    normalized = raw.lower()
     aliases = {
         "bb": "bollinger",
         "bollinger_band": "bollinger",
@@ -9530,6 +9618,37 @@ def _resolve_backtesting_strategy_type(
         if normalized_inferred:
             return normalized_inferred
     return _normalize_strategy_type(_infer_strategy_type_from_name(strategy_name))
+
+
+def resolve_execution_strategy_type(strategy_row: object) -> str | None:
+    """Return the column that names the EXECUTABLE type for a strategies row.
+
+    Dropzone/imported strategies carry a bare ``type`` (the author's TYPE_NAME)
+    plus a namespaced ``runtime_type`` (``imported__<module>``) that routes
+    execution through the sandbox worker. Execution entry points must resolve
+    the runtime_type: the bare type's source file was moved to ``imported/`` at
+    registration, so resolving it scans ``custom/`` and lands on the orphan
+    guard.
+    """
+    from forven.strategies.sandbox_proxy import is_sandbox_only_type
+
+    if strategy_row is None:
+        return None
+
+    def _column(key: str) -> object:
+        try:
+            if isinstance(strategy_row, dict):
+                return strategy_row.get(key)
+            return strategy_row[key]
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    runtime_type = str(_column("runtime_type") or "").strip()
+    if runtime_type and is_sandbox_only_type(runtime_type):
+        return runtime_type
+    bare = _column("type")
+    text = str(bare).strip() if bare is not None else ""
+    return text or None
 
 
 def _infer_strategy_context_from_task_audit(strategy_id: str) -> dict | None:
@@ -10233,7 +10352,7 @@ def post_backtest_preview(body: BacktestPreviewBody):
         row = _require_existing_strategy_row(requested)
         if isinstance(row, dict):
             base_params = _parse_strategy_params_blob(row.get("params")) or {}
-            explicit_type = row.get("type")
+            explicit_type = resolve_execution_strategy_type(row)
             if not (asset and asset.strip()):
                 asset = _extract_base_asset_symbol(str(row.get("symbol") or body.symbol))
     except Exception:
@@ -10442,6 +10561,26 @@ def register_manual_backtest_strategy(body: ManualStrategyBody) -> dict:
             params = getattr(instance, "default_params", {})
             if isinstance(params, dict):
                 default_params = dict(params)
+            from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
+
+            leak_reason = detect_lookahead(instance)
+            crash_reason = detect_execution_crash(instance)
+            if leak_reason or crash_reason:
+                registered = False
+                reset()
+                try:
+                    os.remove(manual_path)
+                except OSError:
+                    pass
+                reasons = [reason for reason in (leak_reason, crash_reason) if reason]
+                return {
+                    "valid": False,
+                    "registered": False,
+                    "strategy_name": type_name,
+                    "default_params": {},
+                    "errors": [f"Causality/runtime probe rejected the strategy: {reason}" for reason in reasons],
+                    "warnings": warnings,
+                }
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"Registered, but could not read default_params: {exc}")
     except Exception as exc:  # noqa: BLE001
@@ -10497,6 +10636,17 @@ def send_manual_strategy_to_forge(body: SendToForgeBody) -> dict:
             )
         strategy_type = type_name
         params = dict(body.params) if isinstance(body.params, dict) else {}
+        try:
+            from forven.strategies.lookahead_probe import detect_execution_crash, detect_lookahead
+
+            probe = _TYPE_MAP[type_name](type_name, params)
+            leak_reason = detect_lookahead(probe)
+            crash_reason = detect_execution_crash(probe)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Strategy validation probe failed: {exc}") from exc
+        if leak_reason or crash_reason:
+            detail = "; ".join(reason for reason in (leak_reason, crash_reason) if reason)
+            raise HTTPException(status_code=400, detail=f"Strategy rejected by Forge intake: {detail}")
         params.setdefault("_asset", asset)
         source_ref = f"manual_backtest:custom/manual_{type_name}.py"
         name = (body.name or "").strip() or f"{asset} {type_name}"
@@ -10840,7 +10990,7 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
     requested_params = body.params if isinstance(body.params, dict) else {}
     merged_params = {**base_params, **requested_params}
     strategy_type = _resolve_backtesting_strategy_type(
-        explicit_type=strategy_row.get("type"),
+        explicit_type=resolve_execution_strategy_type(strategy_row),
         strategy_name=strategy_name or strategy_id,
         params=merged_params,
         payload=strategy_definition_json,
@@ -11201,7 +11351,7 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 base_params = dict(audit_params)
                 inferred_params_for_backfill = dict(audit_params)
     strategy_type = _resolve_backtesting_strategy_type(
-        explicit_type=strategy_row.get("type"),
+        explicit_type=resolve_execution_strategy_type(strategy_row),
         strategy_name=strategy_name or strategy_id,
         params=base_params,
         payload=body.definition_json,
@@ -11347,6 +11497,7 @@ def post_optimization_submit(body: OptimizationSubmitBody):
     body_objective = body.objective
     body_start = body.start
     body_end = body.end
+    body_as_of = body.as_of
 
     def _run_optimization_background() -> None:
         try:
@@ -11370,6 +11521,7 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 slippage_bps=body.slippage_bps,
                 initial_capital=body.initial_capital,
                 leverage=body.leverage,
+                as_of=body_as_of,
             )
 
             if not isinstance(opt_result, dict) or opt_result.get("error"):
@@ -11424,6 +11576,10 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 "best_objective_value": best_objective_value,
                 "wfa_verdict": opt_result.get("wfa_verdict"),
                 "validated": opt_result.get("validated"),
+                "holdout_applied": opt_result.get("holdout_applied"),
+                "selection_window": opt_result.get("selection_window"),
+                "validation_window": opt_result.get("validation_window"),
+                "as_of": body_as_of,
                 "top_results": opt_result.get("top_results"),
                 "job_id": job_id,
                 "status": "succeeded",
@@ -11834,7 +11990,8 @@ def post_backtesting_run(body: dict):
                 if _bt_leverage is None:
                     _bt_leverage = _coerce_float(merged_params.get("leverage"), None)
                 strategy_type = _resolve_backtesting_strategy_type(
-                    explicit_type=body.get("strategy_type") or (strategy_row.get("type") if strategy_row else None),
+                    explicit_type=body.get("strategy_type")
+                    or (resolve_execution_strategy_type(strategy_row) if strategy_row else None),
                     strategy_name=(strategy_row.get("name") if strategy_row else strategy_id) or strategy_id,
                     params=merged_params,
                     payload={
@@ -11908,6 +12065,10 @@ def post_backtesting_run(body: dict):
                         slippage_bps=body.get("slippage_bps"),
                         initial_capital=body.get("initial_capital"),
                         execution_controls=manual_execution_controls or None,
+                        start_date=body.get("start") or body.get("start_date"),
+                        end_date=body.get("end") or body.get("end_date"),
+                        as_of=body.get("as_of"),
+                        sync_strategy_state=False,
                     )
                     if isinstance(result, dict) and not result.get("error"):
                         persisted = _persist_completed_backtest_run(

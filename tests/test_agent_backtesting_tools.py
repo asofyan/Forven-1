@@ -77,21 +77,28 @@ def _insert_result(
         )
 
 
-def test_agent_run_backtest_persists_result_and_syncs_strategy(forven_db, monkeypatch):
+def test_agent_run_backtest_persists_result_without_mutating_strategy(forven_db, monkeypatch):
     _insert_strategy("s-agent-backtest", stage="quick_screen")
 
     def _fake_backtest_strategy(**_kwargs):
         return {
             "start_date": "2025-01-01T00:00:00+00:00",
             "end_date": "2026-01-01T00:00:00+00:00",
-                "metrics": {
-                    "total_trades": 120,
-                    "win_rate": 0.57,
-                    "sharpe": 1.8,
-                    "profit_factor": 1.9,
-                    "max_drawdown_pct": 0.08,
-                    "total_return_pct": 14.0,
+            "metrics": {
+                "total_trades": 120,
+                "win_rate": 0.57,
+                "sharpe": 1.8,
+                "profit_factor": 1.9,
+                "max_drawdown_pct": 0.08,
+                "total_return_pct": 14.0,
                 "robustness_score": 82,
+                # Real backtest_strategy output ALWAYS carries IS/OOS blocks;
+                # the degeneracy-aware best-of rule in
+                # _sync_strategy_metrics_and_promote_if_eligible reads
+                # in_sample.total_trades and treats a missing block as a
+                # zero-IS-trades degenerate slice (which never promotes).
+                "in_sample": {"total_trades": 80, "sharpe": 1.6, "profit_factor": 1.8, "win_rate": 0.56},
+                "out_of_sample": {"total_trades": 40, "sharpe": 1.8, "profit_factor": 1.9, "win_rate": 0.57},
             },
             "trades": [],
         }
@@ -131,11 +138,10 @@ def test_agent_run_backtest_persists_result_and_syncs_strategy(forven_db, monkey
     assert result_row["result_type"] == "backtest"
     assert result_row["symbol"] == "BTC"
     assert result_row["timeframe"] == "1h"
-    assert strategy_row["stage"] == "gauntlet"
-    assert strategy_row["status"] == "gauntlet"
+    assert strategy_row["stage"] == "quick_screen"
+    assert strategy_row["status"] == "quick_screen"
     stored_metrics = json.loads(strategy_row["metrics"] or "{}")
-    assert float(stored_metrics["sharpe"]) == 1.8
-    assert float(stored_metrics["fitness"]) > 0
+    assert stored_metrics == {}
 
 
 def test_agent_verdict_persistence_normalizes_gauntlet_aliases(forven_db):
