@@ -248,7 +248,6 @@ def test_validate_symbol_fails_open_without_evidence(monkeypatch, tmp_path):
 
 
 def test_create_strategy_container_rejects_bad_symbol(forven_db, monkeypatch):
-    from forven import db as db_mod
     from forven.db import create_strategy_container, get_db
     from forven.dataeng import coverage
 
