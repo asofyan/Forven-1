@@ -11,7 +11,7 @@ Covers the 2026-07-06 fix set for "dethrone recommendations fire too easily":
 
 from datetime import datetime, timedelta, timezone
 
-from forven.db import create_approval, get_db, kv_set
+from forven.db import create_approval, get_db, kv_get, kv_set
 from forven.dethrone_cooldown import (
     DENY_COOLDOWN_ESCALATION_HOURS,
     clear_dethrone_cooldown,
@@ -42,6 +42,10 @@ def _seed_strategy(
             """,
             (sid, sid, metrics, stage, stage, sid, stage_changed),
         )
+    # Ensure auto_approve_dethrone is OFF so the manual-approval code
+    # path is exercised (tests that need auto-approve can flip it back).
+    existing = kv_get("forven:settings", {}) or {}
+    kv_set("forven:settings", {**existing, "auto_approve_dethrone": False})
     return sid
 
 

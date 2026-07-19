@@ -1652,6 +1652,25 @@ def transition_stage(
                     "Auto-approved dethrone for %s (approval #%s, auto_approve_dethrone enabled)",
                     strategy_id, approval_id,
                 )
+                # Mark the approval record as resolved so it is not left as
+                # pending_approval. We update the row directly rather than calling
+                # post_approve_approval (which would recursively call back into
+                # transition_stage via _apply_dethrone_recommendation). The stage
+                # transition itself happens below.
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        "UPDATE approvals SET status = 'approved', auto_approved = 1,"
+                        " decision = 'approved', actor = 'brain:auto_dethrone',"
+                        " decided_at = ?, updated_at = ?"
+                        " WHERE id = ? AND status = 'pending_approval'",
+                        (now_iso, now_iso, int(approval_id)),
+                    )
+                except Exception as _exc:
+                    log.warning(
+                        "Auto-approve dethrone record update failed for approval #%s: %s",
+                        approval_id, _exc,
+                    )
                 # Fall through to the stage change below — the approval record
                 # was created by _queue_dethrone_approval for audit trail.
             else:

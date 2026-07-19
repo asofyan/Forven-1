@@ -419,6 +419,9 @@ def test_transition_stage_blocks_unforced_rejected_to_paper_without_backtests(fo
 
 
 def test_transition_stage_queues_operator_approval_for_automated_paper_archive(forven_db):
+    # This test exercises the manual-approval code path; ensure auto-approve
+    # is disabled so the operator_approval_required gate fires.
+    kv_set("forven:settings", {"auto_approve_dethrone": False})
     _insert_strategy(
         "s-paper-archive-approval",
         stage="paper",
@@ -511,6 +514,9 @@ def test_transition_stage_force_archives_without_unbound_transition_locals(forve
 
 
 def test_transition_stage_reuses_existing_dethrone_approval_for_automated_paper_demotion(forven_db):
+    # This test exercises the manual-approval code path; ensure auto-approve
+    # is disabled so the operator_approval_required gate fires.
+    kv_set("forven:settings", {"auto_approve_dethrone": False})
     _insert_strategy(
         "s-paper-existing-approval",
         stage="paper",

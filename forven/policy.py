@@ -3437,6 +3437,12 @@ def _check_repeated_failure_auto_archive(
                         )
                     except Exception:
                         pass
+                    # Auto-approve when the setting allows it (default ON).
+                    # A frozen roster is itself a failure mode — dethrone
+                    # recommendations must not pile up as pending forever.
+                    _maybe_auto_apply_dethrone(
+                        approval_id, kv_get("forven:settings", {}) or {}
+                    )
                 return
 
         # Auto-archive — through the canonical lifecycle path (M-12 2026-06-09 audit).
