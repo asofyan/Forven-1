@@ -691,6 +691,19 @@ _MIRROR_SHORT_SAFE_TYPES: set[str] = {
     "williams_r",
     "funding",
     "funding_direction",
+    # Symmetric families: short entry = long exit, short exit = long entry
+    "donchian",
+    "ema_cross",
+    "macd",
+    "supertrend",
+    "orb",
+    "parabolic_sar",
+    "vwap",
+    "ichimoku",
+    "aroon",
+    "awesome_oscillator",
+    "ppo",
+    "trix",
 }
 
 
@@ -5890,7 +5903,15 @@ def _vectorized_directional_signals(
             signals.long_entries, signals.long_exits = _vectorized_signals(df, strategy_type, params)
             signals.short_entries, signals.short_exits = _mirrored_keltner_short_signals(df, params)
             return signals
-        raise ValueError(f"Strategy type '{strategy_type}' does not expose both-side vectorized signals")
+        # Generic mirror fallback for all symmetric/mirror-safe families:
+        # short entry = long exit, short exit = long entry.
+        # This correctly covers donchian, ema_cross, macd, supertrend, orb,
+        # parabolic_sar, vwap, ichimoku, aroon, ppo, trix, and any other
+        # vectorized family where short signals are the inverse of long signals.
+        signals.long_entries, signals.long_exits = _vectorized_signals(df, strategy_type, params)
+        signals.short_entries = signals.long_exits
+        signals.short_exits = signals.long_entries
+        return signals
 
     if resolved_trade_mode == "short_only":
         if strategy_type in {"stochastic", "williams_r"}:
@@ -5901,7 +5922,11 @@ def _vectorized_directional_signals(
         if strategy_type == "keltner":
             signals.short_entries, signals.short_exits = _mirrored_keltner_short_signals(df, params)
             return signals
-        raise ValueError(f"Strategy type '{strategy_type}' does not support trade_mode='short_only'")
+        # Generic mirror fallback for short_only
+        entries, exits = _vectorized_signals(df, strategy_type, params)
+        signals.short_entries = exits
+        signals.short_exits = entries
+        return signals
 
     signals.long_entries, signals.long_exits = _vectorized_signals(df, strategy_type, params)
     return signals
