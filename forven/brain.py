@@ -738,6 +738,32 @@ def _queue_promotion_approval(
     return approval_id, False
 
 
+def _auto_approve_dethrone_enabled() -> bool:
+    """Whether dethrone transitions self-approve (no operator click).
+
+    Controlled by the ``auto_approve_dethrone`` settings key (default True).
+    When explicitly False, falls back to ``auto_approve_promotions`` so
+    fully-autonomous mode still auto-dethrones. The default is ON because a
+    frozen roster that can never free is itself a failure mode in unattended
+    operation.
+    """
+    try:
+        settings = kv_get("forven:settings", {}) or {}
+        if isinstance(settings, dict):
+            raw = settings.get("auto_approve_dethrone", True)
+            if isinstance(raw, str):
+                raw = raw.strip().lower() in ("true", "1", "yes")
+            if bool(raw):
+                return True
+            # Explicitly False — check the promotions fallback
+            if _auto_approve_promotions_enabled():
+                return True
+            return False
+        return True
+    except Exception:
+        return True
+
+
 def _requires_operator_dethrone_approval(current_stage: str, target_stage: str) -> bool:
     if current_stage not in _OPERATOR_OWNED_STAGES:
         return False
@@ -1618,16 +1644,27 @@ def transition_stage(
                 reason=reason,
                 evidence=evidence,
             )
-            action = "Existing dethrone approval reused" if reused else "Dethrone approval queued"
-            blocked = _record_blocked_transition(
-                (
-                    f"{action} (approval #{approval_id}) before moving "
-                    f"{strategy_id} from {current_stage} to {normalized_target}"
-                ),
-                "operator_approval_required",
-            )
-            blocked["approval_id"] = str(approval_id)
-            return blocked
+            # Auto-approve when the setting allows it (default ON for autonomous
+            # operation). A frozen roster that can never free is itself a failure
+            # mode. The approval record still exists for audit.
+            if _auto_approve_dethrone_enabled():
+                log.info(
+                    "Auto-approved dethrone for %s (approval #%s, auto_approve_dethrone enabled)",
+                    strategy_id, approval_id,
+                )
+                # Fall through to the stage change below — the approval record
+                # was created by _queue_dethrone_approval for audit trail.
+            else:
+                action = "Existing dethrone approval reused" if reused else "Dethrone approval queued"
+                blocked = _record_blocked_transition(
+                    (
+                        f"{action} (approval #{approval_id}) before moving "
+                        f"{strategy_id} from {current_stage} to {normalized_target}"
+                    ),
+                    "operator_approval_required",
+                )
+                blocked["approval_id"] = str(approval_id)
+                return blocked
 
         # LIFECYCLE ORCHESTRATION FIX: Verify backtest data exists before transition.
         # Respect manual overrides (`force=True`) so operators can recover/test
