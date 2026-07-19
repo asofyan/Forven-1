@@ -194,11 +194,17 @@ def run_decay_tracker(
     for candidate in demotion_candidates:
         strategy_id = candidate["strategy_id"]
         try:
+            # decay_tracker is a designated system SAFETY actor
+            # (brain._SYSTEM_FORCE_ACTORS), so force=True is honoured and
+            # bypasses the dethrone-approval gate — the strategy is actually
+            # stopped rather than parked behind an operator approval that never
+            # comes in headless operation.
             transition = transition_stage(
                 strategy_id=strategy_id,
                 target_stage=demote_status,
                 reason=candidate["note"],
                 actor="decay_tracker",
+                force=True,
                 notes=candidate["merged_notes"],
                 evidence={
                     "trigger": "decay_tracker",

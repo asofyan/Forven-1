@@ -108,7 +108,7 @@ _USER_ACTORS = {"api", "manual", "user", "ui", "pipeline_sweep", "gauntlet_sweep
 #     ghost protection blocked the intended archive 323x/7d.
 # NOTE: none of these may retire a CANONICAL strategy — the canonical guard in
 # transition_stage only honours decay_tracker or forced _USER_ACTORS.
-_SYSTEM_FORCE_ACTORS = {"decay_kill_switch", "auto_archive", "evolution_terminal_archive"}
+_SYSTEM_FORCE_ACTORS = {"decay_kill_switch", "decay_tracker", "auto_archive", "evolution_terminal_archive"}
 _OPERATOR_OWNED_STAGES = {"paper", "live_graduated"}
 _TERMINAL_DETHRONE_STAGES = {"archived", "rejected", "backtest_failed"}
 
