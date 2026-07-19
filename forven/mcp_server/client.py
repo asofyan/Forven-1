@@ -25,7 +25,7 @@ class ForvenClient:
         operator_key: str | None = None,
         timeout: float | None = None,
     ) -> None:
-        self.base_url = (base_url or os.environ.get("FORVEN_API_URL") or "http://127.0.0.1:8003").rstrip("/")
+        self.base_url = (base_url or os.environ.get("FORVEN_API_URL") or os.environ.get("FORVEN_CLIENT_BASE") or "http://127.0.0.1:8003").rstrip("/")
         self.api_key = api_key or os.environ.get("FORVEN_API_KEY") or ""
         self.operator_key = operator_key or os.environ.get("FORVEN_OPERATOR_KEY") or ""
         try:

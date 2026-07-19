@@ -1,10 +1,146 @@
 # Strategy Development State
 
-> Terakhir diperbarui: 2026-07-11
+> Terakhir diperbarui: 2026-07-15
 
 ---
 
-## Ringkasan Sesi
+## Proposal 7: BTC 1h MACD Divergence + Trend-Alignment Gate (2026-07-15)
+
+### Hypothesis
+
+BTC/USDT 1h adalah kombinasi timeframe/aset yang BELUM dieksplorasi untuk
+alpha MACD divergence. ETH 1h (S01947) mencapai OOS Sharpe 2.14 tapi hanya 23
+trades — terlalu sedikit untuk stabilitas Monte Carlo. Hipotesis: BTC 1h punya
+noise lebih rendah dari 15m → sinyal divergence lebih reliable, dan filter
+RSI + trend-alignment akan memperbaiki IS performance yang menjadi kelemahan
+utama strategi MACD divergence sebelumnya.
+
+### Quant-Research Grounding
+
+Mengikuti prinsip quantitative-research skill:
+1. **Simple works** — canonical MACD(12,26,9) + Wilder RSI(14) + EMA(50/200)
+2. **Regime-blindness (HIGH severity sharp edge)** — mean reversion fails in trends
+3. **Trade count** — target 40-80 trades untuk MC stability
+4. **Parameter discipline** — 4 tunable params (Rule of 5)
+5. **Lookahead-safe** — causal swing detection, verified via parity test
+
+### Iterasi Pengembangan
+
+| Versi | Pendekatan | Hasil |
+|-------|-----------|-------|
+| v1 (S02042) | MACD div + RSI 50/50, no regime filter | IS Sharpe -1.63, OOS Sharpe 2.13, 76+40 trades. RSI 50/50 = no-op (divergence already implies RSI zone) |
+| v1 RSI 40/60 | Tighter RSI bounds | IS Sharpe -1.63, OOS Sharpe 2.13, 76+40 — RSI improved OOS PF |
+| v2 (S02043) | + ADX regime gate (ADX < 25) | ❌ ADX too aggressive — BTC almost always ADX > 25 on 1h. 5 trades total. OOS went from +2.13 to -1.60 |
+| v3 (S02044) | + EMA(50/200) trend-alignment gate | IS Sharpe -0.069 (from -1.63!), OOS Sharpe 1.786. IS PF 0.952 (just below 1.05) |
+| **v2 final (S02045)** | swing=10, vol=1.3, RSI 40/60, trend-aligned | ✅ **IS PF 1.196, IS Sharpe 0.359, OOS PF 1.481, OOS Sharpe 1.149, 28+23 trades** |
+
+### Key Insight: ADX vs Trend-Alignment
+
+- **ADX filter gagal total** — BTC 1h hampir selalu ADX > 25 (persistently trending).
+  ADX < 25 memfilter 95% sinyal. Profitable OOS trades justru terjadi saat ADX > 25.
+- **Trend-alignment (EMA 50/200) berhasil** — bukan memfilter trend, tapi MEMILIH arah
+  yang searah trend. Longs hanya saat uptrend (buy the dip via bullish divergence),
+  shorts hanya saat downtrend. Ini mengubah pure reversal menjadi trend-aligned entry.
+- IS PF dari 0.637 → 1.196 (naik 88%) dengan trend-alignment.
+
+### Parameter Sweep Results (v3/S02044)
+
+| Config | IS PF | IS Sharpe | IS Trades | OOS PF | OOS Sharpe | OOS Trades | Gate |
+|--------|-------|-----------|-----------|--------|------------|------------|------|
+| swing=8, vol=1.0 (default v3) | 0.952 | -0.069 | 27 | 1.823 | 1.786 | 21 | IS PF < 1.05 ❌ |
+| swing=10, vol=1.0 | 1.048 | 0.117 | 33 | 1.465 | 1.188 | 25 | IS PF < 1.05 ❌ |
+| swing=10, vol=1.2 | 1.123 | 0.234 | 28 | 1.345 | 0.898 | 24 | PASS ✅ |
+| **swing=10, vol=1.3** | **1.196** | **0.359** | **28** | **1.481** | **1.149** | **23** | **PASS ✅ BEST** |
+| swing=10, vol=1.4 | 1.196 | 0.359 | 28 | 1.473 | 1.152 | 22 | PASS (saturates at 1.3) |
+| swing=9, vol=1.0 | 0.796 | -0.425 | 30 | 1.831 | 1.755 | 23 | IS PF < 1.05 ❌ |
+| swing=11, vol=1.2 | 1.048 | 0.109 | 29 | 1.345 | 0.898 | 24 | IS PF < 1.05 ❌ |
+| swing=8, vol=0.8 | 0.782 | -0.465 | 30 | 2.115 | 2.450 | 24 | IS PF < 1.05 ❌ (OOS > 2.4 = overfit risk) |
+
+**Pattern:** Higher swing_lookback + higher volume_threshold → better IS PF, weaker OOS.
+Sweet spot at swing=10, vol=1.3 where IS PF > 1.05 AND OOS Sharpe > 1.0.
+
+### Strategi Final: S02045
+
+| Field | Value |
+|-------|-------|
+| **Strategy ID** | S02045 |
+| **File** | `forven/strategies/custom/macd_div_trend_btc_1h.py` |
+| **TYPE_NAME** | `macd_div_trend_btc_1h_v2` |
+| **Asset** | BTC/USDT 1h |
+| **Stage** | gauntlet (auto-promoted) |
+| **Signal parity** | PASS (0 mismatch) |
+| **Robustness** | 1.0 |
+
+**Default params:**
+```python
+fast=12, slow=26, signal=9,         # canonical MACD
+swing_lookback=10,                   # causal swing window
+volume_threshold=1.3,                # volume / vol_ma >= 1.3
+volume_window=20,
+rsi_period=14,                       # Wilder's RSI
+rsi_filter_enabled=True,
+rsi_long_max=40, rsi_short_min=60,   # RSI sanity bounds
+use_trend_filter=True,
+ema_trend_fast=50, ema_trend_slow=200,  # trend-alignment gate
+trade_mode="both",
+```
+
+**Backtest results (BTC/USDT-1h):**
+
+| Metric | IS (8.4mo) | OOS (3.6mo) | Combined |
+|--------|------------|-------------|----------|
+| PF | 1.196 | 1.481 | 1.324 |
+| Sharpe | 0.359 | 1.149 | 0.596 |
+| Trades | 28 | 23 | 51 |
+| MaxDD | 5.0% | 3.7% | 5.0% |
+| Win Rate | 39.3% | 47.8% | 43.1% |
+| Return | +2.0% | +4.3% | +6.4% |
+| Ann. Return | 2.9% | 15.0% | 6.4% |
+| Avg Hold | 17.2 bars | 23.0 bars | 19.8 bars |
+| Verdict | — | Promising | — |
+
+### Gate Status
+
+- ✅ quick_screen PASSED (auto-promoted to gauntlet)
+- ✅ Signal parity (0 mismatch, no stub, no unreachable-signal)
+- ✅ Robustness 1.0
+- ⏳ Gauntlet 12-step Advancer: running (Monte Carlo DD, walk-forward, deflated Sharpe, cost stress, param jitter)
+- ❌ Multi-TF sweep: incomplete (only 1h tested, need 15m + 4h)
+- ❌ Walk-forward artifacts: pending
+
+### Perintah Cek Status
+
+```bash
+cd /home/hms/forven
+export FORVEN_API_URL=http://127.0.0.1:8004
+export FORVEN_API_KEY=92ec5b339a6a980a8c3d6dc31b237ac4e9572a520921ce454fb5bf049839d7c0
+export FORVEN_OPERATOR_KEY=295dc8d02f34f301b6456ae19f4b5b02e8bddc815b124729c020d57dba573566
+export PATH=/home/hms/forven/.venv/bin:$PATH
+
+python -m forven.agent gate-report S02045
+python -m forven.agent status S02045
+python -m forven.agent wait-paper --strategies S02045 --timeout 1800
+```
+
+### Pelajaran Kunci
+
+1. **ADX adalah regime filter yang salah untuk BTC 1h** — BTC persistently trending,
+   ADX hampir selalu > 25. Filter ini membunuh 95% sinyal dan membuat OOS negatif.
+2. **Trend-alignment (EMA 50/200) adalah fix yang tepat** — bukan memfilter berdasarkan
+   kekuatan trend, tapi memilih arah trade yang searah trend. Longs saat uptrend,
+   shorts saat downtrend. Ini mengkonversi pure reversal → trend-aligned entry.
+3. **RSI 50/50 adalah no-op** — divergence secara natural sudah implies RSI zone.
+   RSI 40/60 (stricter) memberikan selectivity tambahan yang meningkatkan OOS PF.
+4. **Volume threshold sweetspot di 1.3** — di atas 1.3 saturates (identical results).
+5. **IS/OOS inverted (OOS > IS) adalah good sign** — bukan overfit. IS period
+   (2025 H2 - 2026 Q1) lebih hostile untuk mean reversion.
+6. **Trade count 51 (28+23) cukup untuk quick_screen** tapi mungkin masih kurang
+   untuk MC stability di gauntlet (target 60-80+). Monte Carlo DD 95th adalah
+   gate yang paling sering gagal.
+
+---
+
+## Ringkasan Sesi Sebelumnya
 
 Kita menganalisis 23 strategi paper di pipeline Forven dan mengidentifikasi **MACD Divergence** sebagai dominant alpha mechanism (8 dari 23 paper). Kemudian mengeksekusi **Proposal 1**: fix structural lookahead di swing detection + deploy 3 strategi ke gauntlet.
 

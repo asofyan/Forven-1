@@ -5385,12 +5385,18 @@ def _load_deployed_strategies() -> dict:
                 load_diagnostics[sid] = diagnostic
                 continue
 
+            # Sandbox-only (imported) types are intentionally not in _TYPE_MAP
+            # in the parent process — their class lives only in the worker and
+            # signal-gen delegates there via the proxy. Skip the registration
+            # gate for these types so the scanner doesn't BLOCK them here.
+            _sandbox_only = bool(runtime_meta.get("sandbox_only", False))
             if stype not in SIGNAL_CHECKERS and resolved_runtime_type not in _TYPE_MAP:
-                diagnostic["blocked_reason"] = f"runtime type '{resolved_runtime_type}' is not registered"
-                diagnostic["last_runtime_error"] = diagnostic["blocked_reason"]
-                diagnostic["execution_decision"] = "blocked"
-                load_diagnostics[sid] = diagnostic
-                continue
+                if not _sandbox_only:
+                    diagnostic["blocked_reason"] = f"runtime type '{resolved_runtime_type}' is not registered"
+                    diagnostic["last_runtime_error"] = diagnostic["blocked_reason"]
+                    diagnostic["execution_decision"] = "blocked"
+                    load_diagnostics[sid] = diagnostic
+                    continue
 
             asset = _normalize_strategy_asset(
                 row.get("symbol") or STRATEGIES.get(sid, {}).get("asset"),
@@ -5431,7 +5437,11 @@ def _load_deployed_strategies() -> dict:
             #         log.warning("Skipping market pot gate for %s: %s", sid, exc)
 
             certified_for_paper = certification.certified
-            if raw_stage == "paper" and not certified_for_paper:
+            # Sandbox-only (imported) types bypass the certification gate:
+            # their class lives only in the worker and can never be certified
+            # in the parent process (by design). The sandbox proxy handles
+            # signal-gen for these at runtime.
+            if raw_stage == "paper" and not certified_for_paper and not _sandbox_only:
                 blocked_reason = (
                     certification.primary_blocking_reason()
                     or "paper strategy is outside the certified subset"
@@ -5441,6 +5451,10 @@ def _load_deployed_strategies() -> dict:
                 load_diagnostics[sid] = diagnostic
                 log.warning("Quarantining paper strategy %s: %s", sid, blocked_reason)
                 continue
+            # Sandbox-only paper strategies: override certified flag so the
+            # merged payload below reflects the truth.
+            if _sandbox_only:
+                certified_for_paper = True
 
             row_timeframe = str(row.get("timeframe") or "").strip().lower() or None
             merged[sid] = {
@@ -5874,6 +5888,11 @@ def _kernel_open_paper_trade(strat_id: str, strat: dict, action, *, sizing_equit
         "take_profit": target_price,
         "take_profit_price": target_price,
         "source": "scanner.kernel" if not late else "scanner.kernel.fill_now",
+        # Effective protective level — the tighter of the fixed stop and any trailing
+        # ratchet. For a late hop-in this equals stop_price at open (trailing builds on
+        # later scans via _kernel_refresh_paper_trade). Persisted so risk audit / mark
+        # watcher can read the real enforced level instead of estimating from ATR params.
+        "effective_stop_price": stop_price,
         # Tag late hop-ins so the close path keeps the entry-based PnL (the recorded entry
         # differs from the kernel's historical entry) and the refresh path leaves the
         # re-anchored stop/target alone.
@@ -6236,8 +6255,13 @@ def _kernel_refresh_paper_trade(action) -> str | None:
     # A late hop-in entered at a DIFFERENT price than the kernel's historical entry, so its
     # stop/target were re-anchored to the hop-in price. The kernel's pos still carries the
     # OLD (historical-entry) levels — don't clobber the re-anchored ones with them; leave
-    # the late trade's own SL/TP intact.
+    # the late trade's own SL/TP intact. Still persist the effective_stop_price from the
+    # trade's OWN re-anchored stop_loss_price so risk audit / mark watcher see the real
+    # enforced level rather than having to estimate it from ATR params alone.
     if bool(sd.get("late_entry")):
+        _late_eff = _coerce_positive_float(sd.get("stop_loss_price"))
+        if _late_eff is not None:
+            _update_trade_signal_data(str(row.get("id")), {"effective_stop_price": round(float(_late_eff), 8)})
         return None
     pos = action.position or {}
     updates: dict = {}

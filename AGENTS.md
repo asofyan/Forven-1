@@ -265,6 +265,7 @@ class NamaStrategi(BaseStrategy):
     # 🔴 WAJIB: implementasi nyata, BUKAN stub `Signal.from_condition(False, ...)`.
     # Scanner live panggil ini — stub = 0 trade di paper selamanya.
     # Gunakan helper/indikator yg sama dgn generate_signals(), evaluasi bar terakhir.
+    # Indikator swing/pivot/extremum WAJIB causal (window ke belakang saja). Lihat PITFALL "Unreachable-Signal".
     def generate_signal(self, df: pd.DataFrame) -> Signal:
         period = int(self.params.get("period", 20))
         if len(df) < period + 2:
@@ -309,6 +310,7 @@ STRATEGY_CLASS = NamaStrategi
 | 2 | `.shift(1)` pada semua indikator/rolling window | Lookahead → strategy di-reject di registration |
 | 3 | Implementasi BOTH `generate_signal()` DAN `generate_signals()` | Tanpa vectorized → O(N²), bisa timeout |
 | 3b | 🔴 **`generate_signal()` HARUS implementasi nyata, BUKAN stub `Signal.from_condition(False, ...)`**. Scanner live panggil `generate_signal()` per-bar; stub = 0 trade selamanya di paper. Lihat section "PITFALL" di bawah. | Chart muncul panah buy tapi tidak ada eksekusi trade — 0 trade selamanya |
+| 3c | 🔴 **Indikator pivot/swing/extremum HARUS causal (window ke belakang saja: `iloc[i-w+1:i+1]` atau `.rolling(w).max().shift(1)`)**. Window simetrik/centered (slice `[i-half:i+half+1]`) melihat ke depan → extremum terbaru tak terdeteksi real-time → kondisi `generate_signal()` unreachable → 0 trade live (plus backtest lookahead/optimistis). Lihat PITFALL "Unreachable-Signal". | Chart arrow + backtest trade, tapi paper 0 trade — lebih sulit dideteksi daripada stub |
 | 4 | Return `(pd.Series bool, pd.Series bool)` dari `generate_signals()` | Tipe salah → error runtime |
 | 5 | Jangan taruh `stop_loss_pct` / `risk_pct` di `default_params` | Engine yang handle risk management |
 | 6 | Set `compatible_regimes` (minimal 1) | Kosong → engine force-exit tiap posisi |
@@ -491,6 +493,88 @@ def generate_signal(self, df: pd.DataFrame) -> Signal:
 grep -l "Signal.from_condition(False" forven/strategies/custom/*.py
 # Setiap file yang muncul = BUG, harus diperbaiki sebelum register
 ```
+
+### 🔴 PITFALL: Unreachable-Signal — Window Simetrik (Lookahead) Bikin Kondisi Scalar Tak Terjangkau
+
+**Varian lebih sulit dari bug stub.** `generate_signal()` terlihat nyata (bukan stub), tapi kondisi
+entry-nya **secara struktural tidak pernah tercapai** di bar terakhir karena indikator pendeteksi
+(swing/pivot/extremum) memakai window **simetrik** yang melihat ke depan. Bug class inilah yang
+menimbulkan insiden 11 strategi divergence di paper (lihat `docs/fix_zero_papertrade.md`).
+
+**Dua path, dua nasib — kunci diagnosis:**
+
+| Path | Method | Dipakai oleh | Konsekuensi window simetrik |
+|------|--------|--------------|-----------------------------|
+| **Scalar** (live) | `generate_signal(df)` | Scanner **eksekusi** (`scanner.py`) | Swing terbaru tak terdeteksi → kondisi unreachable → **0 trade live** |
+| **Vectorized** | `generate_signals(df)` | Chart + backtest | Bocor info masa depan → arrow muncul + backtest trade **(tapi lookahead/optimistis)** |
+
+**Kenapa unreachable?** Window simetrik `half` bar ke depan hanya bisa mendeteksi swing sampai
+index `n - half - 1`. Kondisi scalar yang butuh swing di `n - 2` (bar terakhir yang bisa dievaluasi)
+tak pernah tercapai karena `n - 2 > n - half - 1` selama `half ≥ 2`. Hasil: `entry_signal=False`
+selamanya di live, padahal chart penuh arrow dan backtest profit (palsu).
+
+**Penyebab — window SIMETRIK (❌):**
+
+```python
+# ❌ Melihat `half` bar ke depan → swing terbaru tak terdeteksi real-time + lookahead di backtest
+def _swing_points(self, series, window):
+    half = max(window // 2, 2)
+    n = len(series)
+    for i in range(half, n - half):                    # swing hanya sampai n-half-1
+        seg = series.iloc[i - half : i + half + 1]     # ← BOCOR ke depan
+        ...
+```
+
+**Perbaikan — window CAUSAL (✅):**
+
+```python
+# ✅ Hanya lihat bar lampau + bar saat ini. Swing di n-2 terdeteksi → kondisi scalar reachable.
+def _swing_points(self, series, window):
+    n = len(series)
+    result = pd.Series(0, index=series.index, dtype=int)
+    if n < window:
+        return result
+    for i in range(window - 1, n):
+        seg = series.iloc[i - window + 1 : i + 1]      # ← hanya ke belakang
+        curr = series.iloc[i]
+        if pd.isna(curr):
+            continue
+        if curr == seg.max() and (seg == curr).sum() == 1:
+            result.iloc[i] = 1
+        elif curr == seg.min() and (seg == curr).sum() == 1:
+            result.iloc[i] = -1
+    return result
+```
+
+**Prinsip umum:** Setiap indikator yang butuh "konfirmasi" extremum lokal (swing high/low, pivot,
+divergence peak) **wajib causal** (right-aligned: `df.iloc[i-w+1:i+1]` atau `.rolling(w).max().shift(1)`).
+Window centered/simetrik (slice `[i-half:i+half+1]`) dilarang — selain lookahead, ia membuat sinyal
+bar terbaru mustahil dikonfirmasi secara real-time.
+
+**Aturan emas parity:** `generate_signal()` dan `generate_signals()` **HARUS** share helper yang sama
+dan menghasilkan sinyal bar-terakhir yang **identik**. Chart muncul arrow tapi paper 0 trade → dua path
+divergen → ada bug (stub ATAU unreachable-signal).
+
+**Cara deteksi:**
+
+```bash
+# 1. Window simetrik (root cause) — setiap output = BUG
+grep -rln "for i in range(half, n - half)" forven/strategies/custom/
+grep -rln "iloc\[i - half" forven/strategies/custom/
+
+# 2. Stub (varian lain) — setiap output = BUG
+grep -rln "Signal.from_condition(False" forven/strategies/custom/
+
+# 3. Stub detector resmi
+.venv/bin/python -c "from forven.strategies.stub_detector import scan_custom_directory; print(scan_custom_directory())"
+
+# 4. Parity test (scalar vs vectorized) — konfirmasi 0 mismatch
+.venv/bin/python scripts/test_signal_parity.py --deep 300
+```
+
+**Pelajaran kunci:** Implementasi `generate_signal()` yang "terlihat nyata" **belum cukup**. Kondisinya
+harus **secara struktural reachable** dengan window deteksi indikatornya. Window simetrik = sinyal
+mustahil muncul real-time + backtest optimistis (lookahead). Fix = causal detection.
 
 ### Signal Dataclass Reference
 

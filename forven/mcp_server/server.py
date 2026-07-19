@@ -284,6 +284,8 @@ def build_server(client: ForvenClient | None = None) -> FastMCP:
 
     server = FastMCP(
         name="forven",
+        json_response=True,
+        stateless_http=True,
         instructions=(
             "Forven AI Drop Zone — design, register, backtest, validate, and "
             "promote trading strategies through the REAL lifecycle gates. "
