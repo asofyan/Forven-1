@@ -1829,7 +1829,19 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 # the strategy's declared timeframe but the stored metrics don't,
                 # prefer the new metrics regardless of Sharpe comparison — the
                 # strategy must carry metrics from its OWN trading timeframe.
-                strat_tf = str(row_dict.get("timeframe") or "").strip().lower()
+                #
+                # Prefer params._timeframe (immutable declaration, set at
+                # registration) over the DB timeframe column (which may have been
+                # corrupted by a previous sweep gate crown — S01627/S01724 bug).
+                _row_params = {}
+                try:
+                    _raw = row_dict.get("params")
+                    _row_params = json.loads(_raw) if isinstance(_raw, str) else {}
+                except Exception:
+                    pass
+                strat_tf = str(
+                    _row_params.get("_timeframe") or row_dict.get("timeframe") or ""
+                ).strip().lower()
                 new_tf = str(metrics.get("_backtest_timeframe") or "").strip().lower()
                 existing_tf = str(existing_metrics.get("_backtest_timeframe") or "").strip().lower()
                 new_matches_strat = new_tf and new_tf == strat_tf

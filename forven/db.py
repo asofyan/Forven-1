@@ -4973,6 +4973,17 @@ def create_strategy_container(
         params = lift_unambiguous_risk_params(params)
     except Exception:
         pass
+    # TIMEFRAME-ANCHOR-1: inject the resolved ``_timeframe`` into params so it is
+    # stored as an IMMUTABLE declaration in the DB.  Without this, strategies that
+    # don't declare ``_timeframe`` in their ``default_params`` have no way to recover
+    # their original intended timeframe after the sweep gate overwrites the DB
+    # ``timeframe`` column — the fallback in ``_strategy_declared_timeframe()`` reads
+    # the corrupted column and the off-declared guard in
+    # ``_persist_quick_screen_winner()`` never fires (S01627/S01724 root cause).
+    # Only set when absent — an explicit ``_timeframe`` in the author's
+    # ``default_params`` is always authoritative.
+    if "_timeframe" not in params:
+        params["_timeframe"] = str(timeframe or "1h").strip().lower()
     # SYMBOL-VALID-1: fabricated symbols (MULTI/USDT, BASKET/USDT), inverted
     # pairs, and dataset-context leaks (ETH/USDT-8H) wedge the gauntlet in an
     # eternal blocked_data backfill loop and hammer the exchange with requests

@@ -940,6 +940,10 @@ def _strategy_declared_timeframe(strategy_id: str) -> str | None:
     ``_timeframe`` when it exists.
 
     Returns ``None`` when the strategy row doesn't exist or carries no declaration.
+    DO NOT fall back to the DB ``timeframe`` column — it may have been corrupted by
+    a previous sweep crown, creating a permanently unrecoverable cycle where the
+    corrupted value is read back as "declared" and the off-declared guard never fires.
+    This was the root cause of the S01627/S01724 cross-timeframe metrics collision bug.
     """
     try:
         if not strategy_id:
@@ -953,10 +957,11 @@ def _strategy_declared_timeframe(strategy_id: str) -> str | None:
         declared = str(params.get("_timeframe") or "").strip() or None
         if declared is not None:
             return declared.lower()
-        # No _timeframe in params: fall back to the DB column, but note that
-        # this may have been overwritten by a previous sweep crown.
-        col_tf = str(row.get("timeframe") or "").strip()
-        return col_tf.lower() if col_tf else None
+        # No _timeframe in params: return None.  The DB column is NOT a reliable
+        # source — it may have been overwritten by a previous sweep crown.
+        # The caller (``_persist_quick_screen_winner``) handles None by preserving
+        # the existing DB column and logging a warning.
+        return None
     except Exception:
         return None
 
@@ -1021,6 +1026,7 @@ def _persist_quick_screen_winner(
         and declared_tf != ""
         and tf.lower() != declared_tf
     )
+    declared_tf_unknown = declared_tf is None or declared_tf == ""
 
     try:
         from datetime import datetime, timezone
@@ -1029,9 +1035,19 @@ def _persist_quick_screen_winner(
 
         now = datetime.now(timezone.utc).isoformat()
         with get_db() as conn:
-            if crown_is_off_declared:
-                # Crowned a non-declared timeframe: persist metrics for gate
-                # evaluation but preserve the strategy's declared identity.
+            if crown_is_off_declared or declared_tf_unknown:
+                # ── Off-declared or unknown ──────────────────────────────
+                # When the crown winner's timeframe differs from the strategy's
+                # declared timeframe, persist metrics for gate evaluation but
+                # preserve the strategy's declared identity (don't overwrite the
+                # DB timeframe column).
+                #
+                # When the declared timeframe is unknown (params._timeframe was
+                # never set at registration), also preserve the DB column — we
+                # cannot safely assume the sweep-crowned timeframe is what the
+                # author intended. This prevents the circular corruption where a
+                # previously-corrupted DB column is read back as "declared" and
+                # the guard never fires (S01627/S01724 root cause).
                 conn.execute(
                     """UPDATE strategies SET metrics = ?, updated_at = ?
                        WHERE id = ?
@@ -1039,11 +1055,18 @@ def _persist_quick_screen_winner(
                              ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')""",
                     (json.dumps(metrics), now, strategy_id),
                 )
-                log.warning(
-                    "_persist_quick_screen_winner: %s crowned on tf=%s differs from declared tf=%s "
-                    "— persisted sweep metrics but preserved declared timeframe",
-                    strategy_id, tf, declared_tf,
-                )
+                if crown_is_off_declared:
+                    log.warning(
+                        "_persist_quick_screen_winner: %s crowned on tf=%s differs from declared tf=%s "
+                        "— persisted sweep metrics but preserved declared timeframe",
+                        strategy_id, tf, declared_tf,
+                    )
+                else:
+                    log.warning(
+                        "_persist_quick_screen_winner: %s crowned on tf=%s but declared timeframe is unknown "
+                        "(missing params._timeframe) — persisted sweep metrics but preserved DB timeframe column",
+                        strategy_id, tf,
+                    )
             else:
                 conn.execute(
                     """UPDATE strategies SET timeframe = ?, metrics = ?, updated_at = ?

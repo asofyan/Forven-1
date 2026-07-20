@@ -252,7 +252,7 @@ def test_backtest_submit_skips_task_audit_lookup_when_strategy_is_already_execut
 
     assert response["status"] == "succeeded"
     assert captured.get("strategy_type") == "rsi_momentum"
-    assert captured.get("params") == {"rsi_period": 14, "rsi_entry": 30, "rsi_exit": 70}
+    assert captured.get("params") == {"rsi_period": 14, "rsi_entry": 30, "rsi_exit": 70, "_timeframe": "1h"}
 
 
 def test_backtesting_run_now_working_row_uses_valid_simulation_agent(
