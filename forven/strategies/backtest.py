@@ -1821,9 +1821,34 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                 new_sharpe = float(metrics.get("sharpe") or metrics.get("sharpe_ratio") or 0)
                 existing_degenerate = is_degenerate_backtest_metrics(existing_metrics)
                 new_degenerate = is_degenerate_backtest_metrics(metrics)
+
+                # --- Symbol/timeframe match check (S01627/S01724 fix) ---
+                # The best-of-Sharpe rule below can permanently lock in backtest
+                # metrics from a DIFFERENT timeframe (e.g. storing 4h ETH/USDT
+                # results for a 15m ETH strategy). When the new backtest matches
+                # the strategy's declared timeframe but the stored metrics don't,
+                # prefer the new metrics regardless of Sharpe comparison — the
+                # strategy must carry metrics from its OWN trading timeframe.
+                strat_tf = str(row_dict.get("timeframe") or "").strip().lower()
+                new_tf = str(metrics.get("_backtest_timeframe") or "").strip().lower()
+                existing_tf = str(existing_metrics.get("_backtest_timeframe") or "").strip().lower()
+                new_matches_strat = new_tf and new_tf == strat_tf
+                existing_matches_strat = existing_tf and existing_tf == strat_tf
+                # If existing has no _backtest_timeframe (pre-fix data), treat as
+                # ambiguous — it MIGHT be from a different timeframe.
+                existing_ambiguous = not existing_tf
+                same_context_override = (
+                    new_matches_strat
+                    and not existing_matches_strat  # existing is wrong tf or ambiguous
+                    and not new_degenerate           # new is structurally valid
+                )
+
                 keep_existing = (
-                    (new_degenerate and not existing_degenerate)
-                    or (existing_sharpe > 0 and new_sharpe < existing_sharpe and not existing_degenerate)
+                    not same_context_override
+                    and (
+                        (new_degenerate and not existing_degenerate)
+                        or (existing_sharpe > 0 and new_sharpe < existing_sharpe and not existing_degenerate)
+                    )
                 )
                 if keep_existing:
                     log.info(
@@ -1834,7 +1859,14 @@ def _sync_strategy_metrics_and_promote_if_eligible(
                     # Keep existing but still store the result in backtest_results (already done upstream)
                     metrics = existing_metrics
                 else:
-                    # New metrics are better or first run — preserve robustness fields
+                    if same_context_override:
+                        log.info(
+                            "Overriding stored metrics for %s (same-context override): "
+                            "new backtest tf=%s matches strategy tf=%s, existing tf=%s",
+                            strategy_id, new_tf, strat_tf, existing_tf or "(unknown)",
+                        )
+                    # New metrics are better, first run, or same-context override —
+                    # preserve robustness fields
                     _preserve_keys = (
                         "composite_robustness_score", "robustness_tests_passed", "robustness_tests_total",
                         "archetype_fingerprint",
@@ -8592,7 +8624,10 @@ def backtest_strategy(
 
 
             remote_metrics = remote_res.get("metrics", {}) if isinstance(remote_res, dict) else {}
-
+            # Stamp backtest symbol/timeframe for the best-of-Sharpe merge
+            if isinstance(remote_metrics, dict):
+                remote_metrics["_backtest_symbol"] = str(asset or "").strip()
+                remote_metrics["_backtest_timeframe"] = str(resolved_timeframe or "").strip()
 
             if sync_strategy_state:
 
@@ -9354,6 +9389,15 @@ def backtest_strategy(
 
 
     if sync_strategy_state:
+        # Stamp the backtest symbol/timeframe onto the metrics so the
+        # best-of-Sharpe merge can detect stale stored metrics from a
+        # DIFFERENT timeframe and replace them (S01627/S01724 bug).
+        _bt_symbol = str(asset or "").strip()
+        _bt_tf = str(resolved_timeframe or "").strip()
+        if _bt_symbol:
+            metrics["_backtest_symbol"] = _bt_symbol
+        if _bt_tf:
+            metrics["_backtest_timeframe"] = _bt_tf
         _sync_strategy_metrics_and_promote_if_eligible(
 
 

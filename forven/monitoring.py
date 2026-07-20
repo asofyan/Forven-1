@@ -50,8 +50,32 @@ def _parse_json_obj(value) -> dict:
     return {}
 
 
-def _extract_baseline_sharpe(metrics_raw) -> float | None:
+def _extract_baseline_sharpe(metrics_raw, stage: str | None = None) -> float | None:
+    """Extract the baseline Sharpe from stored metrics.
+
+    For paper/live stages, paper_sharpe (computed from actual live trades)
+    is the authoritative baseline. Falling back to backtest sharpe for a
+    paper/live strategy means live metrics were never synced — a stale
+    baseline that silently masks real degradation (see S01627/S01724 bug).
+    """
     metrics = _parse_json_obj(metrics_raw)
+    stage_norm = str(stage or "").strip().lower()
+    is_live_stage = stage_norm in ("paper", "paper_trading", "live_graduated", "deployed")
+
+    if is_live_stage:
+        paper_sharpe = metrics.get("paper_sharpe")
+        if paper_sharpe is not None:
+            paper_val = _to_float(paper_sharpe)
+            if paper_val is not None:
+                return paper_val
+        # No paper_sharpe yet — the stored backtest sharpe is a stale
+        # baseline. Log a warning so operators can investigate.
+        log.warning(
+            "_extract_baseline_sharpe: %s stage strategy has no paper_sharpe — "
+            "falling back to backtest sharpe (may be stale)",
+            stage_norm,
+        )
+
     baseline = metrics.get("sharpe")
     if baseline is None:
         baseline = metrics.get("sharpe_ratio")
@@ -131,7 +155,7 @@ def run_decay_tracker(
             if execution_pattern is None:
                 skipped.append({"strategy_id": strategy_id, "reason": "unsupported_decay_stage"})
                 continue
-            baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"))
+            baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"), stage=current_stage)
             if baseline_sharpe is None or baseline_sharpe <= 0:
                 skipped.append({"strategy_id": strategy_id, "reason": "missing_or_nonpositive_baseline_sharpe"})
                 continue
@@ -413,7 +437,8 @@ def run_decay_kill_switch() -> dict:
             reviewed += 1
             strategy_id = strategy["id"]
 
-            baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"))
+            current_stage = str(strategy.get("stage") or "").strip()
+            baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"), stage=current_stage)
             if baseline_sharpe is None or baseline_sharpe <= 0:
                 continue
 
