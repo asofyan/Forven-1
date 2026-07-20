@@ -4407,7 +4407,12 @@ def _evaluate_paper_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
 
     pnls = [float(r["pnl_pct"]) for r in trade_rows if r["pnl_pct"] is not None]
     live = compute_live_metrics(pnls)
-    total_trades = int(live.get("total_trades", 0))
+
+    # Persist live paper metrics to strategies.metrics so the stored record
+    # reflects real forward performance (not just stale backtest baselines)
+    # and the ghost-container archive guard sees real evidence.
+    if total_trades := int(live.get("total_trades", 0)):
+        _sync_paper_live_metrics_to_strategy(strategy_id, live)
     total_return = float(live.get("total_return_pct", 0.0))
     max_dd = float(live.get("max_drawdown_pct", 0.0))
 
@@ -4601,3 +4606,49 @@ def compute_live_metrics(pnls: list[float]) -> dict:
         "win_rate": float(win_rate),
         "sharpe": float(sharpe),
     }
+
+
+def _sync_paper_live_metrics_to_strategy(strategy_id: str, live_metrics: dict):
+    """Write live paper trade metrics back to strategies.metrics so the stored
+    data reflects real forward performance, not just stale backtest baselines.
+
+    Called from _evaluate_paper_gate after computing live paper trade metrics.
+    Merges paper_sharpe, paper_profit_factor, paper_max_drawdown_pct,
+    paper_total_return_pct, and paper_trade_count into the stored metrics JSON.
+    Also injects a fitness score derived from live Sharpe when missing — this
+    satisfies the ghost-container protection in _terminal_evidence_error."""
+    live_sharpe = float(live_metrics.get("sharpe", 0.0) or 0.0)
+    live_pf = float(live_metrics.get("profit_factor", 0.0) or 0.0)
+    live_dd = float(live_metrics.get("max_drawdown_pct", 0.0) or 0.0)
+    live_return = float(live_metrics.get("total_return_pct", 0.0) or 0.0)
+    live_trades = int(live_metrics.get("total_trades", 0))
+
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT metrics FROM strategies WHERE id = ?", (strategy_id,),
+            ).fetchone()
+            if not row or not row[0]:
+                return
+            metrics = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            if not isinstance(metrics, dict):
+                return
+
+            metrics["paper_sharpe"] = live_sharpe
+            metrics["paper_profit_factor"] = live_pf
+            metrics["paper_max_drawdown_pct"] = live_dd
+            metrics["paper_total_return_pct"] = live_return
+            metrics["paper_trade_count"] = live_trades
+
+            # Compute a fitness score from live data when none exists.
+            # Negative Sharpe maps to negative fitness — accurately reflecting
+            # negative expectancy for promotion/gate decisions.
+            if "fitness" not in metrics or metrics.get("fitness") is None:
+                metrics["fitness"] = round(live_sharpe * 10.0, 4)
+
+            conn.execute(
+                "UPDATE strategies SET metrics = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(metrics), datetime.now(timezone.utc).isoformat(), strategy_id),
+            )
+    except Exception:
+        log.exception("Failed to sync paper live metrics for %s", strategy_id)

@@ -1715,7 +1715,7 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "risk_fee_bps": 4.5,
     "risk_slippage_bps": 2.0,
     "max_concurrent_positions": 5,
-    "paper_max_concurrent_positions": 0,
+    "paper_max_concurrent_positions": 20,
     "live_books_enabled": False,
     "hyperliquid_long_book_address": "",
     "hyperliquid_short_book_address": "",

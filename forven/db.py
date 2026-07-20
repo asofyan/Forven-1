@@ -461,7 +461,7 @@ def get_db():
     ensure_dirs()
     db_key = str(FORVEN_DB)
     with _db_connect_lock:
-        conn = sqlite3.connect(db_key, timeout=60)
+        conn = sqlite3.connect(db_key, timeout=60, isolation_level=None)
     conn.row_factory = sqlite3.Row
     if db_key not in _WAL_CONFIGURED_PATHS:
         try:
@@ -498,7 +498,7 @@ def get_db_best_effort(timeout_seconds: float = 0.25):
     busy_timeout_ms = max(1, int(timeout * 1000))
     db_key = str(FORVEN_DB)
     with _db_connect_lock:
-        conn = sqlite3.connect(db_key, timeout=timeout)
+        conn = sqlite3.connect(db_key, timeout=timeout, isolation_level=None)
     conn.row_factory = sqlite3.Row
     if db_key not in _WAL_CONFIGURED_PATHS:
         try:
@@ -590,9 +590,9 @@ def backup_db(destination: str | Path) -> Path:
     """
     target = Path(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
-    src = sqlite3.connect(str(FORVEN_DB), timeout=30)
+    src = sqlite3.connect(str(FORVEN_DB), timeout=30, isolation_level=None)
     try:
-        dst = sqlite3.connect(str(target), timeout=30)
+        dst = sqlite3.connect(str(target), timeout=30, isolation_level=None)
         try:
             src.backup(dst)
         finally:
@@ -7540,10 +7540,43 @@ def _terminal_evidence_error(
             return no_metrics_msg
 
         if require_fitness and metrics.get("fitness") is None:
-            return (
-                f"Strategy {strategy_id} has NULL fitness - archive REJECTED "
-                "(ghost container protection)"
+            # The `fitness` key is only injected by the agent backtest tool and
+            # evolution context selector — strategies registered through the
+            # normal pipeline (registered → quick_screen → gauntlet → paper)
+            # will have valid backtest metrics but no scored fitness. Those
+            # strategies carry real evidence and must not be blocked.
+            #
+            # Fallback 1: strategies with real paper-trading history carry
+            # their own evidence (winning or losing).
+            paper_row = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE COALESCE(NULLIF(strategy_id, ''), strategy) = ? "
+                "AND status = 'CLOSED' AND pnl_pct IS NOT NULL "
+                "AND CAST(pnl_pct AS REAL) != 0 "
+                "AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'",
+                (strategy_id,),
+            ).fetchone()
+            has_paper_evidence = paper_row and paper_row[0] >= 15
+
+            # Fallback 2: strategies with valid backtest performance metrics
+            # (Sharpe or total_return) have real evidence — the fitness key is
+            # a derivative, not a gate requirement.
+            has_backtest_sharpe = (
+                metrics.get("sharpe") is not None
+                or metrics.get("sharpe_ratio") is not None
             )
+            has_backtest_return = (
+                metrics.get("total_return_pct") is not None
+                or metrics.get("total_return") is not None
+            )
+            has_metric_evidence = has_backtest_sharpe or has_backtest_return
+
+            if not has_paper_evidence and not has_metric_evidence:
+                return (
+                    f"Strategy {strategy_id} has NULL fitness - archive REJECTED "
+                    "(ghost container protection)"
+                )
+            # Strategy has real evidence; fitness check satisfied.
 
         # Critical performance metrics (handle both key name variants)
         has_sharpe = metrics.get("sharpe") is not None or metrics.get("sharpe_ratio") is not None
