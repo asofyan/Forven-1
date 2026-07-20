@@ -2325,7 +2325,7 @@ def _resolve_strategy_class(strategy_type: str | None):
 
                 assert_custom_module_safe(modname)
                 module = importlib.import_module(f"forven.strategies.custom.{modname}")
-            except (ImportError, AttributeError, SyntaxError, OSError):
+            except (ImportError, AttributeError, SyntaxError, OSError, NameError):
                 continue
 
 
@@ -2338,7 +2338,7 @@ def _resolve_strategy_class(strategy_type: str | None):
             return getattr(module, "STRATEGY_CLASS", None)
 
 
-    except (ImportError, AttributeError, SyntaxError, OSError):
+    except (ImportError, AttributeError, SyntaxError, OSError, NameError):
 
 
         pass
