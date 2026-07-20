@@ -92,6 +92,88 @@ def _annualized_sharpe(pnls: list[float], window_hours: int) -> float:
     return float((mean(pnls) / std) * math.sqrt(trades_per_year))
 
 
+def _sync_paper_metrics_if_missing(
+    conn: "sqlite3.Connection",
+    strategy: dict,
+    current_stage: str,
+) -> None:
+    """Compute and persist ``paper_sharpe`` for paper/live strategies that lack it.
+
+    The decay tracker's baseline comparison depends on stored ``metrics.paper_sharpe``.
+    Without this sync, strategies that were swept onto an off-declared timeframe
+    during the gauntlet carry stale backtest metrics (``metrics.sharpe``) as their
+    baseline through paper, and the decay tracker silently compares live Sharpe
+    against the wrong benchmark (S01627/S01724 bug).
+
+    Mutates ``strategy["metrics"]`` in-place so the caller sees the updated value
+    without an extra DB round-trip.
+    """
+    stage_norm = current_stage.strip().lower()
+    is_live_stage = stage_norm in ("paper", "paper_trading", "live_graduated", "deployed")
+    if not is_live_stage:
+        return
+
+    metrics = _parse_json_obj(strategy.get("metrics"))
+    if not metrics:
+        return
+    # Already has paper_sharpe — nothing to sync.
+    paper_sharpe = metrics.get("paper_sharpe")
+    if paper_sharpe is not None:
+        return
+
+    strategy_id = str(strategy.get("id") or "").strip()
+    if not strategy_id:
+        return
+
+    # Fetch ALL closed paper trades (no time-window filter — we want the
+    # full forward record as the baseline).
+    trade_rows = conn.execute(
+        """SELECT COALESCE(net_pnl_pct, pnl_pct) AS pnl_pct FROM trades
+           WHERE COALESCE(strategy_id, strategy) = ?
+             AND status = 'CLOSED'
+             AND pnl_pct IS NOT NULL
+             AND LOWER(COALESCE(execution_type, '')) LIKE 'paper%'""",
+        (strategy_id,),
+    ).fetchall()
+    pnls = []
+    for r in trade_rows:
+        val = _to_float(r["pnl_pct"])
+        if val is not None:
+            pnls.append(val)
+
+    if len(pnls) < 5:
+        # Fewer than 5 closed trades is insufficient for a meaningful baseline.
+        # Skip sync — the decay tracker's window check will handle this
+        # gracefully (it uses min_trades=5 by default).
+        log.info(
+            "_sync_paper_metrics_if_missing: %s has only %d paper trades — "
+            "skipping paper_sharpe sync until sufficient data",
+            strategy_id, len(pnls),
+        )
+        return
+
+    try:
+        from forven.policy import compute_live_metrics, _sync_paper_live_metrics_to_strategy
+
+        live_metrics = compute_live_metrics(pnls)
+        _sync_paper_live_metrics_to_strategy(strategy_id, live_metrics)
+
+        # Update the in-memory strategy dict so subsequent reads see paper_sharpe.
+        metrics["paper_sharpe"] = float(live_metrics.get("sharpe", 0.0))
+        metrics["paper_profit_factor"] = float(live_metrics.get("profit_factor", 0.0))
+        metrics["paper_max_drawdown_pct"] = float(live_metrics.get("max_drawdown_pct", 0.0))
+        metrics["paper_total_return_pct"] = float(live_metrics.get("total_return_pct", 0.0))
+        metrics["paper_trade_count"] = int(live_metrics.get("total_trades", 0))
+        strategy["metrics"] = json.dumps(metrics)
+
+        log.info(
+            "_sync_paper_metrics_if_missing: synced paper_sharpe=%.4f (%d trades) for %s",
+            float(live_metrics.get("sharpe", 0.0)), len(pnls), strategy_id,
+        )
+    except Exception as exc:
+        log.warning("Failed to sync paper metrics for %s: %s", strategy_id, exc)
+
+
 def _calc_slippage_bps(signal_price: float, fill_price: float, side: str) -> float:
     if signal_price <= 0:
         return 0.0
@@ -155,6 +237,16 @@ def run_decay_tracker(
             if execution_pattern is None:
                 skipped.append({"strategy_id": strategy_id, "reason": "unsupported_decay_stage"})
                 continue
+            # ── Paper-metrics sync ──────────────────────────────────────
+            # For paper/live strategies that lack `paper_sharpe`, compute it
+            # from ALL closed trades so the baseline comparison uses real
+            # forward performance instead of stale backtest metrics.
+            # Without this, a strategy that was crowned on an off-declared
+            # timeframe during sweep carries that stale baseline through
+            # paper, and the decay tracker silently compares live Sharpe
+            # against the wrong benchmark (S01627/S01724 bug).
+            _sync_paper_metrics_if_missing(conn, strategy, current_stage)
+
             baseline_sharpe = _extract_baseline_sharpe(strategy.get("metrics"), stage=current_stage)
             if baseline_sharpe is None or baseline_sharpe <= 0:
                 skipped.append({"strategy_id": strategy_id, "reason": "missing_or_nonpositive_baseline_sharpe"})

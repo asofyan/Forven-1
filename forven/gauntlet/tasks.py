@@ -530,7 +530,16 @@ def run_quick_screen_gate(workflow: dict[str, Any], step: dict[str, Any]) -> dic
             # Promote the winning timeframe + its metrics onto the strategy row so the
             # brain guardrails (which read strategies.metrics) judge the best timeframe,
             # and every downstream step (optimization/confirmation/paper) runs on it.
-            _persist_quick_screen_winner(strategy_id, best_tf, best_metrics)
+            # Pass the declared timeframe so the persist function preserves the
+            # strategy's identity when the sweep crowns an off-declared TF
+            # (S01627/S01724 bug).
+            _declared_tf = str(
+                (row_params if isinstance(row_params, dict) else {}).get("_timeframe") or ""
+            ).strip() or None
+            _persist_quick_screen_winner(
+                strategy_id, best_tf, best_metrics,
+                declared_timeframe=_declared_tf,
+            )
         elif str(best_tf or "").strip().lower() != (fallback_tf or "1h").strip().lower():
             # The selector returned the DECLARED timeframe UNMEASURED: its slice was
             # degenerate/absent and every off-declared survivor was negative. Judging
@@ -921,6 +930,37 @@ def _best_sweep_result(
     return best_tf, best_result_id, best_metrics
 
 
+def _strategy_declared_timeframe(strategy_id: str) -> str | None:
+    """Return the strategy's ORIGINAL declared timeframe from ``params._timeframe``.
+
+    ``strategies.timeframe`` (the DB column) is overwritten by
+    ``_persist_quick_screen_winner``, so after one legitimate crowning a re-sweep
+    reading only the column would defend the previously-crowned timeframe instead
+    of the author's.  The author's declaration lives in the IMMUTABLE params
+    ``_timeframe`` when it exists.
+
+    Returns ``None`` when the strategy row doesn't exist or carries no declaration.
+    """
+    try:
+        if not strategy_id:
+            return None
+        row = _strategy_row(strategy_id)
+        if not row:
+            return None
+        params = _loads(row.get("params"), {})
+        if not isinstance(params, dict):
+            params = {}
+        declared = str(params.get("_timeframe") or "").strip() or None
+        if declared is not None:
+            return declared.lower()
+        # No _timeframe in params: fall back to the DB column, but note that
+        # this may have been overwritten by a previous sweep crown.
+        col_tf = str(row.get("timeframe") or "").strip()
+        return col_tf.lower() if col_tf else None
+    except Exception:
+        return None
+
+
 def _best_sweep_timeframe(
     strategy_id: str,
     fallback: str,
@@ -939,7 +979,13 @@ def _best_sweep_timeframe(
     return best_tf
 
 
-def _persist_quick_screen_winner(strategy_id: str, timeframe: str, metrics: dict[str, Any]) -> None:
+def _persist_quick_screen_winner(
+    strategy_id: str,
+    timeframe: str,
+    metrics: dict[str, Any],
+    *,
+    declared_timeframe: str | None = None,
+) -> None:
     """Persist the best-of-N winning timeframe + its metrics onto the strategy row.
 
     The brain's quick-screen overfitting guardrails read ``strategies.metrics`` (not a
@@ -947,10 +993,35 @@ def _persist_quick_screen_winner(strategy_id: str, timeframe: str, metrics: dict
     thresholds — we promote that timeframe's real metrics here before transitioning.
     The timeframe is also persisted so every downstream step (optimization,
     confirmation, walk-forward, paper) runs on the timeframe the strategy was judged on.
-    Best-effort: a persistence hiccup must never block the gate."""
+    Best-effort: a persistence hiccup must never block the gate.
+
+    When ``declared_timeframe`` is provided and differs from the crown-winning
+    ``timeframe``, the strategy's identity (declared TF) is preserved in the DB column
+    — only ``metrics`` is updated.  This prevents the sweep from silently reassigning
+    the strategy to a different timeframe (S01627/S01724 bug), while still persisting
+    the best evidence for gate-level judgment.
+    """
     tf = str(timeframe or "").strip()
     if not strategy_id or not tf or not isinstance(metrics, dict) or not metrics:
         return
+
+    # Determine the declared (author-original) timeframe so we don't silently
+    # overwrite the strategy's identity with a sweep-crowned off-declared TF.
+    declared_tf: str | None = None
+    if declared_timeframe:
+        declared_tf = str(declared_timeframe).strip().lower()
+    else:
+        try:
+            declared_tf = _strategy_declared_timeframe(strategy_id)
+        except Exception:
+            pass
+
+    crown_is_off_declared = (
+        declared_tf is not None
+        and declared_tf != ""
+        and tf.lower() != declared_tf
+    )
+
     try:
         from datetime import datetime, timezone
 
@@ -958,13 +1029,29 @@ def _persist_quick_screen_winner(strategy_id: str, timeframe: str, metrics: dict
 
         now = datetime.now(timezone.utc).isoformat()
         with get_db() as conn:
-            conn.execute(
-                """UPDATE strategies SET timeframe = ?, metrics = ?, updated_at = ?
-                   WHERE id = ?
-                     AND LOWER(TRIM(COALESCE(stage, status, ''))) IN
-                         ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')""",
-                (tf, json.dumps(metrics), now, strategy_id),
-            )
+            if crown_is_off_declared:
+                # Crowned a non-declared timeframe: persist metrics for gate
+                # evaluation but preserve the strategy's declared identity.
+                conn.execute(
+                    """UPDATE strategies SET metrics = ?, updated_at = ?
+                       WHERE id = ?
+                         AND LOWER(TRIM(COALESCE(stage, status, ''))) IN
+                             ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')""",
+                    (json.dumps(metrics), now, strategy_id),
+                )
+                log.warning(
+                    "_persist_quick_screen_winner: %s crowned on tf=%s differs from declared tf=%s "
+                    "— persisted sweep metrics but preserved declared timeframe",
+                    strategy_id, tf, declared_tf,
+                )
+            else:
+                conn.execute(
+                    """UPDATE strategies SET timeframe = ?, metrics = ?, updated_at = ?
+                       WHERE id = ?
+                         AND LOWER(TRIM(COALESCE(stage, status, ''))) IN
+                             ('quick_screen', 'researching', 'developing', 'gauntlet', 'backtesting')""",
+                    (tf, json.dumps(metrics), now, strategy_id),
+                )
     except Exception as exc:  # noqa: BLE001 - never block the gate on a metrics write
         log.warning("quick_screen_gate: failed to persist best-of-N winner for %s: %s", strategy_id, exc)
 
