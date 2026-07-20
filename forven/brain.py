@@ -786,12 +786,55 @@ def _paper_dethrone_soak_block(conn, strategy_id: str, current_stage: str) -> st
     dethrone.paper_max_soak_days the strategy stays protected while it has
     fewer than dethrone.paper_min_closed_trades closed paper trades in the
     current stay (low-frequency strategies may execute once a week or less).
+
+    DEGRADATION BYPASS: when a strategy's deflated Sharpe has collapsed below
+    the decay degradation threshold relative to its best backtest Sharpe, the
+    soak guard is lifted — the strategy is provably broken and further paper
+    time only delays the inevitable risk-manager mandated demotion.
+
     Returns a human-readable block reason while protected, else None.
     Fail-open: unreadable config/rows allow the recommendation.
     """
     if _normalize_stage(current_stage) != "paper":
         return None
     try:
+        # ── Degradation bypass: confirmed Sharpe collapse → no soak ──
+        decay_cfg = load_pipeline_config().get("decay") or {}
+        degradation_threshold = float(decay_cfg.get("degradation_threshold", 0.30))
+        strat_row = conn.execute(
+            "SELECT deflated_sharpe, metrics FROM strategies WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+        if strat_row:
+            deflated = _to_float(strat_row["deflated_sharpe"], None)
+            if deflated is not None:
+                metrics_raw = str(strat_row["metrics"] or "")
+                try:
+                    metrics = json.loads(metrics_raw) if metrics_raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    metrics = {}
+                # Best backtest Sharpe — try combined, then sharpe_ratio, then sharpe
+                baseline_sharpe = _to_float(
+                    metrics.get("sharpe_ratio")
+                    or metrics.get("sharpe")
+                    or metrics.get("combined", {}).get("sharpe", None),
+                    None,
+                )
+                if baseline_sharpe is not None and baseline_sharpe > 0 and deflated > 0:
+                    degradation = 1.0 - (deflated / baseline_sharpe)
+                    if degradation > degradation_threshold:
+                        log.info(
+                            "paper dethrone soak BYPASSED for %s: deflated Sharpe %.4f vs "
+                            "baseline %.4f (%.1f%% degradation > %.0f%% threshold)",
+                            strategy_id,
+                            deflated,
+                            baseline_sharpe,
+                            degradation * 100,
+                            degradation_threshold * 100,
+                        )
+                        return None
+        # ── End degradation bypass ──
+
         cfg = load_pipeline_config().get("dethrone") or {}
         min_days = float(cfg.get("paper_min_soak_days", 7))
         max_days = float(cfg.get("paper_max_soak_days", 14))
