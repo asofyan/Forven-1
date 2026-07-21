@@ -827,7 +827,7 @@ _PORTFOLIO_BUDGET_DEFAULTS = {
     # each believing it's the only one (paper per-strategy isolation bug).
     # Budget is in risk_pct (fraction of paper portfolio), analogous to
     # live_max_total_open_risk_pct but per-asset-direction.
-    "paper_max_asset_risk_pct": 10.0,
+    "paper_max_asset_risk_pct": 35.0,
 }
 # Risk fallback for a live row with no recorded stop (should not exist — live
 # opens are refused without one; adopted/recovered rows are the edge case).
