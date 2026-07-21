@@ -18,7 +18,7 @@ from forven.strategies.base import BaseStrategy, Signal
 from forven.strategies.indicators import rsi as compute_rsi, atr
 
 
-TYPE_NAME = "rsi_momentum"
+TYPE_NAME = "rsi_momentum_s00139"
 
 
 class RSIMomentumS00139Strategy(BaseStrategy):

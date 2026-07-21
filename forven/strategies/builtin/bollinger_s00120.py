@@ -9,7 +9,7 @@ import pandas as pd
 
 from forven.strategies.base import BaseStrategy, Signal
 
-TYPE_NAME = "bollinger"
+TYPE_NAME = "bollinger_s00120"
 
 
 class BollingerS00120Strategy(BaseStrategy):
