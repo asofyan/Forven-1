@@ -120,7 +120,9 @@ def test_register_custom_strategy_file_creates_quick_screen_ai_row(forven_db, mo
     assert result["module_name"] == "btc_ai_dropzone_wave_test"
     assert result["stage"] == "quick_screen"
     assert result["source"] == "ai_dropzone"
-    assert Path(result["source_ref"]).parent == Path(imported_pkg.__file__).resolve().parent
+    # After the 2026-07 fix, register_custom_strategy_file uses direct import
+    # (no longer sandbox-only). source_ref stays in custom/, not imported/.
+    assert Path(result["source_ref"]).parent == temp_custom_dir
     assert result["strategy_id"]
 
     with get_db() as conn:
@@ -135,10 +137,14 @@ def test_register_custom_strategy_file_creates_quick_screen_ai_row(forven_db, mo
     assert str(row["source"]) == "ai_dropzone"
     assert str(row["source_ref"]) == result["source_ref"]
     assert str(row["type"]) == "ai_dropzone_wave_test"
-    assert str(row["runtime_type"]).startswith("imported__dropzone_")
-    assert row["sandbox_only"] == 1
-    assert strategy_file.exists() is False
-    assert "forven.strategies.custom.btc_ai_dropzone_wave_test" not in sys.modules
+    # runtime_type should be the bare type_name (not imported__ prefix)
+    assert str(row["runtime_type"]) == "ai_dropzone_wave_test"
+    # sandbox_only should be 0 — direct import, not sandbox-only
+    assert row["sandbox_only"] == 0
+    # File stays in custom/ — no longer moved to imported/
+    assert strategy_file.exists() is True
+    # Module IS imported in parent process for _TYPE_MAP registration
+    assert "forven.strategies.custom.btc_ai_dropzone_wave_test" in sys.modules
 
 
 def test_scan_custom_strategies_registers_active_file_once(forven_db, monkeypatch, tmp_path):

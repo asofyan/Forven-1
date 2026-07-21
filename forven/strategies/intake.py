@@ -690,15 +690,12 @@ def register_custom_strategy_file(
                 f"{file_name} is missing embedded hypothesis_id for auto_intake registration"
             )
         hypothesis_id = inferred_hypothesis_id
-    return _register_custom_strategy_sandboxed(
-        modname=modname,
-        source_ref=source_ref,
-        file_name=file_name,
-        source=source,
-        hypothesis_id=hypothesis_id,
-        session_id=clean_session_id,
-        origin_task_id=origin_task_id,
-    )
+    # NOTE: Do NOT delegate to _register_custom_strategy_sandboxed here.
+    # That path moves the file to imported/, registers as sandbox_only=1 with
+    # imported__ prefix, and never imports in the parent process — producing
+    # orphan strategies (type in DB, zero runtime) that can never trade live.
+    # The inline code below does direct import + _TYPE_MAP registration, which
+    # is correct for trusted-origin (agent-generated) strategies.
 
     known_types = set(registry._TYPE_MAP.keys())
 

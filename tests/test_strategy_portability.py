@@ -248,7 +248,10 @@ def test_export_bundles_source_code_for_code_class(forven_db, monkeypatch, tmp_p
     assert sc["filename"] == f"{type_name}.py"
     assert "STRATEGY_CLASS" in sc["content"]
     assert f"TYPE_NAME = '{type_name}'" in sc["content"]
-    assert f"forven.strategies.custom.{type_name}" not in sys.modules
+    # After the 2026-07 fix, register_custom_strategy_file imports the module
+    # directly in the parent process (no longer uses sandbox-only path).
+    # The module SHOULD be in sys.modules so the type is registered in _TYPE_MAP.
+    assert f"forven.strategies.custom.{type_name}" in sys.modules
 
 
 _SANDBOX_PROBE_SRC = "\n".join(
