@@ -289,8 +289,15 @@ def run_code(
                 pass
 
     # POSIX path: keep using subprocess.run with rlimit-based preexec.
+    # ENV-HERMETIC-2: PYTHONPATH is pinned to the repo root (same as Windows
+    # branch) so the sandboxed subprocess can always resolve 'forven' even
+    # when the parent's site-packages layout differs from the child's.
     cmd = [PYTHON_EXE, script_path]
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"), "HOME": tempfile.gettempdir()}
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/usr/local/bin"),
+        "HOME": tempfile.gettempdir(),
+        "PYTHONPATH": str(REPO_ROOT),
+    }
     for _k, _v in _BLAS_THREAD_ENV.items():
         env.setdefault(_k, os.environ.get(_k, _v))
     preexec_fn = _build_posix_preexec(max_memory_mb)

@@ -86,7 +86,7 @@ def validate_strategy_code(code: str) -> dict:
         }
 
     test_code = _wrap_with_test_harness(current_code)
-    exec_result = run_code(test_code, timeout=30, max_memory_mb=256)
+    exec_result = run_code(test_code, timeout=30, max_memory_mb=384)
 
     valid = (
         final_lint["passed"]
@@ -150,21 +150,47 @@ import pandas as pd
 from forven.strategies.base import BaseStrategy, Signal, DirectionalSignals
 
 index = pd.date_range("2025-01-01", periods=100, freq="h", tz="UTC")
-close = np.linspace(100.0, 110.0, num=100)
-open_ = np.concatenate(([close[0]], close[:-1]))
-high = np.maximum(open_, close) + 0.5
-low = np.minimum(open_, close) - 0.5
-volume = np.linspace(1000.0, 2000.0, num=100)
-dummy_df = pd.DataFrame(
-    {{
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-        "volume": volume,
-    }},
-    index=index,
-)
+close = np.asarray(np.linspace(100.0, 110.0, num=100), dtype=np.float64)
+open_ = np.asarray(np.concatenate((close[:1], close[:-1])), dtype=np.float64)
+high = np.asarray(np.maximum(open_, close) + 0.5, dtype=np.float64)
+low = np.asarray(np.minimum(open_, close) - 0.5, dtype=np.float64)
+volume = np.asarray(np.linspace(1000.0, 2000.0, num=100), dtype=np.float64)
+# ── Defensive DataFrame construction ──
+# The original concise form (pd.DataFrame(dict, index=index)) has been
+# observed to crash with sanitize_array → maybe_convert_objects on some
+# pandas 3.x builds when the strategy code (loaded above the harness)
+# modifies numpy/pandas module-level state. Build via a homogenous 2-D
+# float64 array so the fast-path constructor is used and sanitize_array
+# never sees a mixed-type dict path.
+_open_arr = np.column_stack((open_, high, low, close, volume))
+try:
+    dummy_df = pd.DataFrame(
+        _open_arr,
+        columns=["open", "high", "low", "close", "volume"],
+        index=index,
+        copy=False,
+    )
+except Exception as _df_exc:
+    # Fallback: explicit column-by-column with dtype assurance
+    try:
+        dummy_df = pd.DataFrame(
+            {{
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+            }},
+            index=index,
+        )
+    except Exception:
+        print(
+            f"FATAL: Cannot construct validation DataFrame. "
+            f"dtypes: open={{open_.dtype}}, high={{high.dtype}}, low={{low.dtype}}, "
+            f"close={{close.dtype}}, volume={{volume.dtype}}. "
+            f"First error: {{_df_exc}}"
+        )
+        sys.exit(1)
 
 strategy_classes = []
 for name, obj in list(globals().items()):
